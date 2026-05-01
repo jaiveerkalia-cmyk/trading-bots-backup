@@ -1,0 +1,7 @@
+*
+!*/
+!bots/**/*.py
+!bots/*.py
+!.gitignore
+__pycache__/
+*.py[cod]
