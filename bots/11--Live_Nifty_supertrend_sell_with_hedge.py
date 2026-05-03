@@ -275,7 +275,7 @@ stop_percent = 0.5
 
 entry_price_gap = 3
 
-gd_path = '/home/jaivk/Desktop/Python Stuff/'
+gd_path = '/app/data/'
 
 call_token, put_token,hedge_call_token,hedge_put_token,mid_loop,prev_call_token, prev_put_token,put_stop_price,call_stop_price = 0,0,0,0,0,0,0,0,0
 entry_call_price,entry_put_price,entry_put,entry_call,hedge_put,hedge_call,hedge_put_price,hedge_call_price,profit,final_close = 0,0,0,0,0,0,0,0,0,0
@@ -910,7 +910,7 @@ while True:
         
         if  '09:15' in str(now):
             print(now)
-            with open(gd_path+'auth.txt', 'r') as f:
+            with open('/app/config/'+'auth.txt', 'r') as f:
                 api_data = f.read()
             kite = KiteConnect(api_key = api_data.split(',')[0])
             kite.set_access_token(api_data.split(',')[1])

@@ -1,13 +1,12 @@
 import sys
 import subprocess
-import threading
 import time
 import math
 import pandas as pd
 from datetime import datetime
 import pytz
 import talib
-from kiteconnect import KiteConnect, KiteTicker
+from kiteconnect import KiteConnect
 
 # ==============================================================================
 # 1. GLOBAL PATHS & CONFIGURATION
@@ -34,6 +33,7 @@ TOKEN_SWAP_TIME = "09:00"     # Time to restart process daily
 STANDARD_LOT_SIZE = 65        # Nifty Lot Size (Jan 2026 Standard)
 ATR_PERIOD = 10
 VIX_SYMBOL = 'NSE:INDIA VIX'
+TRADING_LOOP_CHECK_INTERVAL_MINUTES = 1
 
 # TARGETS (Per Lot)
 TARGET_PROFIT_PER_LOT = 45000 
@@ -119,8 +119,6 @@ DEFAULT_CONFIGURATION = DAY_CONFIGURATION[0]
 # 2. SHARED DATA & HELPER FUNCTIONS
 # ==============================================================================
 
-live_market_data = {}
-tick_lock = threading.Lock()
 IST = pytz.timezone('Asia/Kolkata')
 
 
@@ -321,6 +319,24 @@ def get_ltp_safe(kite, symbol_list):
         except: time.sleep(1)
     return {}
 
+def wait_for_next_check_interval(interval_minutes):
+    """Sleeps until the next interval boundary, aligned to minute starts."""
+    interval_minutes = max(1, int(interval_minutes))
+
+    while True:
+        now = datetime.now()
+        secs_since_hour = (now.minute * 60) + now.second
+        interval_seconds = interval_minutes * 60
+        sleep_seconds = interval_seconds - (secs_since_hour % interval_seconds)
+
+        if sleep_seconds <= 0:
+            sleep_seconds = interval_seconds
+
+        time.sleep(sleep_seconds)
+        check_dt = datetime.now()
+        if check_dt.second == 0 and (check_dt.minute % interval_minutes) == 0:
+            return check_dt
+
 def get_latest_atr_ema(kite, spot_symbol, current_dt, atr_ema_window=20, lookback_days=60):
     """Fetches 1h candles, calculates ATR and ATR EMA, and returns the latest completed ATR EMA."""
     try:
@@ -510,30 +526,6 @@ def get_token_and_symbol(df, strike, instrument_type):
         return int(row['instrument_token']), row['tradingsymbol']
     except: return None, None
 
-def on_ticks(ws, ticks):
-    with tick_lock:
-        for tick in ticks:
-            try:
-                instrument_token = tick.get('instrument_token')
-                last_price = tick.get('last_price', 0)
-
-                if instrument_token is None:
-                    continue
-
-                # Ignore zero/invalid websocket LTP updates so a bad BFO tick
-                # does not overwrite the last valid market price.
-                if last_price is None or last_price <= 0:
-                    if instrument_token not in live_market_data:
-                        live_market_data[instrument_token] = 0
-                    continue
-
-                live_market_data[instrument_token] = last_price
-            except Exception as e:
-                print(f"WebSocket tick ignored due to processing error: {e}", flush=True)
-
-def on_connect(ws, response):
-    print("WebSocket Connected Successfully.", flush=True)
-
 # ==============================================================================
 # 4. DAILY PROCESS LIFECYCLE (The Worker)
 # ==============================================================================
@@ -664,22 +656,14 @@ def run_trading_process():
                 else:
                     print(f"[{get_now_str()}] VIX Stop Mode fallback: using current max loss per lot {max_loss_per_lot}.", flush=True)
 
-        # 5. WebSocket
-        kws = KiteTicker(api_key, access_token)
-        kws.on_ticks = on_ticks
-        kws.on_connect = on_connect
-        ws_thread = threading.Thread(target=kws.connect, kwargs={'threaded': True})
-        ws_thread.daemon = True
-        ws_thread.start()
-        
-        # 6. Wait for Start Time
+        # 5. Wait for Start Time
         print(f"\n[{get_now_str()}] Waiting for Start Time: {config['start']}...", flush=True)
         while True:
             now_str = datetime.now().strftime("%H:%M")
             if now_str >= config['start']: break
             time.sleep(5)
             
-        # 7. Levels
+        # 6. Levels
         print(f"\n[{get_now_str()}] --- CALCULATING LEVELS ---", flush=True)
         spot_ltp = get_ltp_safe(kite, [spot_sym_full]).get(spot_sym_full, {}).get('last_price', 0)
         
@@ -732,11 +716,6 @@ def run_trading_process():
             token_buy_ce, sym_buy_ce = get_token_and_symbol(nifty_options, buy_strike_ce, 'CE')
             token_buy_pe, sym_buy_pe = get_token_and_symbol(nifty_options, buy_strike_pe, 'PE')
             
-        sub_tokens = [t for t in [token_entry_put, token_entry_call, token_hedge_put, token_hedge_call, token_buy_ce, token_buy_pe] if t]
-        kws.subscribe(sub_tokens)
-        kws.set_mode(kws.MODE_LTP, sub_tokens)
-        time.sleep(2) 
-        
         snap_symbols = [f"{OPT_EXCHANGE}:{s}" for s in [sym_entry_put, sym_entry_call, sym_hedge_put, sym_hedge_call, sym_buy_pe, sym_buy_ce] if s]
         snapshot = get_ltp_safe(kite, snap_symbols)
         
@@ -814,11 +793,7 @@ def run_trading_process():
 
             print(f"\n[{get_now_str()}] !!! CLOSING PUT SIDE | REASON: {reason} !!!", flush=True)
             if sl_price: print(f"    STOP PRICE: {sl_price:.2f}", flush=True)
-            
-            with tick_lock: 
-                curr_price = live_market_data.get(token_entry_put, 0)
-                curr_hedge = live_market_data.get(token_hedge_put, 0)
-            
+
             place_order_with_retry(kite, sym_entry_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
             exec_price = get_quote_price(kite, sym_entry_put, 'BUY', exchange=OPT_EXCHANGE) 
             exit_price_put_sold = exec_price 
@@ -854,10 +829,6 @@ def run_trading_process():
 
             print(f"\n[{get_now_str()}] !!! CLOSING CALL SIDE | REASON: {reason} !!!", flush=True)
             if sl_price: print(f"    STOP PRICE: {sl_price:.2f}", flush=True)
-            
-            with tick_lock: 
-                curr_price = live_market_data.get(token_entry_call, 0)
-                curr_hedge = live_market_data.get(token_hedge_call, 0)
 
             place_order_with_retry(kite, sym_entry_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
             exec_price = get_quote_price(kite, sym_entry_call, 'BUY', exchange=OPT_EXCHANGE)
@@ -929,22 +900,22 @@ def run_trading_process():
 
         print(f"[{get_now_str()}] Starting Main Loop...", flush=True)
         while True:
-            time.sleep(1)
+            check_dt = wait_for_next_check_interval(TRADING_LOOP_CHECK_INTERVAL_MINUTES)
             
-            if datetime.now().strftime("%H:%M") >= config['exit']:
+            if check_dt.strftime("%H:%M") >= config['exit']:
                 close_all_positions("Time_Exit")
                 break
-                
-            with tick_lock:
-                ltp_put = live_market_data.get(token_entry_put, 0)
-                ltp_call = live_market_data.get(token_entry_call, 0)
-                ltp_hedge_put = live_market_data.get(token_hedge_put, 0)
-                ltp_hedge_call = live_market_data.get(token_hedge_call, 0)
-                ltp_buy_put = live_market_data.get(token_buy_pe, 0) if token_buy_pe else 0
-                ltp_buy_call = live_market_data.get(token_buy_ce, 0) if token_buy_ce else 0
+
+            current_snapshot = get_ltp_safe(kite, snap_symbols)
+            ltp_put = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_entry_put}", {}).get('last_price', 0)
+            ltp_call = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_entry_call}", {}).get('last_price', 0)
+            ltp_hedge_put = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_hedge_put}", {}).get('last_price', 0)
+            ltp_hedge_call = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_hedge_call}", {}).get('last_price', 0)
+            ltp_buy_put = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_pe}", {}).get('last_price', 0) if token_buy_pe else 0
+            ltp_buy_call = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_ce}", {}).get('last_price', 0) if token_buy_ce else 0
                 
             if ltp_put == 0 or ltp_call == 0: continue
-            risk_checks_enabled = datetime.now().hour > config.get('skip_till_hour', 8)
+            risk_checks_enabled = check_dt.hour > config.get('skip_till_hour', 8)
             
             # --- ENTRIES ---
             if ltp_put < threshold_put and flag_sell_put == 0:
@@ -1011,8 +982,8 @@ def run_trading_process():
             current_net_pnl = gross_pnl - comm_curr
             
             # --- MINUTE LOG ---
-            if datetime.now().minute != last_print_minute:
-                print(f"\n[STATUS {datetime.now().strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
+            if check_dt.minute != last_print_minute:
+                print(f"\n[STATUS {check_dt.strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
                 print(f"RISK INFO | Put Thresh: {threshold_put:.2f} | Put Stop: {stop_put:.2f} | Call Thresh: {threshold_call:.2f} | Call Stop: {stop_call:.2f} | Global Stop: {-GLOBAL_MAX_LOSS:.2f} | Stops Active: {'YES' if risk_checks_enabled else 'NO (SKIPPED)'}", flush=True)
                 
                 status_p = 'OPEN' if flag_sell_put==1 else 'CLOSED/WAIT'
@@ -1028,7 +999,7 @@ def run_trading_process():
                 if use_buy_legs:
                     print(f"BUY PE    | LTP: {ltp_buy_put:<6} | Trigger: {(2 * initial_bp_price):<6.2f} | Entry: {entry_price_put_bought:<6} | PnL: {round(pnl_bp, 2)}", flush=True)
                     print(f"BUY CE    | LTP: {ltp_buy_call:<6} | Trigger: {(2 * initial_bc_price):<6.2f} | Entry: {entry_price_call_bought:<6} | PnL: {round(pnl_bc, 2)}", flush=True)
-                last_print_minute = datetime.now().minute
+                last_print_minute = check_dt.minute
 
             # --- STOP LOSS CHECKS ---
             if risk_checks_enabled and flag_sell_put == 1 and ltp_put >= stop_put:
@@ -1061,9 +1032,6 @@ def run_trading_process():
                 break
 
         # 8. End of Day Cleanup
-        if kws.is_connected():
-            kws.close()
-        
         print(f"\n{'='*30}", flush=True)
         print(f"FINAL DAY PNL: {final_realized_pnl:.2f}", flush=True)
         print(f"{'='*30}\n", flush=True)

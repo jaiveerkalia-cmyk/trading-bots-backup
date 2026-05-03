@@ -32,7 +32,7 @@ def commission(amount, buy_price, sell_price):
 
 def get_contracts():
 
-    with open('auth.txt', 'r') as f:
+    with open('/app/config/auth.txt', 'r') as f:
 
         api_data = f.read()
 
@@ -226,7 +226,7 @@ stop_percent = 0.5
 entry_price_gap = 10
 live_mode = 0
 
-gd_path = '/home/jaivk/Desktop/Python Stuff/'
+gd_path = '/app/data/'
 
 
 def get_best_atm_strike(kite, atm_strike, zerodha_instruments_list):
@@ -939,7 +939,7 @@ while True:
         
         if '09:15' in str(now):
             print(now)
-            with open(gd_path+'auth.txt', 'r') as f:
+            with open('/app/config/'+'auth.txt', 'r') as f:
                 api_data = f.read()
             kite = KiteConnect(api_key = api_data.split(',')[0])
             kite.set_access_token(api_data.split(',')[1])
