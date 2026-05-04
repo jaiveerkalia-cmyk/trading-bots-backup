@@ -2,7 +2,7 @@ from kiteconnect import KiteTicker
 from kiteconnect import KiteConnect
 
 
-with open('auth.txt', 'r') as f:
+with open('/app/config/' + 'auth.txt', 'r') as f:
         api_data = f.read()
 kite = KiteConnect(api_key = api_data.split(',')[0])
 kite.set_access_token(api_data.split(',')[1])
@@ -18,7 +18,7 @@ order_id = kite.place_order(
     quantity=1,                            # SBIN lot size = 1, change to your qty
     product=kite.PRODUCT_MIS,              # MIS = intraday
     order_type=kite.ORDER_TYPE_LIMIT,      # LIMIT instead of MARKET
-    price=795.5,                           # your limit price here
+    price=1010.5,                           # your limit price here
     validity=kite.VALIDITY_DAY
 )
 

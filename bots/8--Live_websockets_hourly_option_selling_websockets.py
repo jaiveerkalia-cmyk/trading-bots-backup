@@ -118,7 +118,7 @@ DAY_CONFIGURATION = {
     # option_mode: 'sell' -> sell options, 'buy' -> buy options
     # Strike offsets set globally via POS1_STRIKE_OFFSET / POS2_STRIKE_OFFSET.
     0: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 19,
-        'lots': 5, 'live_mode': 0,
+        'lots': 2, 'live_mode': 1,
         'pos1_stop'                   : 20000,  # Mon per-leg SL for 1st position
         'pos2_close_target'           : 50000,  # Mon total PnL target to close 2nd position
         'global_stop_atr_multiplier'  : 20.0,   # Mon
@@ -154,7 +154,7 @@ DAY_CONFIGURATION = {
         'option_mode'                : 'buy',
         },
     3: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 19,
-        'lots': 5, 'live_mode': 0,
+        'lots': 3, 'live_mode': 1,
         'pos1_stop'                   : 20000,  # Thu per-leg SL for 1st position
         'pos2_close_target'           : 50000,  # Thu total PnL target to close 2nd position
         'global_stop_atr_multiplier'  : 20.0,   # Thu
@@ -166,7 +166,7 @@ DAY_CONFIGURATION = {
         'option_mode'                : 'buy',
         },
     4: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 19,
-        'lots': 5, 'live_mode': 0,
+        'lots': 3, 'live_mode': 1,
         'pos1_stop'                   : 20000,  # Fri per-leg SL for 1st position
         'pos2_close_target'           : 50000,  # Fri total PnL target to close 2nd position
         'global_stop_atr_multiplier'  : 20.0,   # Fri
@@ -1656,7 +1656,7 @@ def run_trading_process():
                     print(f"  {put_label} OPEN  | Strike: {entry_put_strike}  | Entry: {entry_put_price} | IndexStop: {stop_put_index_price}", flush=True)
                 else:
                     print(f"  No position open | waiting for entry signal", flush=True)
-                print(f"  -----------------------------------------------------", flush=True)
+                
 
             # -- P&L + EXIT LOGIC ---------------------------------------------
             if call_position_open and not call_just_opened:
@@ -1762,7 +1762,7 @@ def run_trading_process():
                             elif realized_profit >= 0:
                                 print(f"[{get_now_str()}] Realized profit not negative | day_over", flush=True)
                                 day_over = True
-
+            print(f"  -----------------------------------------------------", flush=True)
             last_print_minute = now.minute
 
         # -- End of day --------------------------------------------------------
