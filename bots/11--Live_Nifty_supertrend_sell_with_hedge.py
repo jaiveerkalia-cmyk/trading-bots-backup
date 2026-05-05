@@ -914,7 +914,7 @@ while True:
             kite.set_access_token(api_data.split(',')[1])
             
             ###########PICK UP THE ZERODHA INSTRUMENT LIST#########
-            zerodha_instruments_list = pd.read_csv('app/data/instrument_tokens.csv')
+            zerodha_instruments_list = pd.read_csv('/app/data/instrument_tokens.csv')
             zerodha_instruments_list = zerodha_instruments_list[(zerodha_instruments_list['name'] == ind) & (zerodha_instruments_list['segment'] == 'NFO-OPT')].reset_index(drop=True)
             zerodha_instruments_list = zerodha_instruments_list[zerodha_instruments_list['expiry'] == zerodha_instruments_list['expiry'].iloc[0]]
             expiry = zerodha_instruments_list['expiry'].iloc[0]

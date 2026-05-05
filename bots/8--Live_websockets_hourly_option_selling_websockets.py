@@ -1656,7 +1656,7 @@ def run_trading_process():
                     print(f"  {put_label} OPEN  | Strike: {entry_put_strike}  | Entry: {entry_put_price} | IndexStop: {stop_put_index_price}", flush=True)
                 else:
                     print(f"  No position open | waiting for entry signal", flush=True)
-                
+                print(f"  -----------------------------------------------------", flush=True)
 
             # -- P&L + EXIT LOGIC ---------------------------------------------
             if call_position_open and not call_just_opened:
@@ -1762,7 +1762,7 @@ def run_trading_process():
                             elif realized_profit >= 0:
                                 print(f"[{get_now_str()}] Realized profit not negative | day_over", flush=True)
                                 day_over = True
-            print(f"  -----------------------------------------------------", flush=True)
+            
             last_print_minute = now.minute
 
         # -- End of day --------------------------------------------------------
