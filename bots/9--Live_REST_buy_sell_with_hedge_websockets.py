@@ -69,7 +69,7 @@ INDEX_DETAILS = {
 # NOTE:
 # - When `vix_stop_mode_on` is enabled, it overrides the normal per-day
 #   `max_loss_per_lot`.
-# - When `atr_mode_on` is enabled, it affects only the entry-gap calculation.
+# - When `atr_mode_on` is enabled, it affects the entry-gap and max-loss calculations.
 # ------------------------------------------------------------------------------
 DAY_CONFIGURATION = {
     # Monday (NIFTY)
@@ -97,7 +97,7 @@ DAY_CONFIGURATION = {
         'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False},
     
     # Friday (NIFTY)
-   4: {'target_index': 'NIFTY', 'start': '10:15', 'exit': '14:45', 'entry_gap': 8, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
+   4: {'target_index': 'NIFTY', 'start': '10:15', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 8, 'live_mode': 1, 'percent_mode': 0, 'find_atm': True,
        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
        'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50},
@@ -639,11 +639,13 @@ def run_trading_process():
 
                 if latest_atr is not None:
                     atr_entry_gap_pct = config.get('atr_entry_gap', 10)
+                    max_loss_per_lot = config.get('atr_stop_per_lot', 30) * latest_atr
+                    GLOBAL_MAX_LOSS = max_loss_per_lot * LOTS
                     if atr_entry_gap_pct == 0:
                         print(f"[{get_now_str()}] ATR entry gap value is 0. Falling back to configured entry gap.", flush=True)
                     else:
                         effective_entry_gap = latest_atr / atr_entry_gap_pct
-                    print(f"[{get_now_str()}] ATR Mode Active @ 09:00 | Latest ATR EMA: {latest_atr:.2f} | Effective Entry Gap %: {effective_entry_gap:.2f}", flush=True)
+                    print(f"[{get_now_str()}] ATR Mode Active @ 09:00 | Latest ATR EMA: {latest_atr:.2f} | Effective Entry Gap %: {effective_entry_gap:.2f} | Max Loss/Lot: {max_loss_per_lot:.2f} | Global Max Loss: {GLOBAL_MAX_LOSS:.2f}", flush=True)
                 else:
                     print(f"[{get_now_str()}] ATR Mode fallback: using configured entry gap {effective_entry_gap}.", flush=True)
 
@@ -779,16 +781,19 @@ def run_trading_process():
         entry_price_put_bought, entry_price_call_bought = 0, 0
 
         exit_price_put_sold, exit_price_call_sold = 0, 0
+        exit_price_hedge_put, exit_price_hedge_call = 0, 0
         exit_price_put_bought, exit_price_call_bought = 0, 0
         
         final_realized_pnl = 0
         final_realized_main_pnl = 0 
+        realized_put_main_pnl, realized_put_hedge_pnl, realized_put_leg_pnl = 0, 0, 0
+        realized_call_main_pnl, realized_call_hedge_pnl, realized_call_leg_pnl = 0, 0, 0
         last_print_minute = datetime.now().minute
         
         # --- CLOSING HELPER FUNCTIONS ---
         
         def close_put_side(reason, sl_price=None):
-            nonlocal final_realized_pnl, final_realized_main_pnl, flag_sell_put, exit_price_put_sold, GLOBAL_PROFIT_TARGET
+            nonlocal final_realized_pnl, final_realized_main_pnl, flag_sell_put, exit_price_put_sold, exit_price_hedge_put, realized_put_main_pnl, realized_put_hedge_pnl, realized_put_leg_pnl, GLOBAL_PROFIT_TARGET
             if flag_sell_put != 1: return 
 
             print(f"\n[{get_now_str()}] !!! CLOSING PUT SIDE | REASON: {reason} !!!", flush=True)
@@ -800,6 +805,7 @@ def run_trading_process():
             
             place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
             exec_hedge = get_quote_price(kite, sym_hedge_put, 'SELL', exchange=OPT_EXCHANGE) 
+            exit_price_hedge_put = exec_hedge
 
             main_pnl = QUANTITY * (entry_price_put_sold - exec_price)
             hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_put)
@@ -810,6 +816,9 @@ def run_trading_process():
             total_leg_pnl = main_pnl + hedge_pnl - (comm_main + comm_hedge)
             final_realized_pnl += total_leg_pnl
             final_realized_main_pnl += (main_pnl - comm_main)
+            realized_put_main_pnl = main_pnl - comm_main
+            realized_put_hedge_pnl = hedge_pnl - comm_hedge
+            realized_put_leg_pnl = total_leg_pnl
             
             print(f"    MAIN  | Entry: {entry_price_put_sold} | Exit: {exec_price}", flush=True)
             print(f"    HEDGE | Entry: {entry_price_hedge_put} | Exit: {exec_hedge}", flush=True)
@@ -824,7 +833,7 @@ def run_trading_process():
                 print(f"[{get_now_str()}] Total Profit Change Active. New Global Target: {GLOBAL_PROFIT_TARGET}", flush=True)
 
         def close_call_side(reason, sl_price=None):
-            nonlocal final_realized_pnl, final_realized_main_pnl, flag_sell_call, exit_price_call_sold, GLOBAL_PROFIT_TARGET
+            nonlocal final_realized_pnl, final_realized_main_pnl, flag_sell_call, exit_price_call_sold, exit_price_hedge_call, realized_call_main_pnl, realized_call_hedge_pnl, realized_call_leg_pnl, GLOBAL_PROFIT_TARGET
             if flag_sell_call != 1: return
 
             print(f"\n[{get_now_str()}] !!! CLOSING CALL SIDE | REASON: {reason} !!!", flush=True)
@@ -836,6 +845,7 @@ def run_trading_process():
             
             place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
             exec_hedge = get_quote_price(kite, sym_hedge_call, 'SELL', exchange=OPT_EXCHANGE)
+            exit_price_hedge_call = exec_hedge
 
             main_pnl = QUANTITY * (entry_price_call_sold - exec_price)
             hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_call)
@@ -846,6 +856,9 @@ def run_trading_process():
             total_leg_pnl = main_pnl + hedge_pnl - (comm_main + comm_hedge)
             final_realized_pnl += total_leg_pnl
             final_realized_main_pnl += (main_pnl - comm_main)
+            realized_call_main_pnl = main_pnl - comm_main
+            realized_call_hedge_pnl = hedge_pnl - comm_hedge
+            realized_call_leg_pnl = total_leg_pnl
             
             print(f"    MAIN  | Entry: {entry_price_call_sold} | Exit: {exec_price}", flush=True)
             print(f"    HEDGE | Entry: {entry_price_hedge_call} | Exit: {exec_hedge}", flush=True)
@@ -986,15 +999,61 @@ def run_trading_process():
                 print(f"\n[STATUS {check_dt.strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
                 print(f"RISK INFO | Put Thresh: {threshold_put:.2f} | Put Stop: {stop_put:.2f} | Call Thresh: {threshold_call:.2f} | Call Stop: {stop_call:.2f} | Global Stop: {-GLOBAL_MAX_LOSS:.2f} | Stops Active: {'YES' if risk_checks_enabled else 'NO (SKIPPED)'}", flush=True)
                 
-                status_p = 'OPEN' if flag_sell_put==1 else 'CLOSED/WAIT'
-                print(f"PUT SIDE  | Status: {status_p:<6} | Net Leg PnL: {round(pnl_sp + pnl_hp, 2)}", flush=True)
-                print(f"  > Main  | LTP: {ltp_put:<6} | Entry: {entry_price_put_sold:<6} | PnL: {round(pnl_sp, 2)}", flush=True)
-                print(f"  > Hedge | LTP: {ltp_hedge_put:<6} | Entry: {entry_price_hedge_put:<6} | PnL: {round(pnl_hp, 2)}", flush=True)
+                if flag_sell_put == 1:
+                    status_p = 'OPEN'
+                    put_leg_pnl = pnl_sp + pnl_hp
+                    put_main_pnl = pnl_sp
+                    put_hedge_pnl = pnl_hp
+                    put_main_price_label, put_main_price = 'LTP', ltp_put
+                    put_hedge_price_label, put_hedge_price = 'LTP', ltp_hedge_put
+                    put_main_exit_price, put_hedge_exit_price = 0, 0
+                elif flag_sell_put == 2:
+                    status_p = 'CLOSED'
+                    put_leg_pnl = realized_put_leg_pnl
+                    put_main_pnl = realized_put_main_pnl
+                    put_hedge_pnl = realized_put_hedge_pnl
+                    put_main_price_label, put_main_price = 'LTP', ltp_put
+                    put_hedge_price_label, put_hedge_price = 'LTP', ltp_hedge_put
+                    put_main_exit_price, put_hedge_exit_price = exit_price_put_sold, exit_price_hedge_put
+                else:
+                    status_p = 'WAIT'
+                    put_leg_pnl = 0
+                    put_main_pnl = 0
+                    put_hedge_pnl = 0
+                    put_main_price_label, put_main_price = 'LTP', ltp_put
+                    put_hedge_price_label, put_hedge_price = 'LTP', ltp_hedge_put
+                    put_main_exit_price, put_hedge_exit_price = 0, 0
+                print(f"PUT SIDE  | Status: {status_p:<6} | Net Leg PnL: {round(put_leg_pnl, 2)}", flush=True)
+                print(f"  > Main  | {put_main_price_label}: {put_main_price:<6} | Entry: {entry_price_put_sold:<6} | Exit: {put_main_exit_price:<6} | PnL: {round(put_main_pnl, 2)}", flush=True)
+                print(f"  > Hedge | {put_hedge_price_label}: {put_hedge_price:<6} | Entry: {entry_price_hedge_put:<6} | Exit: {put_hedge_exit_price:<6} | PnL: {round(put_hedge_pnl, 2)}", flush=True)
 
-                status_c = 'OPEN' if flag_sell_call==1 else 'CLOSED/WAIT'
-                print(f"CALL SIDE | Status: {status_c:<6} | Net Leg PnL: {round(pnl_sc + pnl_hc, 2)}", flush=True)
-                print(f"  > Main  | LTP: {ltp_call:<6} | Entry: {entry_price_call_sold:<6} | PnL: {round(pnl_sc, 2)}", flush=True)
-                print(f"  > Hedge | LTP: {ltp_hedge_call:<6} | Entry: {entry_price_hedge_call:<6} | PnL: {round(pnl_hc, 2)}", flush=True)
+                if flag_sell_call == 1:
+                    status_c = 'OPEN'
+                    call_leg_pnl = pnl_sc + pnl_hc
+                    call_main_pnl = pnl_sc
+                    call_hedge_pnl = pnl_hc
+                    call_main_price_label, call_main_price = 'LTP', ltp_call
+                    call_hedge_price_label, call_hedge_price = 'LTP', ltp_hedge_call
+                    call_main_exit_price, call_hedge_exit_price = 0, 0
+                elif flag_sell_call == 2:
+                    status_c = 'CLOSED'
+                    call_leg_pnl = realized_call_leg_pnl
+                    call_main_pnl = realized_call_main_pnl
+                    call_hedge_pnl = realized_call_hedge_pnl
+                    call_main_price_label, call_main_price = 'LTP', ltp_call
+                    call_hedge_price_label, call_hedge_price = 'LTP', ltp_hedge_call
+                    call_main_exit_price, call_hedge_exit_price = exit_price_call_sold, exit_price_hedge_call
+                else:
+                    status_c = 'WAIT'
+                    call_leg_pnl = 0
+                    call_main_pnl = 0
+                    call_hedge_pnl = 0
+                    call_main_price_label, call_main_price = 'LTP', ltp_call
+                    call_hedge_price_label, call_hedge_price = 'LTP', ltp_hedge_call
+                    call_main_exit_price, call_hedge_exit_price = 0, 0
+                print(f"CALL SIDE | Status: {status_c:<6} | Net Leg PnL: {round(call_leg_pnl, 2)}", flush=True)
+                print(f"  > Main  | {call_main_price_label}: {call_main_price:<6} | Entry: {entry_price_call_sold:<6} | Exit: {call_main_exit_price:<6} | PnL: {round(call_main_pnl, 2)}", flush=True)
+                print(f"  > Hedge | {call_hedge_price_label}: {call_hedge_price:<6} | Entry: {entry_price_hedge_call:<6} | Exit: {call_hedge_exit_price:<6} | PnL: {round(call_hedge_pnl, 2)}", flush=True)
                 
                 if use_buy_legs:
                     print(f"BUY PE    | LTP: {ltp_buy_put:<6} | Trigger: {(2 * initial_bp_price):<6.2f} | Entry: {entry_price_put_bought:<6} | PnL: {round(pnl_bp, 2)}", flush=True)
