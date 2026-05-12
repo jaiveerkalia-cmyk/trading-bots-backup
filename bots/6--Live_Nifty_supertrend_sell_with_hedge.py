@@ -16,9 +16,7 @@ import talib
 import requests
 import pyotp
 import pytz
-import talib
 from numba import jit
-
 
 def commission(quantity, buy_price, sell_price):
     """
