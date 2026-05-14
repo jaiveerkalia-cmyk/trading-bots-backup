@@ -174,14 +174,6 @@ def write_lot_size_csv(rows: Sequence[Tuple[str, int]]) -> None:
             writer.writerow([symbol, lot_size])
 
 
-def read_cached_symbols() -> List[str]:
-    if not os.path.exists(SYMBOL_CSV_PATH):
-        return []
-    with open(SYMBOL_CSV_PATH, 'r', encoding='utf-8') as handle:
-        reader = csv.DictReader(handle)
-        return [str(row.get('Symbol') or '').strip() for row in reader if str(row.get('Symbol') or '').strip()]
-
-
 def get_symbols(page_soup: Optional[BeautifulSoup] = None) -> List[str]:
     # Keep the original core logic of scraping Zerodha's futures page, but make
     # it reusable and lighter by allowing the caller to pass the already-fetched soup.
@@ -213,11 +205,6 @@ def load_symbol_universe(instruments: Sequence[dict]) -> List[str]:
         return symbols
     except Exception as exc:
         log(f'Unable to refresh symbol/lot-size scrape: {exc}')
-
-    cached_symbols = read_cached_symbols()
-    if cached_symbols:
-        log(f'Using cached stock symbol list with {len(cached_symbols)} symbols')
-        return cached_symbols
 
     # Final fallback: derive the stock names directly from the option master.
     derived_symbols = sorted(
