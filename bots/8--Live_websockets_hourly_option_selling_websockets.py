@@ -142,7 +142,7 @@ DAY_CONFIGURATION = {
         'option_mode'                : 'buy',
         },
     2: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 19,
-        'lots': 5, 'live_mode': 0,
+        'lots': 3, 'live_mode': 1,
         'pos1_stop'                   : 20000,  # Wed per-leg SL for 1st position
         'pos2_close_target'           : 50000,  # Wed total PnL target to close 2nd position
         'global_stop_atr_multiplier'  : 20.0,   # Wed
