@@ -714,14 +714,21 @@ def run_trading_process():
         price_put = initial_prices.get(f"{OPT_EXCHANGE}:{sym_entry_put}", {}).get('last_price', 0)
         price_call = initial_prices.get(f"{OPT_EXCHANGE}:{sym_entry_call}", {}).get('last_price', 0)
         
+        print(f"[{get_now_str()}] Skew Balance Check | Before | PE Strike: {entry_put_strike} ({sym_entry_put}) | PE Price: {price_put} | CE Strike: {entry_call_strike} ({sym_entry_call}) | CE Price: {price_call} | Threshold: 1.25x", flush=True)
         if price_put > 1.25 * price_call:
-            print(f"[{get_now_str()}] Skew Balance: PE ({price_put}) > 1.25x CE ({price_call}). Shifting CE Down.", flush=True)
+            old_entry_call_strike = entry_call_strike
+            print(f"[{get_now_str()}] Skew Balance Decision: Adjustment needed. PE ({price_put}) > 1.25x CE ({price_call}). Shifting CE down by {STRIKE_STEP}.", flush=True)
             entry_call_strike -= STRIKE_STEP
             token_entry_call, sym_entry_call = get_token_and_symbol(nifty_options, entry_call_strike, 'CE')
+            print(f"[{get_now_str()}] Skew Balance After | CE Strike: {old_entry_call_strike} -> {entry_call_strike} ({sym_entry_call}) | PE Strike unchanged: {entry_put_strike} ({sym_entry_put})", flush=True)
         elif 1.25 * price_put < price_call:
-            print(f"[{get_now_str()}] Skew Balance: CE ({price_call}) > 1.25x PE ({price_put}). Shifting PE Up.", flush=True)
+            old_entry_put_strike = entry_put_strike
+            print(f"[{get_now_str()}] Skew Balance Decision: Adjustment needed. CE ({price_call}) > 1.25x PE ({price_put}). Shifting PE up by {STRIKE_STEP}.", flush=True)
             entry_put_strike += STRIKE_STEP
             token_entry_put, sym_entry_put = get_token_and_symbol(nifty_options, entry_put_strike, 'PE')
+            print(f"[{get_now_str()}] Skew Balance After | PE Strike: {old_entry_put_strike} -> {entry_put_strike} ({sym_entry_put}) | CE Strike unchanged: {entry_call_strike} ({sym_entry_call})", flush=True)
+        else:
+            print(f"[{get_now_str()}] Skew Balance Decision: No adjustment needed. PE Strike remains {entry_put_strike} ({sym_entry_put}); CE Strike remains {entry_call_strike} ({sym_entry_call}).", flush=True)
             
         hedge_put_strike = entry_put_strike - (10 * STRIKE_STEP)
         hedge_call_strike = entry_call_strike + (10 * STRIKE_STEP)
@@ -741,7 +748,7 @@ def run_trading_process():
         sub_tokens = [t for t in [token_entry_put, token_entry_call, token_hedge_put, token_hedge_call, token_buy_ce, token_buy_pe] if t]
         kws.subscribe(sub_tokens)
         kws.set_mode(kws.MODE_LTP, sub_tokens)
-        time.sleep(2) 
+        time.sleep(0.25) 
         
         snap_symbols = [f"{OPT_EXCHANGE}:{s}" for s in [sym_entry_put, sym_entry_call, sym_hedge_put, sym_hedge_call, sym_buy_pe, sym_buy_ce] if s]
         snapshot = get_ltp_safe(kite, snap_symbols)
