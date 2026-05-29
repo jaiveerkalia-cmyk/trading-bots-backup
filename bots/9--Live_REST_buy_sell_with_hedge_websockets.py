@@ -85,14 +85,10 @@ DAY_CONFIGURATION = {
         'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': True},
     
     # Wednesday (NIFTY)
-    # 2: {'target_index': 'NIFTY', 'start': '10:45', 'exit': '14:45', 'entry_gap': 8, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
-    #     'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
-    #     'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-    #     'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False},
-    2: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
-        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': True, 'atr_ema_window': 20,
-        'atr_stop_per_lot': 10, 'atr_entry_gap': 20, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False},
+    2: {'target_index': 'NIFTY', 'start': '10:45', 'exit': '14:45', 'entry_gap': 8, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
+        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
+        'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False},
     
     # Thursday (SENSEX)
     3: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
