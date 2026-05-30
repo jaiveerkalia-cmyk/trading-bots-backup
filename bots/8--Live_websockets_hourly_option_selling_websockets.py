@@ -234,6 +234,41 @@ def get_now_str():
 def get_now():
     return datetime.now(IST)
 
+def normalize_candle_time(ts):
+    """
+    Converts API/build candle timestamps to a comparable minute-level key.
+    Kite API rows and locally built rows can carry different timezone objects,
+    but the strategy only needs the local candle start time for ordering.
+    """
+    t = pd.Timestamp(ts)
+    if t.tzinfo is not None:
+        t = t.tz_localize(None)
+    return t.replace(second=0, microsecond=0)
+
+def prepare_hourly_df_for_logic(hourly_df, context='hourly'):
+    """
+    Sorts hourly candles by start time and removes duplicate candle slots.
+    In BUILD/WS modes the freshly built candle is appended after API context,
+    so keep='last' keeps the locally built candle when API returns the same
+    hourly slot.
+    """
+    if hourly_df.empty or 'date' not in hourly_df.columns:
+        return hourly_df
+
+    df = hourly_df.copy()
+    df['_candle_time'] = df['date'].apply(normalize_candle_time)
+    before = len(df)
+    df = (
+        df.sort_values('_candle_time')
+          .drop_duplicates(subset=['_candle_time'], keep='last')
+          .drop(columns=['_candle_time'])
+          .reset_index(drop=True)
+    )
+    removed = before - len(df)
+    if removed:
+        print(f"[{get_now_str()}] [{context}] Removed {removed} duplicate hourly candle(s); using built candle for duplicate slot", flush=True)
+    return df
+
 def commission(quantity, buy_price, sell_price):
     """
     Calculates total charges for BSE Equity Options (Sensex/Bankex)
@@ -1101,6 +1136,8 @@ def run_trading_process():
             print(f"[{get_now_str()}] Fetching 10:15 hourly candle for entry levels...", flush=True)
             hourly_df = fetch_today_hourly(kite, index_token)
 
+        hourly_df = prepare_hourly_df_for_logic(hourly_df, context='INIT')
+
         if hourly_df.empty:
             print("Could not fetch hourly candles. Exiting.", flush=True)
             return
@@ -1507,6 +1544,8 @@ def run_trading_process():
                     time.sleep(HOURLY_CANDLE_WAIT_SECONDS)
                     hourly_df = fetch_today_hourly(kite, index_token)
 
+                hourly_df = prepare_hourly_df_for_logic(hourly_df, context='HOURLY')
+
                 if not hourly_df.empty and len(hourly_df) >= 2 and pos_num == 0:
                     latest_candle   = hourly_df.iloc[-1]
                     previous_candle = hourly_df.iloc[-2]
@@ -1519,7 +1558,8 @@ def run_trading_process():
                     close_near_high = (latest_candle['high']  - latest_candle['close']) <= candle_range * CANDLE_CLOSE_THRESHOLD
 
                     # --- Detailed candle print for every hourly logic check ---
-                    print(f"[{get_now_str()}] HOURLY CANDLE | O:{latest_candle['open']} H:{latest_candle['high']} L:{latest_candle['low']} C:{latest_candle['close']}", flush=True)
+                    print(f"[{get_now_str()}] PREV CANDLE   | D:{previous_candle.get('date', 'N/A')} O:{previous_candle['open']} H:{previous_candle['high']} L:{previous_candle['low']} C:{previous_candle['close']}", flush=True)
+                    print(f"[{get_now_str()}] HOURLY CANDLE | D:{latest_candle.get('date', 'N/A')} O:{latest_candle['open']} H:{latest_candle['high']} L:{latest_candle['low']} C:{latest_candle['close']}", flush=True)
                     cnl_val = latest_candle['close'] - latest_candle['low']
                     cnh_val = latest_candle['high']  - latest_candle['close']
                     cnl_thr = candle_range * CANDLE_CLOSE_THRESHOLD
