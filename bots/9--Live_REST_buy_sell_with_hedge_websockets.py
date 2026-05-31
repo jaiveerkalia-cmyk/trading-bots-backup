@@ -625,7 +625,7 @@ def run_trading_process():
             calc_time = "09:00"
             print(f"[{get_now_str()}] Pre-start setup active. Waiting for calculation time: {calc_time}", flush=True)
             while datetime.now().strftime("%H:%M") < calc_time:
-                time.sleep(5)
+                time.sleep(1)
 
             reference_dt = datetime.now(IST)
 
@@ -663,7 +663,7 @@ def run_trading_process():
         while True:
             now_str = datetime.now().strftime("%H:%M")
             if now_str >= config['start']: break
-            time.sleep(5)
+            time.sleep(1)
             
         # 6. Levels
         print(f"\n[{get_now_str()}] --- CALCULATING LEVELS ---", flush=True)

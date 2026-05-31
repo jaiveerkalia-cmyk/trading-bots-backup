@@ -679,7 +679,7 @@ def run_trading_process():
         while True:
             now_str = datetime.now().strftime("%H:%M")
             if now_str >= config['start']: break
-            time.sleep(5)
+            time.sleep(1)
             
         # 7. Levels
         print(f"\n[{get_now_str()}] --- CALCULATING LEVELS ---", flush=True)
