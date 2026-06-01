@@ -12,12 +12,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from kiteconnect import KiteConnect
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OPTION_OUTPUT_ROOT = os.path.normpath(os.path.join(BASE_DIR, '..', 'data', 'stock_options_data'))
-SYMBOL_CSV_PATH = os.path.join(BASE_DIR, 'fo_mktlots.csv')
-LOT_SIZE_CSV_PATH = os.path.join(BASE_DIR, '..', 'GetData', 'Symbols_lot_size.csv')
-INSTRUMENT_CACHE_PATH = os.path.join(BASE_DIR, '..', 'GetData', 'instrument_list.csv')
-AUTH_PATH = os.path.join(BASE_DIR, 'auth.txt')
+AUTH_PATH = '/app/config/auth.txt'
+DATA_ROOT = '/app/data/stock_options_data'
+OPTION_OUTPUT_ROOT = DATA_ROOT
+SYMBOL_CSV_PATH = '/app/data/fo_mktlots.csv'
+LOT_SIZE_CSV_PATH = '/app/data/Symbols_lot_size.csv'
+INSTRUMENT_CACHE_PATH = '/app/data/instrument_list.csv'
 MARGIN_PAGE_URL = 'https://zerodha.com/margin-calculator/Futures/'
 MARGIN_PAGE_USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -158,6 +158,7 @@ def parse_margin_lot_sizes(page_soup: BeautifulSoup) -> List[Tuple[str, int]]:
 
 
 def write_symbol_csv(symbols: Sequence[str]) -> None:
+    os.makedirs(os.path.dirname(SYMBOL_CSV_PATH), exist_ok=True)
     with open(SYMBOL_CSV_PATH, 'w', newline='', encoding='utf-8') as handle:
         writer = csv.writer(handle)
         writer.writerow(['Symbol'])

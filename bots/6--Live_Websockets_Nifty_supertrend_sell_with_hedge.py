@@ -1,4 +1,6 @@
 import logging
+import subprocess
+import sys
 from kiteconnect import KiteTicker
 # logging.basicConfig(level=logging.DEBUG)
 import threading
@@ -6,7 +8,6 @@ import time
 import datetime
 from collections import OrderedDict
 # from datetime import time
-# import sys  # To find out the script name (in argv[0])
 import pandas as pd
 from pprint import pprint
 from datetime import datetime, timedelta
@@ -34,9 +35,11 @@ start_time = '09:35'
 supertrend_period = 10
 stop_percent = 0.5
 reverse_threshold_percentage = 0.1
+exit_check_interval_seconds = 1
+token_swap_time = "09:00"
 
 gd_path = '/app/data/'
-results_folder = 'Nifty_sell_supertrend_results'
+results_folder = 'Nifty_sell_supertrend_results_websockets'
 
 call_token, put_token,hedge_call_token,hedge_put_token,mid_loop,prev_call_token, prev_put_token,put_stop_price,call_stop_price = 0,0,0,0,0,0,0,0,0
 entry_call_price,entry_put_price,entry_put,entry_call,hedge_put,hedge_call,hedge_put_price,hedge_call_price,profit,final_close = 0,0,0,0,0,0,0,0,0,0
@@ -45,6 +48,48 @@ sell_put_flag, sell_call_flag, buy_put_flag, buy_call_flag = 0,0,0,0
 tick_list = []
 token_list = []
 live_mode = 0
+live_market_data = {}
+tick_lock = threading.Lock()
+
+def on_ticks(ws, ticks):
+    with tick_lock:
+        for tick in ticks:
+            try:
+                instrument_token = tick.get('instrument_token')
+                last_price = tick.get('last_price', 0)
+
+                if instrument_token is None:
+                    continue
+
+                if last_price is None or last_price <= 0:
+                    if instrument_token not in live_market_data:
+                        live_market_data[instrument_token] = 0
+                    continue
+
+                live_market_data[instrument_token] = last_price
+            except Exception as e:
+                print(f"WebSocket tick ignored due to processing error: {e}")
+
+def on_connect(ws, response):
+    print("WebSocket Connected Successfully.")
+
+def get_symbol_and_token(zerodha_instruments_list, strike, instrument_type):
+    option_rows = zerodha_instruments_list[zerodha_instruments_list['strike'] == int(strike)]
+    row = option_rows[option_rows['tradingsymbol'].str.contains(instrument_type, na=False)].iloc[0]
+    return row['tradingsymbol'], int(row['instrument_token'])
+
+def subscribe_tokens(kws, tokens):
+    tokens = [int(token) for token in tokens if token]
+    if not tokens:
+        return
+    kws.subscribe(tokens)
+    kws.set_mode(kws.MODE_LTP, tokens)
+    time.sleep(0.25)
+
+def get_live_price(instrument_token, fallback_price):
+    with tick_lock:
+        live_price = live_market_data.get(instrument_token, 0)
+    return live_price if live_price > 0 else fallback_price
 
 def commission(quantity, buy_price, sell_price):
     """
@@ -409,7 +454,7 @@ def place_order(kite, sym, qty, side):
 
 
 
-def sell_fn(kite, zerodha_instruments_list, expiry):
+def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     global total_premium,put_stop_price,call_stop_price,opening_underlying_price, call_open, put_open,option_df,call_token,token,put_token,hedge_call_token,hedge_put_token,current_call_buy,current_put_buy,entry_call_price,entry_put_price,entry_put,entry_call,hedge_put,hedge_call,hedge_put_price,hedge_call_price
     sell_put_flag, sell_call_flag, buy_put_flag, buy_call_flag = 0,0,0,0
     current_profit, final_profit = 0,0
@@ -421,9 +466,16 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
     intraday_positions = pd.read_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv')
     final_position_df = pd.read_csv(gd_path + results_folder + '/Final_daily_pnl.csv')
 
+    kws = KiteTicker(api_key, access_token)
+    kws.on_ticks = on_ticks
+    kws.on_connect = on_connect
+    ws_thread = threading.Thread(target=kws.connect, kwargs={'threaded': True})
+    ws_thread.daemon = True
+    ws_thread.start()
+
     live_mode = 0
     if datetime.now().strftime('%w') == '5':
-        live_mode = 1
+        live_mode = 0
         lots = lots_num
         qty = lots*lot_size
     else:
@@ -595,8 +647,9 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
             entry_put = atm_strike + (entry_strike_gap * strike_difference)
             hedge_put = entry_put-strike_hedge_gap*strike_difference
             
-            sym_put = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(entry_put)]['tradingsymbol'].values if 'PE' in item)
-            sym_hedge_put = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(hedge_put)]['tradingsymbol'].values if 'PE' in item)
+            sym_put, put_token = get_symbol_and_token(zerodha_instruments_list, entry_put, 'PE')
+            sym_hedge_put, hedge_put_token = get_symbol_and_token(zerodha_instruments_list, hedge_put, 'PE')
+            subscribe_tokens(kws, [put_token, hedge_put_token])
             print(sym_put, sym_hedge_put)
 
             if live_mode == 1:
@@ -626,6 +679,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
             
             intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, 0, 0 , 0, 'Open - Sell_Put_Opened']
             intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
+            current_entry_put_price = entry_put_price
+            exit_hedge_put_price = entry_hedge_put_price
 
             print(f"{datetime.now()} - Put Entry: {entry_put}, Hedge: {hedge_put} | Entry Price: {entry_put_price}, Hedge Price: {entry_hedge_put_price}")
 
@@ -634,8 +689,9 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
             entry_call = atm_strike - (entry_strike_gap * strike_difference)
             hedge_call = entry_call+strike_hedge_gap*strike_difference
         
-            sym_call = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(entry_call)]['tradingsymbol'].values if 'CE' in item)
-            sym_hedge_call = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(hedge_call)]['tradingsymbol'].values if 'CE' in item)
+            sym_call, call_token = get_symbol_and_token(zerodha_instruments_list, entry_call, 'CE')
+            sym_hedge_call, hedge_call_token = get_symbol_and_token(zerodha_instruments_list, hedge_call, 'CE')
+            subscribe_tokens(kws, [call_token, hedge_call_token])
             print(sym_call, sym_hedge_call)
 
             if live_mode == 1:
@@ -663,39 +719,27 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                     print(e)
             intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, 0, 0 , 0, 'Open - Sell_Call_Opened']
             intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
+            current_entry_call_price = entry_call_price
+            exit_hedge_call_price = entry_hedge_call_price
                 
             print(f"{datetime.now()} - Call Entry: {entry_call}, Hedge: {hedge_call} | Entry Price: {entry_call_price}, Hedge Price: {entry_hedge_call_price}")
 
         ######### START CHECKING THE ENTRY CONDITIONS
         counter, sell_put_profit, sell_call_profit = 0,0,0
+        last_status_print_minute = -1
         
         while True:
-            time.sleep(60 - time.localtime().tm_sec)
+            time.sleep(exit_check_interval_seconds)
             counter+=1
             
             ####### GET CURRENT PRICES FOR ALL THE SYMBOLS
-            
-            for _ in range(10):
+            if sell_put_flag == 1:
+                current_entry_put_price = get_live_price(put_token, current_entry_put_price)
+                exit_hedge_put_price = get_live_price(hedge_put_token, exit_hedge_put_price)
 
-                try:
-
-                    if sell_put_flag == 1:
-                        a1 = kite.ltp('NFO:'+sym_put)
-                        current_entry_put_price = (a1['NFO:'+sym_put]['last_price'])
-                        a1 = kite.ltp('NFO:'+sym_hedge_put)
-                        exit_hedge_put_price = (a1['NFO:'+sym_hedge_put]['last_price'])
-
-                    if sell_call_flag == 1:
-                        a1 = kite.ltp('NFO:'+sym_call)
-                        current_entry_call_price = (a1['NFO:'+sym_call]['last_price'])
-                        a1 = kite.ltp('NFO:'+sym_hedge_call)
-                        exit_hedge_call_price = (a1['NFO:'+sym_hedge_call]['last_price'])
-
-                    break
-
-                except Exception as e:
-                    print(e)
-                    time.sleep(1)
+            if sell_call_flag == 1:
+                current_entry_call_price = get_live_price(call_token, current_entry_call_price)
+                exit_hedge_call_price = get_live_price(hedge_call_token, exit_hedge_call_price)
 
             ###################### CHECK PROFIT AND EXITS ################################
 
@@ -711,12 +755,15 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
             
             put_stop_price = (1 + stop_percent) * entry_put_price if sell_put_flag == 1 else 0
             call_stop_price = (1 + stop_percent) * entry_call_price if sell_call_flag == 1 else 0
-            print(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-                f"Status | Realized P&L={final_profit:.2f} | "
-                f"PE strike={entry_put}, Entry={entry_put_price:.2f}, LTP={current_entry_put_price:.2f}, Stop={put_stop_price:.2f}, P&L={sell_put_profit:.2f} | "
-                f"CE strike={entry_call}, Entry={entry_call_price:.2f}, LTP={current_entry_call_price:.2f}, Stop={call_stop_price:.2f}, P&L={sell_call_profit:.2f}"
-            )
+            current_status_minute = datetime.now().minute
+            if current_status_minute != last_status_print_minute:
+                print(
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"Status | Realized P&L={final_profit:.2f} | "
+                    f"PE strike={entry_put}, Entry={entry_put_price:.2f}, LTP={current_entry_put_price:.2f}, Stop={put_stop_price:.2f}, P&L={sell_put_profit:.2f} | "
+                    f"CE strike={entry_call}, Entry={entry_call_price:.2f}, LTP={current_entry_call_price:.2f}, Stop={call_stop_price:.2f}, P&L={sell_call_profit:.2f}"
+                )
+                last_status_print_minute = current_status_minute
 
             ########################## EXIT AT THE END OF DAY #############################
             if (datetime.now().hour == 15 and datetime.now().minute == 19):
@@ -800,30 +847,82 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                 print(datetime.now(), 'Sell_Call_closed', final_profit, exit_sell_call_price, exit_hedge_call_price)
                 break
 
-print('Supertrend STart')
-
-while True:
-    now_min = time.localtime().tm_min
-    s = (14 - (now_min % 15))*60
-    now_sec = time.localtime().tm_sec
-    time.sleep(60 + s - now_sec )  # `now` is between 0 and 59, so we always sleep
-    now = (datetime.now())
+def run_trading_process():
+    print('Supertrend STart', flush=True)
+    now = datetime.now()
     current_day = now.strftime('%w')
 
-    if current_day != '0' and current_day != '6':
-        if '07:45' in str(now):print("Active")
+    if current_day == '0' or current_day == '6':
+        print("Today is Weekend. Skipping.", flush=True)
+        return
+
+    print(now, flush=True)
+    with open('/app/config/'+'auth.txt', 'r') as f:
+        api_data = f.read()
+    api_key = api_data.split(',')[0]
+    access_token = api_data.split(',')[1]
+    kite = KiteConnect(api_key = api_key)
+    kite.set_access_token(access_token)
+    
+    ###########PICK UP THE ZERODHA INSTRUMENT LIST#########
+    zerodha_instruments_list = pd.read_csv('/app/data/instrument_tokens.csv')
+    zerodha_instruments_list = zerodha_instruments_list[(zerodha_instruments_list['name'] == ind) & (zerodha_instruments_list['segment'] == 'NFO-OPT')].reset_index(drop=True)
+    zerodha_instruments_list = zerodha_instruments_list[zerodha_instruments_list['expiry'] == zerodha_instruments_list['expiry'].iloc[0]]
+    expiry = zerodha_instruments_list['expiry'].iloc[0]
+    sell_fn(kite, zerodha_instruments_list,expiry, api_key, access_token)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        run_trading_process()
+    else:
+        worker_process = None
+        print(f"Supervisor Active. Waiting for {token_swap_time} to start...", flush=True)
         
-        if  '09:15' in str(now):
-            print(now)
-            with open('/app/config/'+'auth.txt', 'r') as f:
-                api_data = f.read()
-            kite = KiteConnect(api_key = api_data.split(',')[0])
-            kite.set_access_token(api_data.split(',')[1])
-            
-            ###########PICK UP THE ZERODHA INSTRUMENT LIST#########
-            zerodha_instruments_list = pd.read_csv('/app/data/instrument_tokens.csv')
-            zerodha_instruments_list = zerodha_instruments_list[(zerodha_instruments_list['name'] == ind) & (zerodha_instruments_list['segment'] == 'NFO-OPT')].reset_index(drop=True)
-            zerodha_instruments_list = zerodha_instruments_list[zerodha_instruments_list['expiry'] == zerodha_instruments_list['expiry'].iloc[0]]
-            expiry = zerodha_instruments_list['expiry'].iloc[0]
-            sell_fn(kite, zerodha_instruments_list,expiry)
+        try:
+            while True:
+                if datetime.now().strftime("%H:%M") == token_swap_time:
+                    if datetime.now().weekday() in [5, 6]:
+                        print("Today is Weekend. Skipping.", flush=True)
+                        time.sleep(70)
+                        continue
+
+                    print(f"\n{'*'*40}", flush=True)
+                    print(f"LAUNCHING DAILY TRADING WORKER: {datetime.now().date()}", flush=True)
+                    print(f"{'*'*40}\n", flush=True)
+
+                    try:
+                        worker_process = subprocess.Popen(
+                            [sys.executable, __file__, "--worker"],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1
+                        )
+
+                        for line in worker_process.stdout:
+                            print(line, end='', flush=True)
+                        
+                        worker_process.wait()
+
+                    except Exception as e:
+                        print(f"Worker Crash/Interruption: {e}", flush=True)
+                    
+                    print("\nWorker Finished. Supervisor sleeping until tomorrow.", flush=True)
+                    worker_process = None
+                    time.sleep(70)
+                
+                time.sleep(30)
+
+        except KeyboardInterrupt:
+            print("\nSupervisor stopping by User Request (Ctrl+C).", flush=True)
+        
+        finally:
+            if worker_process and worker_process.poll() is None:
+                print("\n[SAFETY] Killing background Worker process...", flush=True)
+                try:
+                    worker_process.terminate()
+                    worker_process.wait(timeout=5)
+                except Exception:
+                    worker_process.kill()
+                print("[SAFETY] Worker terminated.", flush=True)
 

@@ -32,6 +32,8 @@ MIN_QUOTE_CHUNK_SIZE = 100
 QUOTE_REQUEST_INTERVAL_SECONDS = 1.05
 COLLECTION_OFFSET_SECONDS = 10
 COLLECTION_GRACE_SECONDS = 5
+AUTH_PATH = '/app/config/auth.txt'
+DATA_ROOT = '/app/data/MCX_options_data'
 
 
 @dataclass(frozen=True)
@@ -71,11 +73,11 @@ def get_base_dir() -> str:
 
 
 def get_auth_path(base_dir: str) -> str:
-    return os.path.join(base_dir, 'auth.txt')
+    return AUTH_PATH
 
 
 def get_output_root(base_dir: str) -> str:
-    return os.path.normpath(os.path.join(base_dir, '..', 'data', 'MCX_options_data'))
+    return DATA_ROOT
 
 
 def parse_auth_file(auth_path: str) -> Tuple[str, str]:
