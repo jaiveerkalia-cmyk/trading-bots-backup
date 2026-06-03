@@ -1,4 +1,6 @@
 import logging
+import subprocess
+import sys
 from kiteconnect import KiteTicker
 # logging.basicConfig(level=logging.DEBUG)
 import threading
@@ -6,7 +8,6 @@ import time
 import datetime
 from collections import OrderedDict
 # from datetime import time
-# import sys  # To find out the script name (in argv[0])
 import pandas as pd
 from pprint import pprint
 from datetime import datetime, timedelta
@@ -28,53 +29,18 @@ min_buy_price = 15
 entry_strike_gap = 0
 strike_difference = 50
 strike_hedge_gap = 10
+lots_num = 10
 lot_size = 65
+start_time = '09:35'
+supertrend_period = 10
+stop_percent = 0.5
+reverse_threshold_percentage = 0.1
+exit_check_interval_seconds = 1
+token_swap_time = "09:00"
 
 gd_path = '/app/data/'
-results_folder = 'Nifty_sell_supertrend_results'
+results_folder = 'Nifty_sell_supertrend_results_websockets'
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DAY-OF-WEEK TRADING CONFIG
-# Keys: 0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday
-# live_mode: 1 = live trading (real orders placed), 0 = paper trading
-# ─────────────────────────────────────────────────────────────────────────────
-DAY_CONFIG = {
-    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Friday
-}
-
-def get_day_config():
-    """Returns the DAY_CONFIG entry for today (weekday 0=Mon to 4=Fri)."""
-    today_weekday = datetime.now().weekday()
-    return DAY_CONFIG.get(today_weekday, DAY_CONFIG[0])
-
-def print_tomorrow_mode():
-    """Prints all trading parameters for the next trading day."""
-    day_names = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'}
-    today_weekday = datetime.now().weekday()
-    next_trading_offset = 1
-    next_weekday = (today_weekday + next_trading_offset) % 7
-    while next_weekday in [5, 6]:
-        next_trading_offset += 1
-        next_weekday = (today_weekday + next_trading_offset) % 7
-    next_cfg = DAY_CONFIG.get(next_weekday, DAY_CONFIG[0])
-    mode_str = 'LIVE TRADING' if next_cfg['live_mode'] == 1 else 'PAPER TRADING'
-    hedgeless_str = 'YES (no hedges)' if next_cfg['hedgeless_mode'] == 1 else 'NO (hedges active)'
-    print(f"\n{'='*60}")
-    print(f"  TOMORROW ({day_names[next_weekday]}) CONFIGURATION SUMMARY:")
-    print(f"  Mode              : {mode_str}")
-    print(f"  lots_num          : {next_cfg['lots_num']}")
-    print(f"  start_time        : {next_cfg['start_time']}")
-    print(f"  supertrend_period : {next_cfg['supertrend_period']}")
-    print(f"  stop_percent      : {next_cfg['stop_percent']}")
-    print(f"  reverse_threshold : {next_cfg['reverse_threshold_percentage']}")
-    print(f"  global_stop/lot   : {next_cfg['global_stop_per_lot']}")
-    print(f"  hedgeless_mode    : {hedgeless_str}")
-    print(f"{'='*60}\n")
-    
 call_token, put_token,hedge_call_token,hedge_put_token,mid_loop,prev_call_token, prev_put_token,put_stop_price,call_stop_price = 0,0,0,0,0,0,0,0,0
 entry_call_price,entry_put_price,entry_put,entry_call,hedge_put,hedge_call,hedge_put_price,hedge_call_price,profit,final_close = 0,0,0,0,0,0,0,0,0,0
 current_call_buy,current_put_buy,total_premium,opening_underlying_price, call_open, put_open = 0,0,0,0,1,1
@@ -82,6 +48,48 @@ sell_put_flag, sell_call_flag, buy_put_flag, buy_call_flag = 0,0,0,0
 tick_list = []
 token_list = []
 live_mode = 0
+live_market_data = {}
+tick_lock = threading.Lock()
+
+def on_ticks(ws, ticks):
+    with tick_lock:
+        for tick in ticks:
+            try:
+                instrument_token = tick.get('instrument_token')
+                last_price = tick.get('last_price', 0)
+
+                if instrument_token is None:
+                    continue
+
+                if last_price is None or last_price <= 0:
+                    if instrument_token not in live_market_data:
+                        live_market_data[instrument_token] = 0
+                    continue
+
+                live_market_data[instrument_token] = last_price
+            except Exception as e:
+                print(f"WebSocket tick ignored due to processing error: {e}")
+
+def on_connect(ws, response):
+    print("WebSocket Connected Successfully.")
+
+def get_symbol_and_token(zerodha_instruments_list, strike, instrument_type):
+    option_rows = zerodha_instruments_list[zerodha_instruments_list['strike'] == int(strike)]
+    row = option_rows[option_rows['tradingsymbol'].str.contains(instrument_type, na=False)].iloc[0]
+    return row['tradingsymbol'], int(row['instrument_token'])
+
+def subscribe_tokens(kws, tokens):
+    tokens = [int(token) for token in tokens if token]
+    if not tokens:
+        return
+    kws.subscribe(tokens)
+    kws.set_mode(kws.MODE_LTP, tokens)
+    time.sleep(0.25)
+
+def get_live_price(instrument_token, fallback_price):
+    with tick_lock:
+        live_price = live_market_data.get(instrument_token, 0)
+    return live_price if live_price > 0 else fallback_price
 
 def commission(quantity, buy_price, sell_price):
     """
@@ -219,36 +227,53 @@ def get_best_atm_strike(kite, atm_strike, zerodha_instruments_list):
     """
     start = time.time()
     
+    # ---------------------------------------------------------
+    # 1. PREPARE SYMBOLS LIST (Batch Preparation)
+    # ---------------------------------------------------------
     symbols_to_fetch = []
     strike_symbol_map = {} 
 
+    # We check strikes from -150 to +200 relative to input ATM
     for x1 in range(-3, 5):
         test_strike = int(atm_strike) + (x1 * 50)
         
         try:
+            # We filter the DataFrame to find the specific CE and PE for this strike.
+            # NOTE: Ensure 'zerodha_instruments_list' is already filtered for the 
+            # correct expiry/symbol to ensure this runs fast.
+            
+            # Find PE Symbol
             sym_put = next(item for item in zerodha_instruments_list[
                 zerodha_instruments_list['strike'] == int(test_strike)
             ]['tradingsymbol'].values if 'PE' in item)
             
+            # Find CE Symbol
             sym_call = next(item for item in zerodha_instruments_list[
                 zerodha_instruments_list['strike'] == int(test_strike)
             ]['tradingsymbol'].values if 'CE' in item)
             
+            # Append to our batch list
             symbols_to_fetch.append('NFO:' + sym_put)
             symbols_to_fetch.append('NFO:' + sym_call)
             
+            # Map strike to symbols for the calculation phase later
             strike_symbol_map[test_strike] = {'PE': 'NFO:' + sym_put, 'CE': 'NFO:' + sym_call}
             
         except StopIteration:
+            # Strike not found in the instrument list (e.g. out of range)
             continue
         except Exception as e:
             print(f"Skipping strike {test_strike} due to data error: {e}")
             continue
 
+    # Safety: If no symbols were found, return original ATM to avoid API errors
     if not symbols_to_fetch:
         print("CRITICAL: No matching symbols found in instrument list. Returning input ATM.")
         return atm_strike
 
+    # ---------------------------------------------------------
+    # 2. FETCH ALL DATA IN ONE API CALL (With 20 Retries)
+    # ---------------------------------------------------------
     all_ltp = {}
     success = False
 
@@ -256,15 +281,18 @@ def get_best_atm_strike(kite, atm_strike, zerodha_instruments_list):
         try:
             all_ltp = kite.ltp(symbols_to_fetch)
             success = True
-            break
+            break # Success! Exit the retry loop
         except Exception as e:
             print(f"API Attempt {attempt+1}/20 failed: {e}")
-            time.sleep(1)
+            time.sleep(1) # Wait 1 second before retrying
     
     if not success:
         print("CRITICAL: Could not fetch quotes after 20 attempts. Returning input ATM.")
         return atm_strike
 
+    # ---------------------------------------------------------
+    # 3. CALCULATE BEST ATM (The Comparison Logic)
+    # ---------------------------------------------------------
     org_price_difference = 9999999.0 
     new_atm_strike = atm_strike
 
@@ -274,10 +302,12 @@ def get_best_atm_strike(kite, atm_strike, zerodha_instruments_list):
     for x1 in range(-3, 5):
         test_strike = int(atm_strike) + (x1 * 50)
         
+        # Only process if we successfully identified symbols for this strike
         if test_strike in strike_symbol_map:
             sym_put = strike_symbol_map[test_strike]['PE']
             sym_call = strike_symbol_map[test_strike]['CE']
             
+            # Only process if API returned data for both
             if sym_put in all_ltp and sym_call in all_ltp:
                 put_price = all_ltp[sym_put]['last_price']
                 call_price = all_ltp[sym_call]['last_price']
@@ -286,6 +316,7 @@ def get_best_atm_strike(kite, atm_strike, zerodha_instruments_list):
                 
                 print(f"{test_strike:<10} | {call_price:<10} | {put_price:<10} | {price_difference:<10.2f}")
                 
+                # Update if we found a smaller difference
                 if price_difference < org_price_difference:
                     org_price_difference = price_difference
                     new_atm_strike = test_strike
@@ -298,9 +329,11 @@ def get_best_atm_strike(kite, atm_strike, zerodha_instruments_list):
 
 def place_order(kite, sym, qty, side):
     
+    # Format symbol explicitly for NFO LTP fetching
     ltp_sym = f"NFO:{sym}"
     order_side = kite.TRANSACTION_TYPE_BUY if side == 'BUY' else kite.TRANSACTION_TYPE_SELL
 
+    # --- Nested Helper 1: Fetch LTP ---
     def get_ltp():
         ltp_sleep = 0.5
         for attempt in range(10):
@@ -313,26 +346,32 @@ def place_order(kite, sym, qty, side):
                 print(f"LTP fetch error attempt {attempt + 1}: {e}")
             
             time.sleep(ltp_sleep)
+            # Increase sleep time by 1s after the 3rd failed attempt
             if attempt >= 2: 
                 ltp_sleep += 1.0
         return None
 
+    # --- Nested Helper 2: Calculate Aggressive Price ---
     def get_limit_price(current_ltp):
         if side == 'BUY':
             price = current_ltp * 1.10 if current_ltp > 50 else current_ltp + 5.0
         else:
             price = current_ltp * 0.90 if current_ltp > 50 else current_ltp - 5.0
             
+        # Ensure price doesn't drop below tick size (0.05)
         price = max(price, 0.05)
         return round(round(price / 0.05) * 0.05, 2)
 
+    # 1. Fetch Initial LTP
     current_ltp = get_ltp()
     if current_ltp is None:
         print('order_placement_failed: Could not fetch initial LTP')
         return
 
+    # 2. Calculate Initial Limit Price
     limit_price = get_limit_price(current_ltp)
 
+    # 3. Place Initial Limit Order (10 retries, dynamic sleep)
     order_id = None
     place_retries = 0
     place_sleep = 1.0
@@ -356,20 +395,24 @@ def place_order(kite, sym, qty, side):
                 return 
             
             time.sleep(place_sleep)
+            # Increase sleep time by 1s after 3 retries
             if place_retries >= 3:
                 place_sleep += 1.0
 
+    # Exit if order couldn't be placed
     if not order_id:
         return
 
+    # 4. Check Fill Status and Chase Price if Partial/Unfilled
     max_modifications = 10 
     mod_count = 0
     mod_sleep = 1.0
     
     while mod_count < max_modifications:
-        time.sleep(mod_sleep)
+        time.sleep(mod_sleep) # Dynamic wait before checking status
         
         try:
+            # Fetch the history for this specific order ID
             order_history = kite.order_history(order_id)
             latest_state = order_history[-1] 
             status = latest_state['status']
@@ -382,7 +425,7 @@ def place_order(kite, sym, qty, side):
                 print(f"Order {status}. Reason: {latest_state.get('status_message', 'Unknown')}")
                 break
                 
-            elif pending_qty > 0:
+            elif pending_qty > 0: # Order is OPEN or UPDATE (Partially filled)
                 print(f"Partial/No Fill. Pending Qty: {pending_qty}. Fetching latest LTP to modify...")
                 
                 new_ltp = get_ltp()
@@ -390,6 +433,7 @@ def place_order(kite, sym, qty, side):
                 if new_ltp:
                     new_limit_price = get_limit_price(new_ltp)
                     
+                    # Modify the order explicitly as LIMIT
                     kite.modify_order(variety=kite.VARIETY_REGULAR,
                                       order_id=order_id,
                                       order_type=kite.ORDER_TYPE_LIMIT,
@@ -400,6 +444,7 @@ def place_order(kite, sym, qty, side):
         except Exception as e:
             print('Order_modification_error:', e)
             
+        # Increment counters and adjust sleep uniformly for the next loop iteration
         mod_count += 1
         if mod_count >= 3:
             mod_sleep += 1.0
@@ -409,7 +454,7 @@ def place_order(kite, sym, qty, side):
 
 
 
-def sell_fn(kite, zerodha_instruments_list, expiry):
+def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     global total_premium,put_stop_price,call_stop_price,opening_underlying_price, call_open, put_open,option_df,call_token,token,put_token,hedge_call_token,hedge_put_token,current_call_buy,current_put_buy,entry_call_price,entry_put_price,entry_put,entry_call,hedge_put,hedge_call,hedge_put_price,hedge_call_price
     sell_put_flag, sell_call_flag, buy_put_flag, buy_call_flag = 0,0,0,0
     current_profit, final_profit = 0,0
@@ -417,42 +462,29 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
     initial_entry_put_price, initial_entry_call_price, initial_buy_put_price, initial_buy_call_price, current_entry_put_price, current_entry_call_price, current_buy_put_price, current_buy_call_price, entry_put_price, entry_call_price, buy_put_price, buy_call_price = 0,0,0,0,0,0,0,0,0,0,0,0
     exit_sell_call_price, exit_sell_put_price, exit_buy_call_price, exit_buy_put_price = 0,0,0,0
     entry_hedge_put_price, entry_hedge_call_price = 0,0
-
-    # ── Load today's config from DAY_CONFIG ──────────────────────────────────
-    cfg = get_day_config()
-    lots_num                     = cfg['lots_num']
-    live_mode                    = cfg['live_mode']
-    start_time                   = cfg['start_time']
-    supertrend_period            = cfg['supertrend_period']
-    stop_percent                 = cfg['stop_percent']
-    reverse_threshold_percentage = cfg['reverse_threshold_percentage']
-    global_stop_per_lot          = cfg['global_stop_per_lot']
-    hedgeless_mode               = cfg['hedgeless_mode']
-
-    day_names = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday'}
-    today_name = day_names.get(datetime.now().weekday(), 'Unknown')
-    mode_str = 'LIVE TRADING' if live_mode == 1 else 'PAPER TRADING'
-    hedgeless_str = 'YES (no hedges)' if hedgeless_mode == 1 else 'NO (hedges active)'
-    print(f"\n{'='*60}")
-    print(f"  TODAY ({today_name}) CONFIG LOADED:")
-    print(f"  Mode={mode_str} | lots_num={lots_num} | start_time={start_time} | "
-          f"supertrend_period={supertrend_period} | stop_percent={stop_percent} | "
-          f"reverse_threshold_percentage={reverse_threshold_percentage} | "
-          f"global_stop_per_lot={global_stop_per_lot} | hedgeless_mode={hedgeless_str}")
-    print(f"{'='*60}\n")
-    # ─────────────────────────────────────────────────────────────────────────
-
+    
     intraday_positions = pd.read_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv')
     final_position_df = pd.read_csv(gd_path + results_folder + '/Final_daily_pnl.csv')
 
-    lots = math.floor(1*lots_num)
-    qty = lots*lot_size
-    global_stop = -abs(global_stop_per_lot * lots)
+    kws = KiteTicker(api_key, access_token)
+    kws.on_ticks = on_ticks
+    kws.on_connect = on_connect
+    ws_thread = threading.Thread(target=kws.connect, kwargs={'threaded': True})
+    ws_thread.daemon = True
+    ws_thread.start()
 
+    live_mode = 0
+    if datetime.now().strftime('%w') == '5':
+        live_mode = 0
+        lots = lots_num
+        qty = lots*lot_size
+    else:
+        lots = math.floor(1*lots_num)
+        qty = lots*lot_size
+        
     print('Qty:', qty)
-    print(f'Global Stop: {global_stop}')
     loss_target = 4500 * lots
-
+    
     #####GET TOKEN
     now = datetime.now()
     configured_start_time = datetime.strptime(start_time, '%H:%M').time()
@@ -477,6 +509,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
 
     while True:
         try:
+            # Fetch data
             a = kite.historical_data(INSTRUMENT_TOKEN, sd, ed, '5minute')
             
             if not a:
@@ -484,6 +517,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                 time.sleep(2)
                 continue
                 
+            # 1. Safely extract and convert the latest fetched candle time
             latest_fetched_time = pd.to_datetime(a[-1]['date'])
             
             if latest_fetched_time.tzinfo is None:
@@ -491,24 +525,27 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
             else:
                 latest_fetched_time = latest_fetched_time.tz_convert('Asia/Kolkata')
 
+            # 2. THE FIX: Build the target time dynamically using the date of the latest candle
             target_candle_time = latest_fetched_time.replace(
-                hour=target_candle_config.hour,
-                minute=target_candle_config.minute,
-                second=0,
+                hour=target_candle_config.hour, 
+                minute=target_candle_config.minute, 
+                second=0, 
                 microsecond=0
             )
 
+            # 3. Compare times safely (Now comparing apples to apples on the same date)
             if latest_fetched_time >= target_candle_time:
                 print(f"Target {target_candle_config.strftime('%H:%M')} candle verified! Latest fetched: {latest_fetched_time}")
                 break
             else:
                 print(f"Target candle missing. Latest is {latest_fetched_time}. Waiting...")
                 time.sleep(2)
-
+                
         except Exception as e:
             print(f"Error occurred: {str(e)}")
-            time.sleep(2)
+            time.sleep(2)  # Wait longer on errors
 
+    # Build DataFrame and normalize the 'date' column
     df_ohlc = pd.DataFrame(a)
     df_ohlc['date'] = pd.to_datetime(df_ohlc['date'])
 
@@ -517,57 +554,75 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
     else:
         df_ohlc['date'] = df_ohlc['date'].dt.tz_convert('Asia/Kolkata')
 
+    # Slice the DataFrame exactly up to the target time of the latest trading day
     df_ohlc = df_ohlc[df_ohlc['date'] <= target_candle_time]
-    df_ohlc.reset_index(drop=True, inplace=True)
-    print(df_ohlc.tail())
 
+    # Clean up index
+    df_ohlc.reset_index(drop=True, inplace=True)
+
+    # Verify the final rows
+    print(df_ohlc.tail())
+    
 ##    df_ohlc['atr'] =  talib.ATR(df_ohlc.high, df_ohlc.low, df_ohlc.close, timeperiod= 10)
 
-    df_ohlc['prev_close'] = df_ohlc['close'].shift(1)
-    df_ohlc['tr1'] = df_ohlc['high'] - df_ohlc['low']
-    df_ohlc['tr2'] = abs(df_ohlc['high'] - df_ohlc['prev_close'])
-    df_ohlc['tr3'] = abs(df_ohlc['low'] - df_ohlc['prev_close'])
-    df_ohlc['tr'] = df_ohlc[['tr1', 'tr2', 'tr3']].max(axis=1)
+    # Step 1: Calculate True Range (TR) for each row
 
-    atr_period = supertrend_period
-    df_ohlc['atr'] = df_ohlc['tr'].rolling(atr_period).mean()
+    df_ohlc['prev_close'] = df_ohlc['close'].shift(1)  # Previous close
+
+    df_ohlc['tr1'] = df_ohlc['high'] - df_ohlc['low']  # High - Low
+
+    df_ohlc['tr2'] = abs(df_ohlc['high'] - df_ohlc['prev_close'])  # |High - Previous Close|
+
+    df_ohlc['tr3'] = abs(df_ohlc['low'] - df_ohlc['prev_close'])   # |Low - Previous Close|
+
+    df_ohlc['tr'] = df_ohlc[['tr1', 'tr2', 'tr3']].max(axis=1)  # True Range = max(tr1, tr2, tr3)
+
+    
+    # Step 2: Compute ATR (e.g., 14-period ATR)
+
+    atr_period = supertrend_period  # Standard ATR period
+
+    df_ohlc['atr'] = df_ohlc['tr'].rolling(atr_period).mean()  # Smoothed average of TR
+
+    # Cleanup (drop intermediate columns)
+
     df_ohlc.drop(['prev_close', 'tr1', 'tr2', 'tr3', 'tr'], axis=1, inplace=True)
-    df_ohlc = calculate_supertrend_numba(df_ohlc, supertrend_period, 4)
+    df_ohlc = calculate_supertrend_numba(df_ohlc, supertrend_period,4)
 
     print(df_ohlc)
     try:
         df_ohlc.to_csv('NIFTYST.csv', index=False)
     except Exception as e:
         pass
+    
 
-    if df_ohlc.iloc[-1].direction == -1:
+    if df_ohlc.iloc[-1].direction == -1:  
         sell_call_flag = 1
         sell_put_flag = 0
-    if df_ohlc.iloc[-1].direction == 1:
+    if df_ohlc.iloc[-1].direction == 1: 
         sell_put_flag = 1
-        sell_call_flag = 0
+        sell_call_flag = 0    
     print(sell_call_flag, sell_put_flag)
-
+    
     ###### GET ENTRIES AND START CHECKING THE POSITIONS ####
     ########################################################
 
     current_pos_profit = 0
-
-    for pos_num in range(0, 4):
-
-        if pos_num > 2 or (pos_num > 1 and final_profit > 0):
-            final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price, final_profit]
+    
+    for pos_num in range(0,4):
+        
+        if pos_num > 2 or (pos_num >1 and  final_profit > 0):
+            final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price,  final_profit ]
             final_position_df.to_csv(gd_path + results_folder + '/Final_daily_pnl.csv', index=False)
             print('day_over')
-            print_tomorrow_mode()
             return()
-
+        
         #### REVERSE THE SIGNAL FOR SECOND POSITION
         if pos_num >= 1:
             sell_call_flag, sell_put_flag = sell_put_flag, sell_call_flag  # Swap values
             entry_strike_gap = 2
         else: entry_strike_gap = 0
-
+        
         ###GET NIFTY CURRENT PRICE
         while True:
             try:
@@ -584,22 +639,22 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
         ################################
 
         print(sell_call_flag, sell_put_flag)
-
+        
         ###################### GET ENTRY SELL PUTS AND BUY PUTS ################################
-
+    
         if sell_put_flag == 1:
         #####GET INITIAL ENTRY PUT PRICE
             entry_put = atm_strike + (entry_strike_gap * strike_difference)
-            hedge_put = entry_put - strike_hedge_gap * strike_difference
-
-            sym_put = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(entry_put)]['tradingsymbol'].values if 'PE' in item)
-            sym_hedge_put = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(hedge_put)]['tradingsymbol'].values if 'PE' in item)
+            hedge_put = entry_put-strike_hedge_gap*strike_difference
+            
+            sym_put, put_token = get_symbol_and_token(zerodha_instruments_list, entry_put, 'PE')
+            sym_hedge_put, hedge_put_token = get_symbol_and_token(zerodha_instruments_list, hedge_put, 'PE')
+            subscribe_tokens(kws, [put_token, hedge_put_token])
             print(sym_put, sym_hedge_put)
 
             if live_mode == 1:
                 ####PLACE BUY HEDGE ORDER
-                if hedgeless_mode == 0:
-                    place_order(kite, sym_hedge_put, qty, 'BUY')
+                place_order(kite, sym_hedge_put, qty, 'BUY')
                 ####PLACE SELL ACTUAL ORDER
                 place_order(kite, sym_put, qty, 'SELL')
 
@@ -612,35 +667,36 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                 except Exception as e:
                     print(e)
                     time.sleep(1)
-
+        
             #####GET ENTRY HEDGE PUT PRICE
-            if hedgeless_mode == 0:
-                for _ in range(10):
-                    try:
-                        a1 = kite.ltp('NFO:'+sym_hedge_put)
-                        entry_hedge_put_price = (a1['NFO:'+sym_hedge_put]['last_price'])
-                        break
-                    except Exception as e:
-                        print(e)
-
-            intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, 0, 0, 0, 'Open - Sell_Put_Opened']
+            for _ in range(10):
+                try:
+                    a1 = kite.ltp('NFO:'+sym_hedge_put)
+                    entry_hedge_put_price = (a1['NFO:'+sym_hedge_put]['last_price'])
+                    break
+                except Exception as e:
+                    print(e)
+            
+            intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, 0, 0 , 0, 'Open - Sell_Put_Opened']
             intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
+            current_entry_put_price = entry_put_price
+            exit_hedge_put_price = entry_hedge_put_price
 
             print(f"{datetime.now()} - Put Entry: {entry_put}, Hedge: {hedge_put} | Entry Price: {entry_put_price}, Hedge Price: {entry_hedge_put_price}")
 
         if sell_call_flag == 1:
-        #####GET INITIAL ENTRY CALL PRICE
+        #####GET INITIAL ENTRY CALL PRICE    
             entry_call = atm_strike - (entry_strike_gap * strike_difference)
-            hedge_call = entry_call + strike_hedge_gap * strike_difference
-
-            sym_call = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(entry_call)]['tradingsymbol'].values if 'CE' in item)
-            sym_hedge_call = next(item for item in zerodha_instruments_list[zerodha_instruments_list['strike'] == int(hedge_call)]['tradingsymbol'].values if 'CE' in item)
+            hedge_call = entry_call+strike_hedge_gap*strike_difference
+        
+            sym_call, call_token = get_symbol_and_token(zerodha_instruments_list, entry_call, 'CE')
+            sym_hedge_call, hedge_call_token = get_symbol_and_token(zerodha_instruments_list, hedge_call, 'CE')
+            subscribe_tokens(kws, [call_token, hedge_call_token])
             print(sym_call, sym_hedge_call)
 
             if live_mode == 1:
                 ####PLACE BUY HEDGE ORDER
-                if hedgeless_mode == 0:
-                    place_order(kite, sym_hedge_call, qty, 'BUY')
+                place_order(kite, sym_hedge_call, qty, 'BUY')
                 ####PLACE SELL ACTUAL ORDER
                 place_order(kite, sym_call, qty, 'SELL')
 
@@ -652,205 +708,221 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                     break
                 except Exception as e:
                     time.sleep(1)
-
+        
             #####GET ENTRY HEDGE CALL PRICE
-            if hedgeless_mode == 0:
-                for _ in range(10):
-                    try:
-                        a1 = kite.ltp('NFO:'+sym_hedge_call)
-                        entry_hedge_call_price = (a1['NFO:'+sym_hedge_call]['last_price'])
-                        break
-                    except Exception as e:
-                        print(e)
-
-            intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, 0, 0, 0, 'Open - Sell_Call_Opened']
+            for _ in range(10):
+                try:
+                    a1 = kite.ltp('NFO:'+sym_hedge_call)
+                    entry_hedge_call_price = (a1['NFO:'+sym_hedge_call]['last_price'])
+                    break
+                except Exception as e:
+                    print(e)
+            intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, 0, 0 , 0, 'Open - Sell_Call_Opened']
             intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
-
+            current_entry_call_price = entry_call_price
+            exit_hedge_call_price = entry_hedge_call_price
+                
             print(f"{datetime.now()} - Call Entry: {entry_call}, Hedge: {hedge_call} | Entry Price: {entry_call_price}, Hedge Price: {entry_hedge_call_price}")
 
         ######### START CHECKING THE ENTRY CONDITIONS
-        counter, sell_put_profit, sell_call_profit = 0, 0, 0
-
+        counter, sell_put_profit, sell_call_profit = 0,0,0
+        last_status_print_minute = -1
+        
         while True:
-            time.sleep(60 - time.localtime().tm_sec)
-            counter += 1
-
+            time.sleep(exit_check_interval_seconds)
+            counter+=1
+            
             ####### GET CURRENT PRICES FOR ALL THE SYMBOLS
+            if sell_put_flag == 1:
+                current_entry_put_price = get_live_price(put_token, current_entry_put_price)
+                exit_hedge_put_price = get_live_price(hedge_put_token, exit_hedge_put_price)
 
-            for _ in range(10):
-                try:
-                    if sell_put_flag == 1:
-                        a1 = kite.ltp('NFO:'+sym_put)
-                        current_entry_put_price = (a1['NFO:'+sym_put]['last_price'])
-                        if hedgeless_mode == 0:
-                            a1 = kite.ltp('NFO:'+sym_hedge_put)
-                            exit_hedge_put_price = (a1['NFO:'+sym_hedge_put]['last_price'])
-
-                    if sell_call_flag == 1:
-                        a1 = kite.ltp('NFO:'+sym_call)
-                        current_entry_call_price = (a1['NFO:'+sym_call]['last_price'])
-                        if hedgeless_mode == 0:
-                            a1 = kite.ltp('NFO:'+sym_hedge_call)
-                            exit_hedge_call_price = (a1['NFO:'+sym_hedge_call]['last_price'])
-
-                    break
-
-                except Exception as e:
-                    print(e)
-                    time.sleep(1)
+            if sell_call_flag == 1:
+                current_entry_call_price = get_live_price(call_token, current_entry_call_price)
+                exit_hedge_call_price = get_live_price(hedge_call_token, exit_hedge_call_price)
 
             ###################### CHECK PROFIT AND EXITS ################################
 
             ######### CALCULATE CURRENT PROFIT
             if sell_put_flag == 1:
                 sell_put_profit = qty*(entry_put_price - current_entry_put_price) - commission(qty, current_entry_put_price, entry_put_price)
-                if hedgeless_mode == 0:
-                    sell_put_profit = sell_put_profit + qty*(exit_hedge_put_price-entry_hedge_put_price) - commission(qty, entry_hedge_put_price, exit_hedge_put_price)
-
+                sell_put_profit = sell_put_profit + qty*(exit_hedge_put_price-entry_hedge_put_price) - commission(qty, entry_hedge_put_price, exit_hedge_put_price)
+                
             if sell_call_flag == 1:
                 sell_call_profit = qty*(entry_call_price - current_entry_call_price) - commission(qty, current_entry_call_price, entry_call_price)
-                if hedgeless_mode == 0:
-                    sell_call_profit = sell_call_profit + qty*(exit_hedge_call_price-entry_hedge_call_price) - commission(qty, entry_hedge_call_price, exit_hedge_call_price)
-
+                sell_call_profit = sell_call_profit + qty*(exit_hedge_call_price-entry_hedge_call_price) - commission(qty, entry_hedge_call_price, exit_hedge_call_price)
+                
+            
             put_stop_price = (1 + stop_percent) * entry_put_price if sell_put_flag == 1 else 0
             call_stop_price = (1 + stop_percent) * entry_call_price if sell_call_flag == 1 else 0
-            print(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-                f"Status | Realized P&L={final_profit:.2f} | "
-                f"PE strike={entry_put}, Entry={entry_put_price:.2f}, LTP={current_entry_put_price:.2f}, Stop={put_stop_price:.2f}, P&L={sell_put_profit:.2f} | "
-                f"CE strike={entry_call}, Entry={entry_call_price:.2f}, LTP={current_entry_call_price:.2f}, Stop={call_stop_price:.2f}, P&L={sell_call_profit:.2f}"
-            )
-
-            ########################## GLOBAL STOP LOSS CHECK ############################
-            total_unrealized_pnl = sell_put_profit + sell_call_profit
-            if (final_profit + total_unrealized_pnl) <= global_stop:
-                print(f"{datetime.now()} GLOBAL STOP HIT: realized={final_profit:.2f}, unrealized={total_unrealized_pnl:.2f}, total={final_profit+total_unrealized_pnl:.2f}, limit={global_stop}")
-
-                if sell_put_flag == 1:
-                    if live_mode == 1:
-                        place_order(kite, sym_put, qty, 'BUY')
-                        if hedgeless_mode == 0:
-                            place_order(kite, sym_hedge_put, qty, 'SELL')
-                    exit_sell_put_price = current_entry_put_price
-                    final_profit = final_profit + sell_put_profit
-                    intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, exit_sell_put_price, sell_put_profit, final_profit, 'Close - Global_Stop_Hit']
-                    intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
-                    print(datetime.now(), 'Sell_Put_closed_GlobalStop', sell_put_profit, exit_sell_put_price)
-
-                if sell_call_flag == 1:
-                    if live_mode == 1:
-                        place_order(kite, sym_call, qty, 'BUY')
-                        if hedgeless_mode == 0:
-                            place_order(kite, sym_hedge_call, qty, 'SELL')
-                    exit_sell_call_price = current_entry_call_price
-                    final_profit = final_profit + sell_call_profit
-                    intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, exit_sell_call_price, sell_call_profit, final_profit, 'Close - Global_Stop_Hit']
-                    intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
-                    print(datetime.now(), 'Sell_Call_closed_GlobalStop', sell_call_profit, exit_sell_call_price)
-
-                print('Global_Stop_reached', 'Final_profit:', final_profit)
-                print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
-                final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price, final_profit]
-                final_position_df.to_csv(gd_path + results_folder + '/Final_daily_pnl.csv', index=False)
-                print_tomorrow_mode()
-                return()
-            ###############################################################################
+            current_status_minute = datetime.now().minute
+            if current_status_minute != last_status_print_minute:
+                print(
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"Status | Realized P&L={final_profit:.2f} | "
+                    f"PE strike={entry_put}, Entry={entry_put_price:.2f}, LTP={current_entry_put_price:.2f}, Stop={put_stop_price:.2f}, P&L={sell_put_profit:.2f} | "
+                    f"CE strike={entry_call}, Entry={entry_call_price:.2f}, LTP={current_entry_call_price:.2f}, Stop={call_stop_price:.2f}, P&L={sell_call_profit:.2f}"
+                )
+                last_status_print_minute = current_status_minute
 
             ########################## EXIT AT THE END OF DAY #############################
             if (datetime.now().hour == 15 and datetime.now().minute == 19):
-
+                
                 if sell_put_flag == 1:
+
                     if live_mode == 1:
                         #####CLOSE THE SELL ORDER
                         place_order(kite, sym_put, qty, 'BUY')
                         ####CLOSE THE HEDGE ORDER
-                        if hedgeless_mode == 0:
-                            place_order(kite, sym_hedge_put, qty, 'SELL')
+                        place_order(kite, sym_hedge_put, qty, 'SELL')
+
+                    #####GET EXIT PUT PRICE
 
                     exit_sell_put_price = current_entry_put_price
+                    
+
                     final_profit = final_profit + sell_put_profit
-                    intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, exit_sell_put_price, sell_put_profit, final_profit, 'Close - Sell_Put_Closed']
+                    intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, exit_sell_put_price, sell_put_profit , final_profit, 'Close - Sell_Put_Closed']
                     intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
                     print(datetime.now(), 'Sell_Put_closed', sell_put_profit, exit_sell_put_price, exit_hedge_put_price)
-
+                    
                 if sell_call_flag == 1:
+
                     if live_mode == 1:
                         #####CLOSE THE SELL ORDER
                         place_order(kite, sym_call, qty, 'BUY')
                         ####CLOSE THE HEDGE ORDER
-                        if hedgeless_mode == 0:
-                            place_order(kite, sym_hedge_call, qty, 'SELL')
+                        place_order(kite, sym_hedge_call, qty, 'SELL')
 
+                    #####GET EXIT CALL PRICE
                     exit_sell_call_price = current_entry_call_price
+                    
+
                     final_profit = final_profit + sell_call_profit
-                    intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, exit_sell_call_price, sell_call_profit, final_profit, 'Close - Sell_Call_Closed']
+                    intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, exit_sell_call_price, sell_call_profit , final_profit, 'Close - Sell_Call_Closed']
                     intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
                     print(datetime.now(), 'Sell_Call_closed', sell_call_profit, exit_sell_call_price, exit_hedge_call_price)
-
+                    
                 print('All_positions_closed', 'Final_profit:', final_profit)
                 print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
-                final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price, final_profit]
+                final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price,  final_profit ]
                 final_position_df.to_csv(gd_path + results_folder + '/Final_daily_pnl.csv', index=False)
-                print_tomorrow_mode()
+                
                 return()
 
             ################################### EXIT IF STOP LOSS / TARGET IS HIT ############################
-            if (sell_put_flag == 1 and current_entry_put_price >= (1 + stop_percent)*entry_put_price) or (sell_put_flag == 1 and pos_num >= 1 and sell_put_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
+            if (sell_put_flag == 1 and current_entry_put_price >= (1 + stop_percent)*entry_put_price) or (sell_put_flag == 1 and pos_num >=1 and sell_put_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
 
                 if live_mode == 1:
                     #####CLOSE THE SELL ORDER
                     place_order(kite, sym_put, qty, 'BUY')
                     ####CLOSE THE HEDGE ORDER
-                    if hedgeless_mode == 0:
-                        place_order(kite, sym_hedge_put, qty, 'SELL')
+                    place_order(kite, sym_hedge_put, qty, 'SELL')
 
+                #####GET EXIT PUT PRICE
                 exit_sell_put_price = current_entry_put_price
+                 
                 final_profit = final_profit + sell_put_profit
-                intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, exit_sell_put_price, sell_put_profit, final_profit, 'Close - Sell_Put_Stopped']
+                intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, exit_sell_put_price, sell_put_profit , final_profit, 'Close - Sell_Put_Stopped']
                 intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
+
                 print(datetime.now(), 'Sell_Put_closed', final_profit, exit_sell_put_price, exit_hedge_put_price)
                 break
-
-            if (sell_call_flag == 1 and current_entry_call_price >= (1 + stop_percent)*entry_call_price) or (sell_call_flag == 1 and pos_num >= 1 and sell_call_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
+                
+            if (sell_call_flag == 1 and current_entry_call_price >= (1 + stop_percent)*entry_call_price) or (sell_call_flag == 1 and pos_num >=1 and sell_call_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
 
                 if live_mode == 1:
                     #####CLOSE THE SELL ORDER
                     place_order(kite, sym_call, qty, 'BUY')
                     ####CLOSE THE HEDGE ORDER
-                    if hedgeless_mode == 0:
-                        place_order(kite, sym_hedge_call, qty, 'SELL')
+                    place_order(kite, sym_hedge_call, qty, 'SELL')
 
+                #####GET EXIT CALL PRICE
                 exit_sell_call_price = current_entry_call_price
+                
                 final_profit = final_profit + sell_call_profit
-                intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, exit_sell_call_price, sell_call_profit, final_profit, 'Close - Sell_Call_Stopped']
+                intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, exit_sell_call_price, sell_call_profit , final_profit, 'Close - Sell_Call_Stopped']
                 intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
+
                 print(datetime.now(), 'Sell_Call_closed', final_profit, exit_sell_call_price, exit_hedge_call_price)
                 break
-            
-print('Supertrend STart')
-print_tomorrow_mode()
 
-while True:
-    now_min = time.localtime().tm_min
-    s = (14 - (now_min % 15))*60
-    now_sec = time.localtime().tm_sec
-    time.sleep(60 + s - now_sec )  # `now` is between 0 and 59, so we always sleep
-    now = (datetime.now())
+def run_trading_process():
+    print('Supertrend STart', flush=True)
+    now = datetime.now()
     current_day = now.strftime('%w')
 
-    if current_day != '0' and current_day != '6':
-        if '07:45' in str(now):print("Active")
+    if current_day == '0' or current_day == '6':
+        print("Today is Weekend. Skipping.", flush=True)
+        return
+
+    print(now, flush=True)
+    with open('/app/config/'+'auth.txt', 'r') as f:
+        api_data = f.read()
+    api_key = api_data.split(',')[0]
+    access_token = api_data.split(',')[1]
+    kite = KiteConnect(api_key = api_key)
+    kite.set_access_token(access_token)
+    
+    ###########PICK UP THE ZERODHA INSTRUMENT LIST#########
+    zerodha_instruments_list = pd.read_csv('/app/data/instrument_tokens.csv')
+    zerodha_instruments_list = zerodha_instruments_list[(zerodha_instruments_list['name'] == ind) & (zerodha_instruments_list['segment'] == 'NFO-OPT')].reset_index(drop=True)
+    zerodha_instruments_list = zerodha_instruments_list[zerodha_instruments_list['expiry'] == zerodha_instruments_list['expiry'].iloc[0]]
+    expiry = zerodha_instruments_list['expiry'].iloc[0]
+    sell_fn(kite, zerodha_instruments_list,expiry, api_key, access_token)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        run_trading_process()
+    else:
+        worker_process = None
+        print(f"Supervisor Active. Waiting for {token_swap_time} to start...", flush=True)
         
-        if  '09:15' in str(now):
-            print(now)
-            with open('/app/config/'+'auth.txt', 'r') as f:
-                api_data = f.read()
-            kite = KiteConnect(api_key = api_data.split(',')[0])
-            kite.set_access_token(api_data.split(',')[1])
-            
-            ###########PICK UP THE ZERODHA INSTRUMENT LIST#########
-            zerodha_instruments_list = pd.read_csv('/app/data/instrument_tokens.csv')
-            zerodha_instruments_list = zerodha_instruments_list[(zerodha_instruments_list['name'] == ind) & (zerodha_instruments_list['segment'] == 'NFO-OPT')].reset_index(drop=True)
-            zerodha_instruments_list = zerodha_instruments_list[zerodha_instruments_list['expiry'] == zerodha_instruments_list['expiry'].iloc[0]]
-            expiry = zerodha_instruments_list['expiry'].iloc[0]
-            sell_fn(kite, zerodha_instruments_list,expiry)
+        try:
+            while True:
+                if datetime.now().strftime("%H:%M") == token_swap_time:
+                    if datetime.now().weekday() in [5, 6]:
+                        print("Today is Weekend. Skipping.", flush=True)
+                        time.sleep(70)
+                        continue
+
+                    print(f"\n{'*'*40}", flush=True)
+                    print(f"LAUNCHING DAILY TRADING WORKER: {datetime.now().date()}", flush=True)
+                    print(f"{'*'*40}\n", flush=True)
+
+                    try:
+                        worker_process = subprocess.Popen(
+                            [sys.executable, __file__, "--worker"],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1
+                        )
+
+                        for line in worker_process.stdout:
+                            print(line, end='', flush=True)
+                        
+                        worker_process.wait()
+
+                    except Exception as e:
+                        print(f"Worker Crash/Interruption: {e}", flush=True)
+                    
+                    print("\nWorker Finished. Supervisor sleeping until tomorrow.", flush=True)
+                    worker_process = None
+                    time.sleep(70)
+                
+                time.sleep(30)
+
+        except KeyboardInterrupt:
+            print("\nSupervisor stopping by User Request (Ctrl+C).", flush=True)
+        
+        finally:
+            if worker_process and worker_process.poll() is None:
+                print("\n[SAFETY] Killing background Worker process...", flush=True)
+                try:
+                    worker_process.terminate()
+                    worker_process.wait(timeout=5)
+                except Exception:
+                    worker_process.kill()
+                print("[SAFETY] Worker terminated.", flush=True)
+

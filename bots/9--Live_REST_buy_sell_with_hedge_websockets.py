@@ -38,6 +38,8 @@ TRADING_LOOP_CHECK_INTERVAL_MINUTES = 1
 # TARGETS (Per Lot)
 TARGET_PROFIT_PER_LOT = 45000 
 MAX_LOSS_PER_LOT = 3000
+# Once one leg is closed, close the other leg when total profit crosses this value.
+POST_LEG_CLOSE_PROFIT_TARGET = 100
 # PREMIUM THRESHOLDS (For Total_premium_skip)
 LOWER_THRESHOLD = 250  # Example value, adjust as needed
 UPPER_THRESHOLD = 270  # Example value, adjust as needed
@@ -70,37 +72,38 @@ INDEX_DETAILS = {
 # - When `vix_stop_mode_on` is enabled, it overrides the normal per-day
 #   `max_loss_per_lot`.
 # - When `atr_mode_on` is enabled, it affects the entry-gap and max-loss calculations.
+# - Set `hedgeless_mode` to True to sell entry strikes without buying hedges.
 # ------------------------------------------------------------------------------
 DAY_CONFIGURATION = {
     # Monday (NIFTY)
     0: {'target_index': 'NIFTY', 'start': '10:00', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False},
     
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': True},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': True, 'hedgeless_mode': True},
     
     # Wednesday (NIFTY)
     2: {'target_index': 'NIFTY', 'start': '10:45', 'exit': '14:45', 'entry_gap': 8, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': True},
     
     # Thursday (SENSEX)
     3: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': True, 'atr_ema_window': 20,
         'atr_stop_per_lot': 10, 'atr_entry_gap': 20, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False, 'hedgeless_mode': True},
     
     # Friday (NIFTY)
    4: {'target_index': 'NIFTY', 'start': '10:00', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 6, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
        'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-       'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50},
+       'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False},
     
     # Saturday/Sunday (Defaults)
     5: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 0, 'lots': 7, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
@@ -557,6 +560,7 @@ def run_trading_process():
         PERCENT_MODE = config.get('percent_mode', 1)
         ATR_MODE_ON = config.get('atr_mode_on', False)
         VIX_STOP_MODE_ON = config.get('vix_stop_mode_on', False)
+        HEDGELESS_MODE = config.get('hedgeless_mode', False)
         QUANTITY = LOTS * STANDARD_LOT_SIZE
         
         effective_entry_gap = config['entry_gap']
@@ -577,7 +581,7 @@ def run_trading_process():
         print(f"ATM Finder:   {'ENABLED' if config.get('find_atm', True) else 'DISABLED'}", flush=True)
         print(f"ATR Mode:     {'ENABLED' if ATR_MODE_ON else 'DISABLED'} | EMA Window: {config.get('atr_ema_window', 20)} | Stop Mult: {config.get('atr_stop_per_lot', 30)} | Gap %: {config.get('atr_entry_gap', 10)}", flush=True)
         print(f"VIX Stop:     {'ENABLED' if VIX_STOP_MODE_ON else 'DISABLED'}", flush=True)
-        print(f"Flags:        Skip: {config['total_premium_skip']} | Buy: {config['buy_strikes_flag']} | PftChg: {config['total_profit_change']}", flush=True)
+        print(f"Flags:        Skip: {config['total_premium_skip']} | Buy: {config['buy_strikes_flag']} | PftChg: {config['total_profit_change']} | Hedgeless: {HEDGELESS_MODE}", flush=True)
         print(f"Target/Lot:    {target_profit_per_lot}", flush=True)
         print(f"Max Loss/Lot:  {max_loss_per_lot}", flush=True)
         print(f"Global Target: {GLOBAL_PROFIT_TARGET}", flush=True)
@@ -710,10 +714,15 @@ def run_trading_process():
         else:
             print(f"[{get_now_str()}] Skew Balance Decision: No adjustment needed. PE Strike remains {entry_put_strike} ({sym_entry_put}); CE Strike remains {entry_call_strike} ({sym_entry_call}).", flush=True)
             
-        hedge_put_strike = entry_put_strike - (10 * STRIKE_STEP)
-        hedge_call_strike = entry_call_strike + (10 * STRIKE_STEP)
-        token_hedge_put, sym_hedge_put = get_token_and_symbol(nifty_options, hedge_put_strike, 'PE')
-        token_hedge_call, sym_hedge_call = get_token_and_symbol(nifty_options, hedge_call_strike, 'CE')
+        if HEDGELESS_MODE:
+            hedge_put_strike, hedge_call_strike = 0, 0
+            token_hedge_put, sym_hedge_put = None, None
+            token_hedge_call, sym_hedge_call = None, None
+        else:
+            hedge_put_strike = entry_put_strike - (10 * STRIKE_STEP)
+            hedge_call_strike = entry_call_strike + (10 * STRIKE_STEP)
+            token_hedge_put, sym_hedge_put = get_token_and_symbol(nifty_options, hedge_put_strike, 'PE')
+            token_hedge_call, sym_hedge_call = get_token_and_symbol(nifty_options, hedge_call_strike, 'CE')
         
         buy_strike_ce, buy_strike_pe = 0, 0
         token_buy_ce, sym_buy_ce, token_buy_pe, sym_buy_pe = None, None, None, None
@@ -770,7 +779,10 @@ def run_trading_process():
             print(f"ATR INFO | Entry Gap: {effective_entry_gap:.2f} | Max Loss/Lot: {max_loss_per_lot:.2f} | Global Max Loss: {GLOBAL_MAX_LOSS:.2f}", flush=True)
         print(f"PUT LEG  | Strike: {entry_put_strike} PE | Initial: {initial_ep_price} | Threshold: {threshold_put:.2f} | Stop: {stop_put:.2f}", flush=True)
         print(f"CALL LEG | Strike: {entry_call_strike} CE | Initial: {initial_ec_price} | Threshold: {threshold_call:.2f} | Stop: {stop_call:.2f}", flush=True)
-        print(f"HEDGES   | PE: {hedge_put_strike} | CE: {hedge_call_strike}", flush=True)
+        if HEDGELESS_MODE:
+            print("HEDGES   | DISABLED (hedgeless mode)", flush=True)
+        else:
+            print(f"HEDGES   | PE: {hedge_put_strike} | CE: {hedge_call_strike}", flush=True)
         if use_buy_legs:
             print(f"BUY LEGS | PE: {buy_strike_pe} (@ {initial_bp_price}) | CE: {buy_strike_ce} (@ {initial_bc_price})", flush=True)
         print(f"{'-'*60}\n", flush=True)
@@ -810,15 +822,20 @@ def run_trading_process():
             exec_price = get_quote_price(kite, sym_entry_put, 'BUY', exchange=OPT_EXCHANGE) 
             exit_price_put_sold = exec_price 
             
-            place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
-            exec_hedge = get_quote_price(kite, sym_hedge_put, 'SELL', exchange=OPT_EXCHANGE) 
-            exit_price_hedge_put = exec_hedge
-
             main_pnl = QUANTITY * (entry_price_put_sold - exec_price)
-            hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_put)
-            
             comm_main = commission(QUANTITY, exec_price, entry_price_put_sold)
-            comm_hedge = commission(QUANTITY, entry_price_hedge_put, exec_hedge)
+
+            if HEDGELESS_MODE:
+                exec_hedge = 0
+                exit_price_hedge_put = 0
+                hedge_pnl = 0
+                comm_hedge = 0
+            else:
+                place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                exec_hedge = get_quote_price(kite, sym_hedge_put, 'SELL', exchange=OPT_EXCHANGE) 
+                exit_price_hedge_put = exec_hedge
+                hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_put)
+                comm_hedge = commission(QUANTITY, entry_price_hedge_put, exec_hedge)
             
             total_leg_pnl = main_pnl + hedge_pnl - (comm_main + comm_hedge)
             final_realized_pnl += total_leg_pnl
@@ -828,7 +845,10 @@ def run_trading_process():
             realized_put_leg_pnl = total_leg_pnl
             
             print(f"    MAIN  | Entry: {entry_price_put_sold} | Exit: {exec_price}", flush=True)
-            print(f"    HEDGE | Entry: {entry_price_hedge_put} | Exit: {exec_hedge}", flush=True)
+            if HEDGELESS_MODE:
+                print("    HEDGE | DISABLED", flush=True)
+            else:
+                print(f"    HEDGE | Entry: {entry_price_hedge_put} | Exit: {exec_hedge}", flush=True)
             print(f"    STATS | Net PnL: {total_leg_pnl:.2f} (Comm: {comm_main+comm_hedge:.2f})", flush=True)
             
             tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, exec_price, total_leg_pnl, final_realized_pnl, f'Close - Put_Side_{reason}']
@@ -836,7 +856,7 @@ def run_trading_process():
             
             # --- TOTAL PROFIT CHANGE LOGIC ---
             if config['total_profit_change']:
-                GLOBAL_PROFIT_TARGET = 100
+                GLOBAL_PROFIT_TARGET = POST_LEG_CLOSE_PROFIT_TARGET
                 print(f"[{get_now_str()}] Total Profit Change Active. New Global Target: {GLOBAL_PROFIT_TARGET}", flush=True)
 
         def close_call_side(reason, sl_price=None):
@@ -850,15 +870,20 @@ def run_trading_process():
             exec_price = get_quote_price(kite, sym_entry_call, 'BUY', exchange=OPT_EXCHANGE)
             exit_price_call_sold = exec_price 
             
-            place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
-            exec_hedge = get_quote_price(kite, sym_hedge_call, 'SELL', exchange=OPT_EXCHANGE)
-            exit_price_hedge_call = exec_hedge
-
             main_pnl = QUANTITY * (entry_price_call_sold - exec_price)
-            hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_call)
-            
             comm_main = commission(QUANTITY, exec_price, entry_price_call_sold)
-            comm_hedge = commission(QUANTITY, entry_price_hedge_call, exec_hedge)
+
+            if HEDGELESS_MODE:
+                exec_hedge = 0
+                exit_price_hedge_call = 0
+                hedge_pnl = 0
+                comm_hedge = 0
+            else:
+                place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                exec_hedge = get_quote_price(kite, sym_hedge_call, 'SELL', exchange=OPT_EXCHANGE)
+                exit_price_hedge_call = exec_hedge
+                hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_call)
+                comm_hedge = commission(QUANTITY, entry_price_hedge_call, exec_hedge)
             
             total_leg_pnl = main_pnl + hedge_pnl - (comm_main + comm_hedge)
             final_realized_pnl += total_leg_pnl
@@ -868,7 +893,10 @@ def run_trading_process():
             realized_call_leg_pnl = total_leg_pnl
             
             print(f"    MAIN  | Entry: {entry_price_call_sold} | Exit: {exec_price}", flush=True)
-            print(f"    HEDGE | Entry: {entry_price_hedge_call} | Exit: {exec_hedge}", flush=True)
+            if HEDGELESS_MODE:
+                print("    HEDGE | DISABLED", flush=True)
+            else:
+                print(f"    HEDGE | Entry: {entry_price_hedge_call} | Exit: {exec_hedge}", flush=True)
             print(f"    STATS | Net PnL: {total_leg_pnl:.2f} (Comm: {comm_main+comm_hedge:.2f})", flush=True)
 
             tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, exec_price, total_leg_pnl, final_realized_pnl, f'Close - Call_Side_{reason}']
@@ -876,7 +904,7 @@ def run_trading_process():
 
             # --- TOTAL PROFIT CHANGE LOGIC ---
             if config['total_profit_change']:
-                GLOBAL_PROFIT_TARGET = 100
+                GLOBAL_PROFIT_TARGET = POST_LEG_CLOSE_PROFIT_TARGET
                 print(f"[{get_now_str()}] Total Profit Change Active. New Global Target: {GLOBAL_PROFIT_TARGET}", flush=True)
 
         def close_buy_legs(reason):
@@ -940,26 +968,32 @@ def run_trading_process():
             # --- ENTRIES ---
             if ltp_put < threshold_put and flag_sell_put == 0:
                 print(f"\n[{get_now_str()}] >>> ENTRY PUT SIDE | LTP: {ltp_put} < Thresh: {threshold_put:.2f}", flush=True)
-                place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
-                entry_price_hedge_put = get_quote_price(kite, sym_hedge_put, 'BUY', exchange=OPT_EXCHANGE)
-                time.sleep(1)
+                if HEDGELESS_MODE:
+                    entry_price_hedge_put = 0
+                else:
+                    place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    entry_price_hedge_put = get_quote_price(kite, sym_hedge_put, 'BUY', exchange=OPT_EXCHANGE)
+                    time.sleep(1)
                 place_order_with_retry(kite, sym_entry_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_put_sold = get_quote_price(kite, sym_entry_put, 'SELL', exchange=OPT_EXCHANGE)
                 
                 flag_sell_put = 1
-                print(f"[{get_now_str()}] OPENED PUT SIDE | Main: {entry_price_put_sold} | Hedge: {entry_price_hedge_put}", flush=True)
+                print(f"[{get_now_str()}] OPENED PUT SIDE | Main: {entry_price_put_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_put}", flush=True)
                 tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, 0, 0, final_realized_pnl, 'Open - Put_Sold']
                 
             if ltp_call < threshold_call and flag_sell_call == 0:
                 print(f"\n[{get_now_str()}] >>> ENTRY CALL SIDE | LTP: {ltp_call} < Thresh: {threshold_call:.2f}", flush=True)
-                place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
-                entry_price_hedge_call = get_quote_price(kite, sym_hedge_call, 'BUY', exchange=OPT_EXCHANGE)
-                time.sleep(1)
+                if HEDGELESS_MODE:
+                    entry_price_hedge_call = 0
+                else:
+                    place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    entry_price_hedge_call = get_quote_price(kite, sym_hedge_call, 'BUY', exchange=OPT_EXCHANGE)
+                    time.sleep(1)
                 place_order_with_retry(kite, sym_entry_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_call_sold = get_quote_price(kite, sym_entry_call, 'SELL', exchange=OPT_EXCHANGE)
                 
                 flag_sell_call = 1
-                print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {entry_price_hedge_call}", flush=True)
+                print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_call}", flush=True)
                 tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, 0, 0, final_realized_pnl, 'Open - Call_Sold']
 
             # --- BUYS ---
@@ -983,18 +1017,20 @@ def run_trading_process():
             # --- PNL CALCULATION ---
             pnl_sp = (QUANTITY * (entry_price_put_sold - ltp_put)) if flag_sell_put == 1 else 0
             pnl_sc = (QUANTITY * (entry_price_call_sold - ltp_call)) if flag_sell_call == 1 else 0
-            pnl_hp = (QUANTITY * (ltp_hedge_put - entry_price_hedge_put)) if flag_sell_put == 1 else 0
-            pnl_hc = (QUANTITY * (ltp_hedge_call - entry_price_hedge_call)) if flag_sell_call == 1 else 0
+            pnl_hp = (QUANTITY * (ltp_hedge_put - entry_price_hedge_put)) if flag_sell_put == 1 and not HEDGELESS_MODE else 0
+            pnl_hc = (QUANTITY * (ltp_hedge_call - entry_price_hedge_call)) if flag_sell_call == 1 and not HEDGELESS_MODE else 0
             pnl_bp = (QUANTITY * (ltp_buy_put - entry_price_put_bought)) if flag_buy_put == 1 else 0
             pnl_bc = (QUANTITY * (ltp_buy_call - entry_price_call_bought)) if flag_buy_call == 1 else 0
             
             comm_curr = 0
             if flag_sell_put == 1:
                 comm_curr += commission(QUANTITY, ltp_put, entry_price_put_sold) 
-                comm_curr += commission(QUANTITY, entry_price_hedge_put, ltp_hedge_put) 
+                if not HEDGELESS_MODE:
+                    comm_curr += commission(QUANTITY, entry_price_hedge_put, ltp_hedge_put) 
             if flag_sell_call == 1:
                 comm_curr += commission(QUANTITY, ltp_call, entry_price_call_sold)
-                comm_curr += commission(QUANTITY, entry_price_hedge_call, ltp_hedge_call)
+                if not HEDGELESS_MODE:
+                    comm_curr += commission(QUANTITY, entry_price_hedge_call, ltp_hedge_call)
             if flag_buy_put == 1: comm_curr += commission(QUANTITY, entry_price_put_bought, ltp_buy_put)
             if flag_buy_call == 1: comm_curr += commission(QUANTITY, entry_price_call_bought, ltp_buy_call)
             
