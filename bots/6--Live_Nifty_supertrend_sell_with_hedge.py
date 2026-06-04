@@ -43,7 +43,7 @@ DAY_CONFIG = {
     1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Tuesday
     2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Wednesday
     3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Friday
+    4: {'lots_num': 10, 'live_mode': 1, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Friday
 }
 
 def get_day_config():
