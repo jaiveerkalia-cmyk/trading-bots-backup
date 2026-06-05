@@ -78,7 +78,7 @@ UI_OPTS = {
 
 # --- USER PARAMETERS ---
 params = {
-    'trading_index': 'NIFTY', 'lots': 10, 'live_trading': 'Off', 'mute_sound': False,
+    'trading_index': 'NIFTY', 'lots': 4, 'live_trading': 'Off', 'mute_sound': False,
     'hedgeless_mode': True,
 
     # Independent Auto Close Flags

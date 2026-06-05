@@ -42,11 +42,11 @@ results_folder = 'Nifty_sell_supertrend_results_websockets'
 # live_mode: 1 = live trading (real orders placed), 0 = paper trading
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
-    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 10, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Friday
+    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Monday
+    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Tuesday
+    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Wednesday
+    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Thursday
+    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Friday
 }
 
 def get_day_config():
@@ -512,6 +512,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     sleep_seconds = (start_datetime - now).total_seconds()
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
+
+    time.sleep(7)
     print(datetime.now())
 
     ##### GET 5m DATAFRAME AT 09:35
@@ -584,7 +586,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     atr_period = supertrend_period
     df_ohlc['atr'] = df_ohlc['tr'].rolling(atr_period).mean()
     df_ohlc.drop(['prev_close', 'tr1', 'tr2', 'tr3', 'tr'], axis=1, inplace=True)
-    df_ohlc = calculate_supertrend_numba(df_ohlc, supertrend_period, 4)
+    df_ohlc = calculate_supertrend_numba(df_ohlc, 10, supertrend_period)
 
     print(df_ohlc)
     try:

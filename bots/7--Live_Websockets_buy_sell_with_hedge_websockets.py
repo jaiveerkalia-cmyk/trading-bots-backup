@@ -33,6 +33,7 @@ STRIKE_STEP = 50              # Nifty strike difference
 TOKEN_SWAP_TIME = "09:00"     # Time to restart process daily
 STANDARD_LOT_SIZE = 65        # Nifty Lot Size (Jan 2026 Standard)
 ATR_PERIOD = 10
+INDEX_ENTRY_ATR_PERIOD = 14
 VIX_SYMBOL = 'NSE:INDIA VIX'
 
 # TARGETS (Per Lot)
@@ -79,41 +80,48 @@ DAY_CONFIGURATION = {
     0: {'target_index': 'NIFTY', 'start': '10:00', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False},
-    
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
+        'index_based_entry': False, 'atr_entry_multiplier': 1},
+
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': True, 'hedgeless_mode': True},
-    
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': True, 'hedgeless_mode': True,
+        'index_based_entry': False, 'atr_entry_multiplier': 1},
+
     # Wednesday (NIFTY)
     2: {'target_index': 'NIFTY', 'start': '10:45', 'exit': '14:45', 'entry_gap': 8, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': True},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': True,
+        'index_based_entry': False, 'atr_entry_multiplier': 1},
 
     # Thursday (SENSEX)
     3: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': True, 'atr_ema_window': 20,
         'atr_stop_per_lot': 10, 'atr_entry_gap': 20, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False, 'hedgeless_mode': True},
-    
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False, 'hedgeless_mode': True,
+        'index_based_entry': False, 'atr_entry_multiplier': 1},
+
     # Friday (NIFTY)
    4: {'target_index': 'NIFTY', 'start': '10:00', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 6, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
        'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-       'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False},
-    
+       'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
+       'index_based_entry': True, 'atr_entry_multiplier': 2},
+
     # Saturday/Sunday (Defaults)
     5: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 0, 'lots': 7, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False,
+        'index_based_entry': False, 'atr_entry_multiplier': 1},
     6: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 0, 'lots': 7, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False}
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False,
+        'index_based_entry': False, 'atr_entry_multiplier': 1}
 }
 
 DEFAULT_CONFIGURATION = DAY_CONFIGURATION[0]
@@ -430,6 +438,94 @@ def get_vix_stop_per_lot(kite, current_dt, lookback_days=400):
         print(f"VIX stop fetch failed for {VIX_SYMBOL}: {e}", flush=True)
         return None, None
 
+def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
+    """
+    Fetches 1-minute OHLC candles for the spot index and returns the ATR(INDEX_ENTRY_ATR_PERIOD)
+    value from the last completed 1-minute candle of the previous trading day.
+    Used exclusively for index_based_entry mode.
+    """
+    try:
+        print(f"[INDEX_ENTRY_ATR] Fetching instrument token for {spot_symbol}...", flush=True)
+        quote = kite.quote(spot_symbol)
+        instrument_token = quote.get(spot_symbol, {}).get('instrument_token')
+        if not instrument_token:
+            print(f"[INDEX_ENTRY_ATR] FAILED: instrument token missing for {spot_symbol}", flush=True)
+            return None
+
+        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        print(f"[INDEX_ENTRY_ATR] Fetching 1m candles for {spot_symbol} from {from_dt} to {current_dt}...", flush=True)
+        candles = kite.historical_data(instrument_token, from_dt, current_dt, 'minute')
+        if not candles:
+            print(f"[INDEX_ENTRY_ATR] FAILED: no 1m candles returned for {spot_symbol}", flush=True)
+            return None
+
+        df = pd.DataFrame(candles)
+        if df.empty or 'date' not in df.columns:
+            print(f"[INDEX_ENTRY_ATR] FAILED: invalid candle data for {spot_symbol}", flush=True)
+            return None
+
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        print(f"[INDEX_ENTRY_ATR] Total 1m candles fetched: {len(df)}", flush=True)
+
+        # Determine today's date, timezone-aware if needed
+        candle_tz = df['date'].dt.tz
+        current_date = pd.Timestamp(current_dt.date())
+        if candle_tz is not None:
+            current_date = current_date.tz_localize(candle_tz)
+
+        # Keep only candles strictly before today (previous trading day and earlier)
+        prev_day_candles = df[df['date'] < current_date].copy()
+        if prev_day_candles.empty:
+            print(f"[INDEX_ENTRY_ATR] FAILED: no candles found before today ({current_date})", flush=True)
+            return None
+
+        # Identify the last trading day date
+        last_trading_date = prev_day_candles['date'].dt.date.max()
+        prev_day_only = prev_day_candles[prev_day_candles['date'].dt.date == last_trading_date].copy()
+        print(f"[INDEX_ENTRY_ATR] Previous trading day identified: {last_trading_date} | Candles in that day: {len(prev_day_only)}", flush=True)
+
+        # Calculate ATR(INDEX_ENTRY_ATR_PERIOD) on ALL available prior candles (need enough history)
+        high = prev_day_candles['high'].astype(float)
+        low  = prev_day_candles['low'].astype(float)
+        close = prev_day_candles['close'].astype(float)
+
+        if len(prev_day_candles) < INDEX_ENTRY_ATR_PERIOD + 1:
+            print(f"[INDEX_ENTRY_ATR] FAILED: not enough candles ({len(prev_day_candles)}) to compute ATR({INDEX_ENTRY_ATR_PERIOD})", flush=True)
+            return None
+
+        atr_series = talib.ATR(high.values, low.values, close.values, timeperiod=INDEX_ENTRY_ATR_PERIOD)
+        prev_day_candles = prev_day_candles.copy()
+        prev_day_candles['atr'] = atr_series
+
+        # Get candles from the previous trading day that have a valid ATR
+        prev_day_with_atr = prev_day_candles[
+            (prev_day_candles['date'].dt.date == last_trading_date) &
+            prev_day_candles['atr'].notna()
+        ]
+
+        if prev_day_with_atr.empty:
+            print(f"[INDEX_ENTRY_ATR] FAILED: no valid ATR values on previous trading day {last_trading_date}", flush=True)
+            return None
+
+        last_candle = prev_day_with_atr.iloc[-1]
+        atr_value = float(last_candle['atr'])
+
+        display_cols = ['date', 'open', 'high', 'low', 'close', 'atr']
+        print(f"[INDEX_ENTRY_ATR] Last 5 candles of previous trading day ({last_trading_date}) with ATR:", flush=True)
+        print(prev_day_with_atr[display_cols].tail(5).to_string(index=False), flush=True)
+        print(f"[INDEX_ENTRY_ATR] Selected candle (last of previous day):", flush=True)
+        print(last_candle[display_cols].to_frame().T.to_string(index=False), flush=True)
+        print(f"[INDEX_ENTRY_ATR] ATR({INDEX_ENTRY_ATR_PERIOD}) value from previous day last candle: {atr_value:.4f}", flush=True)
+
+        return atr_value
+
+    except Exception as e:
+        print(f"[INDEX_ENTRY_ATR] EXCEPTION during fetch for {spot_symbol}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+    
 # ==============================================================================
 # 3. STRATEGY LOGIC (ATM Finder, Strike Selection)
 # ==============================================================================
@@ -569,6 +665,8 @@ def run_trading_process():
         ATR_MODE_ON = config.get('atr_mode_on', False)
         VIX_STOP_MODE_ON = config.get('vix_stop_mode_on', False)
         HEDGELESS_MODE = config.get('hedgeless_mode', False)
+        INDEX_BASED_ENTRY = config.get('index_based_entry', False)
+        ATR_ENTRY_MULTIPLIER = config.get('atr_entry_multiplier', 1)
         QUANTITY = LOTS * STANDARD_LOT_SIZE
         
         effective_entry_gap = config['entry_gap']
@@ -579,21 +677,22 @@ def run_trading_process():
         GLOBAL_MAX_LOSS = max_loss_per_lot * LOTS
         
         print(f"[{get_now_str()}] Configuration Loaded for {SYMBOL_NAME} ({OPT_EXCHANGE}):", flush=True)
-        print(f"Mode:         {'LIVE TRADING (REAL MONEY)' if LIVE_MODE else 'PAPER TRADING (SIMULATION)'}", flush=True)
-        print(f"Quantity:     {QUANTITY} ({LOTS} Lots x {STANDARD_LOT_SIZE})", flush=True)
-        print(f"Gap Mode:     {'ATR ABSOLUTE' if ATR_MODE_ON else ('PERCENTAGE' if PERCENT_MODE else 'ABSOLUTE POINTS')}", flush=True)
-        print(f"Entry Gap:    {'ATR-DERIVED' if ATR_MODE_ON else config['entry_gap']}", flush=True)
-        print(f"Strike Gap:   {config['strike_gap']}", flush=True)
-        print(f"Risk Checks:  Start after {config.get('skip_till_hour', 8)}:59", flush=True)
-        print(f"Stop %:       {stop_percent}", flush=True)
-        print(f"ATM Finder:   {'ENABLED' if config.get('find_atm', True) else 'DISABLED'}", flush=True)
-        print(f"ATR Mode:     {'ENABLED' if ATR_MODE_ON else 'DISABLED'} | EMA Window: {config.get('atr_ema_window', 20)} | Stop Mult: {config.get('atr_stop_per_lot', 30)} | Gap %: {config.get('atr_entry_gap', 10)}", flush=True)
-        print(f"VIX Stop:     {'ENABLED' if VIX_STOP_MODE_ON else 'DISABLED'}", flush=True)
-        print(f"Flags:        Skip: {config['total_premium_skip']} | Buy: {config['buy_strikes_flag']} | PftChg: {config['total_profit_change']} | Hedgeless: {HEDGELESS_MODE}", flush=True)
-        print(f"Target/Lot:    {target_profit_per_lot}", flush=True)
-        print(f"Max Loss/Lot:  {max_loss_per_lot}", flush=True)
-        print(f"Global Target: {GLOBAL_PROFIT_TARGET}", flush=True)
-        print(f"Max Loss:      {GLOBAL_MAX_LOSS}", flush=True)
+        print(f"Mode:              {'LIVE TRADING (REAL MONEY)' if LIVE_MODE else 'PAPER TRADING (SIMULATION)'}", flush=True)
+        print(f"Quantity:          {QUANTITY} ({LOTS} Lots x {STANDARD_LOT_SIZE})", flush=True)
+        print(f"Gap Mode:          {'ATR ABSOLUTE' if ATR_MODE_ON else ('PERCENTAGE' if PERCENT_MODE else 'ABSOLUTE POINTS')}", flush=True)
+        print(f"Entry Gap:         {'ATR-DERIVED' if ATR_MODE_ON else config['entry_gap']}", flush=True)
+        print(f"Strike Gap:        {config['strike_gap']}", flush=True)
+        print(f"Risk Checks:       Start after {config.get('skip_till_hour', 8)}:59", flush=True)
+        print(f"Stop %:            {stop_percent}", flush=True)
+        print(f"ATM Finder:        {'ENABLED' if config.get('find_atm', True) else 'DISABLED'}", flush=True)
+        print(f"ATR Mode:          {'ENABLED' if ATR_MODE_ON else 'DISABLED'} | EMA Window: {config.get('atr_ema_window', 20)} | Stop Mult: {config.get('atr_stop_per_lot', 30)} | Gap %: {config.get('atr_entry_gap', 10)}", flush=True)
+        print(f"VIX Stop:          {'ENABLED' if VIX_STOP_MODE_ON else 'DISABLED'}", flush=True)
+        print(f"Index Based Entry: {'ENABLED' if INDEX_BASED_ENTRY else 'DISABLED'} | ATR Entry Multiplier: {ATR_ENTRY_MULTIPLIER} | ATR Period: {INDEX_ENTRY_ATR_PERIOD}", flush=True)
+        print(f"Flags:             Skip: {config['total_premium_skip']} | Buy: {config['buy_strikes_flag']} | PftChg: {config['total_profit_change']} | Hedgeless: {HEDGELESS_MODE}", flush=True)
+        print(f"Target/Lot:        {target_profit_per_lot}", flush=True)
+        print(f"Max Loss/Lot:      {max_loss_per_lot}", flush=True)
+        print(f"Global Target:     {GLOBAL_PROFIT_TARGET}", flush=True)
+        print(f"Max Loss:          {GLOBAL_MAX_LOSS}", flush=True)
 
         # 2. Authenticate
         try:
@@ -631,9 +730,11 @@ def run_trading_process():
             print(f"[{get_now_str()}] Error fetching instruments: {e}", flush=True)
             return
 
-        # 4. 9:00 AM Setup
+        # 4. 9:00 AM Setup (ATR / VIX / Index Entry ATR)
         spot_sym_full = f"{SPOT_EXCHANGE}:{SYMBOL_NAME}"
-        if ATR_MODE_ON or VIX_STOP_MODE_ON:
+        index_entry_atr = None  # Will be set below if INDEX_BASED_ENTRY is on
+
+        if ATR_MODE_ON or VIX_STOP_MODE_ON or INDEX_BASED_ENTRY:
             calc_time = "09:00"
             print(f"[{get_now_str()}] Pre-start setup active. Waiting for calculation time: {calc_time}", flush=True)
             while datetime.now().strftime("%H:%M") < calc_time:
@@ -669,6 +770,15 @@ def run_trading_process():
                     print(f"[{get_now_str()}] VIX Stop Mode Active @ 09:00 | Max Loss/Lot overridden to {max_loss_per_lot:.2f} | Global Max Loss: {GLOBAL_MAX_LOSS:.2f}", flush=True)
                 else:
                     print(f"[{get_now_str()}] VIX Stop Mode fallback: using current max loss per lot {max_loss_per_lot}.", flush=True)
+
+            if INDEX_BASED_ENTRY:
+                print(f"[{get_now_str()}] Index Based Entry: Fetching 1m ATR({INDEX_ENTRY_ATR_PERIOD}) for {spot_sym_full}...", flush=True)
+                index_entry_atr = get_index_entry_atr(kite, spot_sym_full, reference_dt)
+                if index_entry_atr is not None:
+                    print(f"[{get_now_str()}] Index Based Entry ATR fetched successfully: {index_entry_atr:.4f} | Multiplier: {ATR_ENTRY_MULTIPLIER} | Effective ATR Band: {index_entry_atr * ATR_ENTRY_MULTIPLIER:.4f}", flush=True)
+                else:
+                    print(f"[{get_now_str()}] WARNING: Index Based Entry ATR fetch FAILED. index_based_entry will be DISABLED for today. Falling back to normal option-price entry logic.", flush=True)
+                    INDEX_BASED_ENTRY = False
 
         # 5. WebSocket
         kws = KiteTicker(api_key, access_token)
@@ -744,13 +854,35 @@ def run_trading_process():
         token_buy_ce, sym_buy_ce, token_buy_pe, sym_buy_pe = None, None, None, None
         
         # --- BUY STRIKES FLAG LOGIC ---
-        use_buy_legs = config['buy_strikes_flag']  # Updated to use Flag
+        use_buy_legs = config['buy_strikes_flag']
         if use_buy_legs:
             buy_strike_ce, buy_strike_pe = find_otm_buy_strikes(kite, atm_strike, nifty_options, exchange=OPT_EXCHANGE)
             token_buy_ce, sym_buy_ce = get_token_and_symbol(nifty_options, buy_strike_ce, 'CE')
             token_buy_pe, sym_buy_pe = get_token_and_symbol(nifty_options, buy_strike_pe, 'PE')
-            
+
+        # --- INDEX BASED ENTRY: Fetch index token and compute thresholds at start time ---
+        index_entry_threshold_put = None   # Index must break ABOVE this to enter PUT
+        index_entry_threshold_call = None  # Index must break BELOW this to enter CALL
+        token_spot_index = None            # Used by WebSocket (Bot 7 only)
+
+        if INDEX_BASED_ENTRY:
+            # Get spot index instrument token for WebSocket subscription
+            try:
+                spot_quote = kite.quote(spot_sym_full)
+                token_spot_index = spot_quote.get(spot_sym_full, {}).get('instrument_token')
+                print(f"[{get_now_str()}] Index Based Entry | Spot index token: {token_spot_index} ({spot_sym_full})", flush=True)
+            except Exception as e:
+                print(f"[{get_now_str()}] Index Based Entry | WARNING: Could not fetch spot index token: {e}. Disabling INDEX_BASED_ENTRY.", flush=True)
+                INDEX_BASED_ENTRY = False
+                token_spot_index = None
+
+        # --- WebSocket subscriptions (Bot 7) ---
         sub_tokens = [t for t in [token_entry_put, token_entry_call, token_hedge_put, token_hedge_call, token_buy_ce, token_buy_pe] if t]
+        # Add spot index token for index_based_entry (Bot 7 only)
+        if INDEX_BASED_ENTRY and token_spot_index:
+            if token_spot_index not in sub_tokens:
+                sub_tokens.append(token_spot_index)
+                print(f"[{get_now_str()}] Index Based Entry | Added spot index token {token_spot_index} to WebSocket subscriptions.", flush=True)
         kws.subscribe(sub_tokens)
         kws.set_mode(kws.MODE_LTP, sub_tokens)
         time.sleep(0.25) 
@@ -780,7 +912,27 @@ def run_trading_process():
         
         initial_bp_price = snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_pe}", {}).get('last_price', 0) if sym_buy_pe else 0
         initial_bc_price = snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_ce}", {}).get('last_price', 0) if sym_buy_ce else 0
-        
+
+        # --- INDEX BASED ENTRY: Compute index thresholds using spot price at start time ---
+        if INDEX_BASED_ENTRY:
+            # Use spot_ltp already fetched via REST at start time (line above: get_ltp_safe at config['start'])
+            index_ltp_at_start = spot_ltp
+            print(f"[{get_now_str()}] Index Based Entry | Using spot_ltp fetched at start time (REST): {index_ltp_at_start}", flush=True)
+
+            if index_ltp_at_start == 0 or index_entry_atr is None:
+                print(f"[{get_now_str()}] Index Based Entry | CRITICAL: Cannot compute index thresholds (index_ltp={index_ltp_at_start}, atr={index_entry_atr}). Disabling INDEX_BASED_ENTRY.", flush=True)
+                INDEX_BASED_ENTRY = False
+            else:
+                atr_band = index_entry_atr * ATR_ENTRY_MULTIPLIER
+                index_entry_threshold_put  = index_ltp_at_start + atr_band  # PUT entry when index breaks ABOVE this
+                index_entry_threshold_call = index_ltp_at_start - atr_band  # CALL entry when index breaks BELOW this
+                print(f"[{get_now_str()}] Index Based Entry THRESHOLDS SET:", flush=True)
+                print(f"  Index LTP at Start ({config['start']}): {index_ltp_at_start}", flush=True)
+                print(f"  ATR({INDEX_ENTRY_ATR_PERIOD}) from prev day: {index_entry_atr:.4f}", flush=True)
+                print(f"  ATR Multiplier:                  {ATR_ENTRY_MULTIPLIER}", flush=True)
+                print(f"  ATR Band (ATR x Multiplier):     {atr_band:.4f}", flush=True)
+                print(f"  PUT  entry threshold (index > ): {index_entry_threshold_put:.2f}", flush=True)
+                print(f"  CALL entry threshold (index < ): {index_entry_threshold_call:.2f}", flush=True)
         
         # --- TOTAL PREMIUM SKIP LOGIC ---
         total_premium = threshold_put + threshold_call
@@ -797,15 +949,17 @@ def run_trading_process():
         print(f"[{get_now_str()}] STRATEGY SETUP COMPLETE", flush=True)
         print(f"{'-'*60}", flush=True)
         if ATR_MODE_ON:
-            print(f"ATR INFO | Entry Gap: {effective_entry_gap:.2f} | Max Loss/Lot: {max_loss_per_lot:.2f} | Global Max Loss: {GLOBAL_MAX_LOSS:.2f}", flush=True)
-        print(f"PUT LEG  | Strike: {entry_put_strike} PE | Initial: {initial_ep_price} | Threshold: {threshold_put:.2f} | Stop: {stop_put:.2f}", flush=True)
-        print(f"CALL LEG | Strike: {entry_call_strike} CE | Initial: {initial_ec_price} | Threshold: {threshold_call:.2f} | Stop: {stop_call:.2f}", flush=True)
+            print(f"ATR INFO       | Entry Gap: {effective_entry_gap:.2f} | Max Loss/Lot: {max_loss_per_lot:.2f} | Global Max Loss: {GLOBAL_MAX_LOSS:.2f}", flush=True)
+        print(f"PUT LEG        | Strike: {entry_put_strike} PE | Initial: {initial_ep_price} | Threshold: {threshold_put:.2f} | Stop: {stop_put:.2f}", flush=True)
+        print(f"CALL LEG       | Strike: {entry_call_strike} CE | Initial: {initial_ec_price} | Threshold: {threshold_call:.2f} | Stop: {stop_call:.2f}", flush=True)
+        if INDEX_BASED_ENTRY:
+            print(f"INDEX ENTRY    | PUT threshold (index >): {index_entry_threshold_put:.2f} | CALL threshold (index <): {index_entry_threshold_call:.2f} | (option-price entry thresholds above are INACTIVE for sell legs)", flush=True)
         if HEDGELESS_MODE:
-            print("HEDGES   | DISABLED (hedgeless mode)", flush=True)
+            print("HEDGES         | DISABLED (hedgeless mode)", flush=True)
         else:
-            print(f"HEDGES   | PE: {hedge_put_strike} | CE: {hedge_call_strike}", flush=True)
+            print(f"HEDGES         | PE: {hedge_put_strike} | CE: {hedge_call_strike}", flush=True)
         if use_buy_legs:
-            print(f"BUY LEGS | PE: {buy_strike_pe} (@ {initial_bp_price}) | CE: {buy_strike_ce} (@ {initial_bc_price})", flush=True)
+            print(f"BUY LEGS       | PE: {buy_strike_pe} (@ {initial_bp_price}) | CE: {buy_strike_ce} (@ {initial_bc_price})", flush=True)
         print(f"{'-'*60}\n", flush=True)
         
         # ----------------------------------------------------------------------
@@ -990,13 +1144,35 @@ def run_trading_process():
                 ltp_hedge_call = live_market_data.get(token_hedge_call, 0)
                 ltp_buy_put = live_market_data.get(token_buy_pe, 0) if token_buy_pe else 0
                 ltp_buy_call = live_market_data.get(token_buy_ce, 0) if token_buy_ce else 0
+                # Bot 7: Read index LTP from WebSocket for index_based_entry
+                ltp_index = live_market_data.get(token_spot_index, 0) if (INDEX_BASED_ENTRY and token_spot_index) else 0
                 
             if ltp_put == 0 or ltp_call == 0: continue
             risk_checks_enabled = datetime.now().hour > config.get('skip_till_hour', 8)
             
             # --- ENTRIES ---
-            if ltp_put < threshold_put and flag_sell_put == 0:
-                print(f"\n[{get_now_str()}] >>> ENTRY PUT SIDE | LTP: {ltp_put} < Thresh: {threshold_put:.2f}", flush=True)
+            # Determine whether to use index-based or option-price-based entry for sell legs
+            if INDEX_BASED_ENTRY:
+                # Validate index LTP is available
+                if ltp_index == 0:
+                    # Only print the warning once per minute to avoid spam
+                    if datetime.now().minute != last_print_minute:
+                        print(f"[{get_now_str()}] Index Based Entry | WARNING: index LTP is 0 (WebSocket not ticked yet?). Skipping entry checks this iteration.", flush=True)
+                    put_entry_condition  = False
+                    call_entry_condition = False
+                else:
+                    put_entry_condition  = ltp_index > index_entry_threshold_put   # Index broke above PUT threshold
+                    call_entry_condition = ltp_index < index_entry_threshold_call  # Index broke below CALL threshold
+                # [INDEX_ENTRY_CHECK] is printed in the minute log below, not here
+            else:
+                put_entry_condition  = ltp_put  < threshold_put
+                call_entry_condition = ltp_call < threshold_call
+
+            if put_entry_condition and flag_sell_put == 0:
+                if INDEX_BASED_ENTRY:
+                    print(f"\n[{get_now_str()}] >>> ENTRY PUT SIDE [INDEX-BASED] | Index LTP: {ltp_index:.2f} > Index Threshold: {index_entry_threshold_put:.2f}", flush=True)
+                else:
+                    print(f"\n[{get_now_str()}] >>> ENTRY PUT SIDE | LTP: {ltp_put} < Thresh: {threshold_put:.2f}", flush=True)
                 if HEDGELESS_MODE:
                     entry_price_hedge_put = 0
                 else:
@@ -1010,8 +1186,11 @@ def run_trading_process():
                 print(f"[{get_now_str()}] OPENED PUT SIDE | Main: {entry_price_put_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_put}", flush=True)
                 tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, 0, 0, final_realized_pnl, 'Open - Put_Sold']
                 
-            if ltp_call < threshold_call and flag_sell_call == 0:
-                print(f"\n[{get_now_str()}] >>> ENTRY CALL SIDE | LTP: {ltp_call} < Thresh: {threshold_call:.2f}", flush=True)
+            if call_entry_condition and flag_sell_call == 0:
+                if INDEX_BASED_ENTRY:
+                    print(f"\n[{get_now_str()}] >>> ENTRY CALL SIDE [INDEX-BASED] | Index LTP: {ltp_index:.2f} < Index Threshold: {index_entry_threshold_call:.2f}", flush=True)
+                else:
+                    print(f"\n[{get_now_str()}] >>> ENTRY CALL SIDE | LTP: {ltp_call} < Thresh: {threshold_call:.2f}", flush=True)
                 if HEDGELESS_MODE:
                     entry_price_hedge_call = 0
                 else:
@@ -1025,7 +1204,7 @@ def run_trading_process():
                 print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_call}", flush=True)
                 tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, 0, 0, final_realized_pnl, 'Open - Call_Sold']
 
-            # --- BUYS ---
+            # --- BUYS (unchanged — always option-price based) ---
             if use_buy_legs:
                 if flag_buy_put == 0 and ltp_buy_put >= (2 * initial_bp_price):
                     print(f"\n[{get_now_str()}] >>> ENTRY BUY PUT | LTP: {ltp_buy_put} >= Trigger: {2 * initial_bp_price:.2f}", flush=True)
@@ -1067,10 +1246,14 @@ def run_trading_process():
             current_net_pnl = gross_pnl - comm_curr
             
             # --- MINUTE LOG ---
+            # --- MINUTE LOG ---
             if datetime.now().minute != last_print_minute:
                 print(f"\n[STATUS {datetime.now().strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
-                print(f"RISK INFO | Put Thresh: {threshold_put:.2f} | Put Stop: {stop_put:.2f} | Call Thresh: {threshold_call:.2f} | Call Stop: {stop_call:.2f} | Global Stop: {-GLOBAL_MAX_LOSS:.2f} | Stops Active: {'YES' if risk_checks_enabled else 'NO (SKIPPED)'}", flush=True)
-                
+                print(f"STRIKES    | PUT: {entry_put_strike} PE ({sym_entry_put}) | CALL: {entry_call_strike} CE ({sym_entry_call})" + (f" | HEDGE PE: {hedge_put_strike} | HEDGE CE: {hedge_call_strike}" if not HEDGELESS_MODE else " | HEDGES: DISABLED") + (f" | BUY PE: {buy_strike_pe} | BUY CE: {buy_strike_ce}" if use_buy_legs else ""), flush=True)
+                print(f"RISK INFO  | Put Thresh: {threshold_put:.2f} | Put Stop: {stop_put:.2f} | Call Thresh: {threshold_call:.2f} | Call Stop: {stop_call:.2f} | Global Stop: {-GLOBAL_MAX_LOSS:.2f} | Stops Active: {'YES' if risk_checks_enabled else 'NO (SKIPPED)'}", flush=True)
+                if INDEX_BASED_ENTRY:
+                    print(f"INDEX ENTRY | Index LTP: {ltp_index:.2f} | PUT thresh (>): {index_entry_threshold_put:.2f} | CALL thresh (<): {index_entry_threshold_call:.2f} | PUT cond: {put_entry_condition} | CALL cond: {call_entry_condition}", flush=True)
+
                 if flag_sell_put == 1:
                     status_p = 'OPEN'
                     put_leg_pnl = pnl_sp + pnl_hp
