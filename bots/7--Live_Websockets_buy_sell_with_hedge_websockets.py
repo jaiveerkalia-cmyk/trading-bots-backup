@@ -77,11 +77,11 @@ INDEX_DETAILS = {
 # ------------------------------------------------------------------------------
 DAY_CONFIGURATION = {
     # Monday (NIFTY)
-    0: {'target_index': 'NIFTY', 'start': '10:00', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
+    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 8, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
         'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
-        'index_based_entry': False, 'atr_entry_multiplier': 1},
+        'index_based_entry': True, 'atr_entry_multiplier': 2},
 
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 4, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
@@ -913,7 +913,7 @@ def run_trading_process():
         initial_bp_price = snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_pe}", {}).get('last_price', 0) if sym_buy_pe else 0
         initial_bc_price = snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_ce}", {}).get('last_price', 0) if sym_buy_ce else 0
 
-        # --- INDEX BASED ENTRY: Compute index thresholds using spot price at start time ---
+        # --- INDEX BASED ENTRY: Compute index thresholds using spot_ltp fetched at start time (REST) ---
         if INDEX_BASED_ENTRY:
             # Use spot_ltp already fetched via REST at start time (line above: get_ltp_safe at config['start'])
             index_ltp_at_start = spot_ltp
@@ -933,6 +933,7 @@ def run_trading_process():
                 print(f"  ATR Band (ATR x Multiplier):     {atr_band:.4f}", flush=True)
                 print(f"  PUT  entry threshold (index > ): {index_entry_threshold_put:.2f}", flush=True)
                 print(f"  CALL entry threshold (index < ): {index_entry_threshold_call:.2f}", flush=True)
+                print(f"  NOTE: Stop prices will be computed from actual fill price at entry time.", flush=True)
         
         # --- TOTAL PREMIUM SKIP LOGIC ---
         total_premium = threshold_put + threshold_call
@@ -954,6 +955,7 @@ def run_trading_process():
         print(f"CALL LEG       | Strike: {entry_call_strike} CE | Initial: {initial_ec_price} | Threshold: {threshold_call:.2f} | Stop: {stop_call:.2f}", flush=True)
         if INDEX_BASED_ENTRY:
             print(f"INDEX ENTRY    | PUT threshold (index >): {index_entry_threshold_put:.2f} | CALL threshold (index <): {index_entry_threshold_call:.2f} | (option-price entry thresholds above are INACTIVE for sell legs)", flush=True)
+            print(f"INDEX ENTRY    | Stop prices will be set from actual fill price at entry time using stop_percent: {stop_percent}%", flush=True)
         if HEDGELESS_MODE:
             print("HEDGES         | DISABLED (hedgeless mode)", flush=True)
         else:
@@ -1181,9 +1183,12 @@ def run_trading_process():
                     time.sleep(1)
                 place_order_with_retry(kite, sym_entry_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_put_sold = get_quote_price(kite, sym_entry_put, 'SELL', exchange=OPT_EXCHANGE)
-                
                 flag_sell_put = 1
-                print(f"[{get_now_str()}] OPENED PUT SIDE | Main: {entry_price_put_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_put}", flush=True)
+                # --- INDEX BASED ENTRY: Recompute stop_put from actual fill price ---
+                if INDEX_BASED_ENTRY:
+                    stop_put = entry_price_put_sold * (1 + stop_percent * 0.01)
+                    print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] PUT stop recomputed from fill price | Fill: {entry_price_put_sold} | Stop: {stop_put:.2f} ({stop_percent}%)", flush=True)
+                print(f"[{get_now_str()}] OPENED PUT SIDE | Main: {entry_price_put_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_put} | Stop: {stop_put:.2f}", flush=True)
                 tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, 0, 0, final_realized_pnl, 'Open - Put_Sold']
                 
             if call_entry_condition and flag_sell_call == 0:
@@ -1199,9 +1204,12 @@ def run_trading_process():
                     time.sleep(1)
                 place_order_with_retry(kite, sym_entry_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_call_sold = get_quote_price(kite, sym_entry_call, 'SELL', exchange=OPT_EXCHANGE)
-                
                 flag_sell_call = 1
-                print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_call}", flush=True)
+                # --- INDEX BASED ENTRY: Recompute stop_call from actual fill price ---
+                if INDEX_BASED_ENTRY:
+                    stop_call = entry_price_call_sold * (1 + stop_percent * 0.01)
+                    print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] CALL stop recomputed from fill price | Fill: {entry_price_call_sold} | Stop: {stop_call:.2f} ({stop_percent}%)", flush=True)
+                print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_call} | Stop: {stop_call:.2f}", flush=True)
                 tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, 0, 0, final_realized_pnl, 'Open - Call_Sold']
 
             # --- BUYS (unchanged — always option-price based) ---
@@ -1246,14 +1254,13 @@ def run_trading_process():
             current_net_pnl = gross_pnl - comm_curr
             
             # --- MINUTE LOG ---
-            # --- MINUTE LOG ---
             if datetime.now().minute != last_print_minute:
                 print(f"\n[STATUS {datetime.now().strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
                 print(f"STRIKES    | PUT: {entry_put_strike} PE ({sym_entry_put}) | CALL: {entry_call_strike} CE ({sym_entry_call})" + (f" | HEDGE PE: {hedge_put_strike} | HEDGE CE: {hedge_call_strike}" if not HEDGELESS_MODE else " | HEDGES: DISABLED") + (f" | BUY PE: {buy_strike_pe} | BUY CE: {buy_strike_ce}" if use_buy_legs else ""), flush=True)
                 print(f"RISK INFO  | Put Thresh: {threshold_put:.2f} | Put Stop: {stop_put:.2f} | Call Thresh: {threshold_call:.2f} | Call Stop: {stop_call:.2f} | Global Stop: {-GLOBAL_MAX_LOSS:.2f} | Stops Active: {'YES' if risk_checks_enabled else 'NO (SKIPPED)'}", flush=True)
                 if INDEX_BASED_ENTRY:
                     print(f"INDEX ENTRY | Index LTP: {ltp_index:.2f} | PUT thresh (>): {index_entry_threshold_put:.2f} | CALL thresh (<): {index_entry_threshold_call:.2f} | PUT cond: {put_entry_condition} | CALL cond: {call_entry_condition}", flush=True)
-
+                
                 if flag_sell_put == 1:
                     status_p = 'OPEN'
                     put_leg_pnl = pnl_sp + pnl_hp
@@ -1373,6 +1380,7 @@ def run_trading_process():
         try:
             input("Press Enter to Exit Process...")
         except: pass
+
         
 # ==============================================================================
 # 5. PHOENIX SUPERVISOR (Pipe Proxy for IDLE Support + Safety Block)

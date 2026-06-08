@@ -42,11 +42,11 @@ results_folder = 'Nifty_sell_supertrend_results_websockets'
 # live_mode: 1 = live trading (real orders placed), 0 = paper trading
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
-    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0},  # Friday
+    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
+    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Tuesday
+    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
+    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
+    4: {'lots_num': 10, 'live_mode': 1, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Friday
 }
 
 def get_day_config():
@@ -76,6 +76,8 @@ def print_tomorrow_mode():
     print(f"  reverse_threshold : {next_cfg['reverse_threshold_percentage']}")
     print(f"  global_stop/lot   : {next_cfg['global_stop_per_lot']}")
     print(f"  hedgeless_mode    : {hedgeless_str}")
+    print(f"  risk_mode_on      : {next_cfg['risk_mode_on']}")
+    print(f"  max_risk_amount   : {next_cfg['max_risk_amount']}")
     print(f"{'='*60}\n")
     
 call_token, put_token,hedge_call_token,hedge_put_token,mid_loop,prev_call_token, prev_put_token,put_stop_price,call_stop_price = 0,0,0,0,0,0,0,0,0
@@ -473,6 +475,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     reverse_threshold_percentage = cfg['reverse_threshold_percentage']
     global_stop_per_lot          = cfg['global_stop_per_lot']
     hedgeless_mode               = cfg['hedgeless_mode']
+    risk_mode_on                 = cfg['risk_mode_on']
+    max_risk_amount              = cfg['max_risk_amount']
 
     day_names = {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday'}
     today_name = day_names.get(datetime.now().weekday(), 'Unknown')
@@ -483,7 +487,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     print(f"  Mode={mode_str} | lots_num={lots_num} | start_time={start_time} | "
           f"supertrend_period={supertrend_period} | stop_percent={stop_percent} | "
           f"reverse_threshold_percentage={reverse_threshold_percentage} | "
-          f"global_stop_per_lot={global_stop_per_lot} | hedgeless_mode={hedgeless_str}")
+          f"global_stop_per_lot={global_stop_per_lot} | hedgeless_mode={hedgeless_str} | "
+          f"risk_mode_on={risk_mode_on} | max_risk_amount={max_risk_amount}")
     print(f"{'='*60}\n")
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -501,7 +506,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     qty = lots*lot_size
     global_stop = -abs(global_stop_per_lot * lots)
 
-    print('Qty:', qty)
+    print('Qty (pre-entry, from lots_num):', qty)
     print(f'Global Stop: {global_stop}')
     loss_target = 4500 * lots
 
@@ -512,8 +517,6 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     sleep_seconds = (start_datetime - now).total_seconds()
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
-
-    time.sleep(7)
     print(datetime.now())
 
     ##### GET 5m DATAFRAME AT 09:35
@@ -607,9 +610,9 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
 
     current_pos_profit = 0
 
-    for pos_num in range(0, 4):
+    for pos_num in range(0, 2):
 
-        if pos_num > 2 or (pos_num > 1 and final_profit > 0):
+        if pos_num > 1 or (pos_num > 0 and final_profit > 0):
             final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price, final_profit]
             final_position_df.to_csv(gd_path + results_folder + '/Final_daily_pnl.csv', index=False)
             print('day_over')
@@ -651,14 +654,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
             subscribe_tokens(kws, [put_token, hedge_put_token])
             print(sym_put, sym_hedge_put)
 
-            if live_mode == 1:
-                ####PLACE BUY HEDGE ORDER
-                if hedgeless_mode == 0:
-                    place_order(kite, sym_hedge_put, qty, 'BUY')
-                ####PLACE SELL ACTUAL ORDER
-                place_order(kite, sym_put, qty, 'SELL')
-
-            #####GET ENTRY PUT PRICE
+            #####GET ENTRY PUT PRICE FIRST (needed for risk_mode qty calc)
             for _ in range(10):
                 try:
                     a1 = kite.ltp('NFO:'+sym_put)
@@ -667,6 +663,20 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
                 except Exception as e:
                     print(e)
                     time.sleep(1)
+
+            ##### CALCULATE QTY BASED ON RISK MODE
+            if risk_mode_on == 1:
+                stop_sell_put_price = (1 + stop_percent) * entry_put_price
+                risk_qty = math.floor((max_risk_amount / (stop_sell_put_price - entry_put_price)) / lot_size) * lot_size
+                qty = max(risk_qty, lot_size)
+                print(f'Risk Mode ON: entry_put_price={entry_put_price:.2f}, stop={stop_sell_put_price:.2f}, calculated qty={qty}')
+
+            if live_mode == 1:
+                ####PLACE BUY HEDGE ORDER
+                if hedgeless_mode == 0:
+                    place_order(kite, sym_hedge_put, qty, 'BUY')
+                ####PLACE SELL ACTUAL ORDER
+                place_order(kite, sym_put, qty, 'SELL')
 
             #####GET ENTRY HEDGE PUT PRICE
             if hedgeless_mode == 0:
@@ -683,7 +693,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
             current_entry_put_price = entry_put_price
             exit_hedge_put_price = entry_hedge_put_price
 
-            print(f"{datetime.now()} - Put Entry: {entry_put}, Hedge: {hedge_put} | Entry Price: {entry_put_price}, Hedge Price: {entry_hedge_put_price}")
+            print(f"{datetime.now()} - Put Entry: {entry_put}, Hedge: {hedge_put} | Entry Price: {entry_put_price}, Hedge Price: {entry_hedge_put_price}, Qty: {qty}")
 
         if sell_call_flag == 1:
         #####GET INITIAL ENTRY CALL PRICE
@@ -695,14 +705,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
             subscribe_tokens(kws, [call_token, hedge_call_token])
             print(sym_call, sym_hedge_call)
 
-            if live_mode == 1:
-                ####PLACE BUY HEDGE ORDER
-                if hedgeless_mode == 0:
-                    place_order(kite, sym_hedge_call, qty, 'BUY')
-                ####PLACE SELL ACTUAL ORDER
-                place_order(kite, sym_call, qty, 'SELL')
-
-            #####GET ENTRY CALL PRICE
+            #####GET ENTRY CALL PRICE FIRST (needed for risk_mode qty calc)
             for _ in range(10):
                 try:
                     a1 = kite.ltp('NFO:'+sym_call)
@@ -710,6 +713,20 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
                     break
                 except Exception as e:
                     time.sleep(1)
+
+            ##### CALCULATE QTY BASED ON RISK MODE
+            if risk_mode_on == 1:
+                stop_sell_call_price = (1 + stop_percent) * entry_call_price
+                risk_qty = math.floor((max_risk_amount / (stop_sell_call_price - entry_call_price)) / lot_size) * lot_size
+                qty = max(risk_qty, lot_size)
+                print(f'Risk Mode ON: entry_call_price={entry_call_price:.2f}, stop={stop_sell_call_price:.2f}, calculated qty={qty}')
+
+            if live_mode == 1:
+                ####PLACE BUY HEDGE ORDER
+                if hedgeless_mode == 0:
+                    place_order(kite, sym_hedge_call, qty, 'BUY')
+                ####PLACE SELL ACTUAL ORDER
+                place_order(kite, sym_call, qty, 'SELL')
 
             #####GET ENTRY HEDGE CALL PRICE
             if hedgeless_mode == 0:
@@ -726,7 +743,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
             current_entry_call_price = entry_call_price
             exit_hedge_call_price = entry_hedge_call_price
 
-            print(f"{datetime.now()} - Call Entry: {entry_call}, Hedge: {hedge_call} | Entry Price: {entry_call_price}, Hedge Price: {entry_hedge_call_price}")
+            print(f"{datetime.now()} - Call Entry: {entry_call}, Hedge: {hedge_call} | Entry Price: {entry_call_price}, Hedge Price: {entry_hedge_call_price}, Qty: {qty}")
 
         ######### START CHECKING THE ENTRY CONDITIONS
         counter, sell_put_profit, sell_call_profit = 0, 0, 0
