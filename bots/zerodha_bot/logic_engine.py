@@ -93,9 +93,20 @@ class LogicEngine:
             self.last_trigger_time['chart'] = curr_min
 
     def commission(self, amount, buy_price, sell_price):
-        turnover = (amount * buy_price) + (amount * sell_price)
-        return 40 + (0.001*amount*sell_price) + (0.0003503*amount*(buy_price+sell_price)) + (0.18*(40+(0.0003503*amount*(buy_price+sell_price)))) + (0.000001*turnover) + (0.00003*amount*buy_price)
+        buy_turnover = amount * buy_price
+        sell_turnover = amount * sell_price
+        total_turnover = buy_turnover + sell_turnover
 
+        brokerage = 20 + 20
+        stt = 0.0015 * sell_turnover
+        exchange_txn = 0.0003503 * total_turnover
+        sebi = 0.000001 * total_turnover
+        gst = 0.18 * (brokerage + exchange_txn + sebi)
+        stamp_duty = 0.00003 * buy_turnover
+        ipft = 0.00000005 * total_turnover
+
+        return round(brokerage + stt + exchange_txn + sebi + gst + stamp_duty + ipft, 2)
+    
     def _place_live_order(self, symbol, txn_type, qty, product, exchange):
         kite = self.inst_manager.kite
         attempts = 0

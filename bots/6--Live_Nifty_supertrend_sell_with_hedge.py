@@ -40,10 +40,10 @@ results_folder = 'Nifty_sell_supertrend_results'
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
     0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 1, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Friday
+    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
+    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
+    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
+    4: {'lots_num': 10, 'live_mode': 1, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Friday
 }
 
 def get_day_config():
@@ -418,7 +418,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
     sell_put_profit, sell_call_profit, buy_put_profit, buy_call_profit = 0,0,0,0
     initial_entry_put_price, initial_entry_call_price, initial_buy_put_price, initial_buy_call_price, current_entry_put_price, current_entry_call_price, current_buy_put_price, current_buy_call_price, entry_put_price, entry_call_price, buy_put_price, buy_call_price = 0,0,0,0,0,0,0,0,0,0,0,0
     exit_sell_call_price, exit_sell_put_price, exit_buy_call_price, exit_buy_put_price = 0,0,0,0
-    entry_hedge_put_price, entry_hedge_call_price = 0,0
+    entry_hedge_put_price, entry_hedge_call_price,exit_hedge_put_price, exit_hedge_call_price = 0,0,0,0
 
     # ── Load today's config from DAY_CONFIG ──────────────────────────────────
     cfg = get_day_config()
@@ -466,7 +466,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
 
-    time.sleep(7)  
+    time.sleep(7)
     print(datetime.now())
 
     ##### GET 5m DATAFRAME AT 09:35
@@ -560,7 +560,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
 
     current_pos_profit = 0
 
-    for pos_num in range(0, 2):
+    for pos_num in range(0, 3):
 
         if pos_num > 1 or (pos_num > 0 and final_profit > 0):
             final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price, final_profit]
@@ -639,7 +639,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
 
             intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_put, 'PE', entry_put_price, 0, 0, 0, 'Open - Sell_Put_Opened']
             intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
-
+            current_entry_put_price = entry_put_price
+            exit_hedge_put_price = entry_hedge_put_price
             print(f"{datetime.now()} - Put Entry: {entry_put}, Hedge: {hedge_put} | Entry Price: {entry_put_price}, Hedge Price: {entry_hedge_put_price}, Qty: {qty}")
 
         if sell_call_flag == 1:
@@ -686,10 +687,15 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
 
             intraday_positions.loc[intraday_positions.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, 'CE', entry_call_price, 0, 0, 0, 'Open - Sell_Call_Opened']
             intraday_positions.to_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv', index=False)
-
+            current_entry_call_price = entry_call_price
+            exit_hedge_call_price = entry_hedge_call_price
             print(f"{datetime.now()} - Call Entry: {entry_call}, Hedge: {hedge_call} | Entry Price: {entry_call_price}, Hedge Price: {entry_hedge_call_price}, Qty: {qty}")
 
-        ######### START CHECKING THE ENTRY CONDITIONS
+        put_stop_price = (1 + stop_percent) * entry_put_price if sell_put_flag == 1 else 0
+        call_stop_price = (1 + stop_percent) * entry_call_price if sell_call_flag == 1 else 0
+        print(f"Stop Prices — put_stop_price={put_stop_price:.2f}, call_stop_price={call_stop_price:.2f}")
+
+        ######### START CHECKING THE EXIT CONDITIONS
         counter, sell_put_profit, sell_call_profit = 0, 0, 0
 
         while True:
@@ -733,8 +739,6 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                 if hedgeless_mode == 0:
                     sell_call_profit = sell_call_profit + qty*(exit_hedge_call_price-entry_hedge_call_price) - commission(qty, entry_hedge_call_price, exit_hedge_call_price)
 
-            put_stop_price = (1 + stop_percent) * entry_put_price if sell_put_flag == 1 else 0
-            call_stop_price = (1 + stop_percent) * entry_call_price if sell_call_flag == 1 else 0
             print(
                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
                 f"Status | Realized P&L={final_profit:.2f} | "
@@ -816,7 +820,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                 return()
 
             ################################### EXIT IF STOP LOSS / TARGET IS HIT ############################
-            if (sell_put_flag == 1 and current_entry_put_price >= (1 + stop_percent)*entry_put_price) or (sell_put_flag == 1 and pos_num >= 1 and sell_put_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
+            if (sell_put_flag == 1 and current_entry_put_price >= put_stop_price) or (sell_put_flag == 1 and pos_num >= 1 and sell_put_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
 
                 if live_mode == 1:
                     #####CLOSE THE SELL ORDER
@@ -832,7 +836,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
                 print(datetime.now(), 'Sell_Put_closed', final_profit, exit_sell_put_price, exit_hedge_put_price)
                 break
 
-            if (sell_call_flag == 1 and current_entry_call_price >= (1 + stop_percent)*entry_call_price) or (sell_call_flag == 1 and pos_num >= 1 and sell_call_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
+            if (sell_call_flag == 1 and current_entry_call_price >= call_stop_price) or (sell_call_flag == 1 and pos_num >= 1 and sell_call_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
 
                 if live_mode == 1:
                     #####CLOSE THE SELL ORDER

@@ -1,7 +1,7 @@
 import logging
 import subprocess
 import sys
-from kiteconnect import KiteTicker
+from redis_tick_client import RedisTickClient
 # logging.basicConfig(level=logging.DEBUG)
 import threading
 import time
@@ -31,7 +31,7 @@ strike_difference = 50
 strike_hedge_gap = 10
 lot_size = 65
 exit_check_interval_seconds = 1
-token_swap_time = "09:00"
+token_swap_time = "11:10"
 
 gd_path = '/app/data/'
 results_folder = 'Nifty_sell_supertrend_results_websockets'
@@ -43,10 +43,10 @@ results_folder = 'Nifty_sell_supertrend_results_websockets'
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
     0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 1, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Friday
+    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '11:15', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
+    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
+    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
+    4: {'lots_num': 10, 'live_mode': 1, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Friday
 }
 
 def get_day_config():
@@ -90,40 +90,14 @@ live_mode = 0
 live_market_data = {}
 tick_lock = threading.Lock()
 
-def on_ticks(ws, ticks):
-    with tick_lock:
-        for tick in ticks:
-            try:
-                instrument_token = tick.get('instrument_token')
-                last_price = tick.get('last_price', 0)
-
-                if instrument_token is None:
-                    continue
-
-                if last_price is None or last_price <= 0:
-                    if instrument_token not in live_market_data:
-                        live_market_data[instrument_token] = 0
-                    continue
-
-                live_market_data[instrument_token] = last_price
-            except Exception as e:
-                print(f"WebSocket tick ignored due to processing error: {e}")
-
-def on_connect(ws, response):
-    print("WebSocket Connected Successfully.")
+def subscribe_tokens(tick_client, tokens):
+    tick_client.subscribe(tokens)
 
 def get_symbol_and_token(zerodha_instruments_list, strike, instrument_type):
     option_rows = zerodha_instruments_list[zerodha_instruments_list['strike'] == int(strike)]
     row = option_rows[option_rows['tradingsymbol'].str.contains(instrument_type, na=False)].iloc[0]
     return row['tradingsymbol'], int(row['instrument_token'])
 
-def subscribe_tokens(kws, tokens):
-    tokens = [int(token) for token in tokens if token]
-    if not tokens:
-        return
-    kws.subscribe(tokens)
-    kws.set_mode(kws.MODE_LTP, tokens)
-    time.sleep(0.25)
 
 def get_live_price(instrument_token, fallback_price):
     with tick_lock:
@@ -463,7 +437,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     sell_put_profit, sell_call_profit, buy_put_profit, buy_call_profit = 0,0,0,0
     initial_entry_put_price, initial_entry_call_price, initial_buy_put_price, initial_buy_call_price, current_entry_put_price, current_entry_call_price, current_buy_put_price, current_buy_call_price, entry_put_price, entry_call_price, buy_put_price, buy_call_price = 0,0,0,0,0,0,0,0,0,0,0,0
     exit_sell_call_price, exit_sell_put_price, exit_buy_call_price, exit_buy_put_price = 0,0,0,0
-    entry_hedge_put_price, entry_hedge_call_price = 0,0
+    entry_hedge_put_price, entry_hedge_call_price,exit_hedge_put_price, exit_hedge_call_price = 0,0,0,0
 
     # ── Load today's config from DAY_CONFIG ──────────────────────────────────
     cfg = get_day_config()
@@ -495,12 +469,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     intraday_positions = pd.read_csv(gd_path + results_folder + '/Intraday_options_tradebook.csv')
     final_position_df = pd.read_csv(gd_path + results_folder + '/Final_daily_pnl.csv')
 
-    kws = KiteTicker(api_key, access_token)
-    kws.on_ticks = on_ticks
-    kws.on_connect = on_connect
-    ws_thread = threading.Thread(target=kws.connect, kwargs={'threaded': True})
-    ws_thread.daemon = True
-    ws_thread.start()
+    kws = RedisTickClient(live_market_data, tick_lock)
+    kws.start()
 
     lots = math.floor(1*lots_num)
     qty = lots*lot_size
@@ -517,6 +487,8 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
     sleep_seconds = (start_datetime - now).total_seconds()
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
+    
+    time.sleep(7)
     print(datetime.now())
 
     ##### GET 5m DATAFRAME AT 09:35
@@ -610,7 +582,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
 
     current_pos_profit = 0
 
-    for pos_num in range(0, 2):
+    for pos_num in range(0, 3):
 
         if pos_num > 1 or (pos_num > 0 and final_profit > 0):
             final_position_df.loc[final_position_df.shape[0]] = [str(datetime.now(pytz.timezone('Asia/Kolkata'))).split('.')[0], entry_call, entry_put, entry_call_price, entry_put_price, exit_sell_call_price, exit_sell_put_price, final_profit]
@@ -745,6 +717,10 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
 
             print(f"{datetime.now()} - Call Entry: {entry_call}, Hedge: {hedge_call} | Entry Price: {entry_call_price}, Hedge Price: {entry_hedge_call_price}, Qty: {qty}")
 
+        put_stop_price = (1 + stop_percent) * entry_put_price if sell_put_flag == 1 else 0
+        call_stop_price = (1 + stop_percent) * entry_call_price if sell_call_flag == 1 else 0
+        print(f"Stop Prices — put_stop_price={put_stop_price:.2f}, call_stop_price={call_stop_price:.2f}")
+
         ######### START CHECKING THE ENTRY CONDITIONS
         counter, sell_put_profit, sell_call_profit = 0, 0, 0
         last_status_print_minute = -1
@@ -777,8 +753,6 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
                 if hedgeless_mode == 0:
                     sell_call_profit = sell_call_profit + qty*(exit_hedge_call_price-entry_hedge_call_price) - commission(qty, entry_hedge_call_price, exit_hedge_call_price)
 
-            put_stop_price = (1 + stop_percent) * entry_put_price if sell_put_flag == 1 else 0
-            call_stop_price = (1 + stop_percent) * entry_call_price if sell_call_flag == 1 else 0
             current_status_minute = datetime.now().minute
             if current_status_minute != last_status_print_minute:
                 print(
@@ -863,7 +837,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
                 return()
 
             ################################### EXIT IF STOP LOSS / TARGET IS HIT ############################
-            if (sell_put_flag == 1 and current_entry_put_price >= (1 + stop_percent)*entry_put_price) or (sell_put_flag == 1 and pos_num >= 1 and sell_put_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
+            if (sell_put_flag == 1 and current_entry_put_price >= put_stop_price) or (sell_put_flag == 1 and pos_num >= 1 and sell_put_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
 
                 if live_mode == 1:
                     #####CLOSE THE SELL ORDER
@@ -879,7 +853,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry, api_key, access_token):
                 print(datetime.now(), 'Sell_Put_closed', final_profit, exit_sell_put_price, exit_hedge_put_price)
                 break
 
-            if (sell_call_flag == 1 and current_entry_call_price >= (1 + stop_percent)*entry_call_price) or (sell_call_flag == 1 and pos_num >= 1 and sell_call_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
+            if (sell_call_flag == 1 and current_entry_call_price >= call_stop_price) or (sell_call_flag == 1 and pos_num >= 1 and sell_call_profit >= (1 + reverse_threshold_percentage)*abs(final_profit)):
 
                 if live_mode == 1:
                     #####CLOSE THE SELL ORDER

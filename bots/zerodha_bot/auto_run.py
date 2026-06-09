@@ -1085,17 +1085,16 @@ def run_daily_scan():
         logic.log_action('🔌 Connecting Ticker...')
         try:
             # If ticker was running (e.g. manual re-scan), stop it first
-            if hasattr(ticker, 'stop'): 
+            if hasattr(ticker, 'stop'):
                 try: ticker.stop()
                 except: pass
-            
-            # Refresh Token & Start
-            ticker.refresh_token(new_token)
-            ticker.start() # <--- MOVED HERE (Safe Zone)
+
+            # Start Redis ticker (no token refresh needed, handled centrally)
+            ticker.start()
             logic.log_action('✅ Ticker Connected & Ready.')
-            
+
         except Exception as e:
-             logic.log_action(f"⚠️ Ticker Start Failed: {e}")
+            logic.log_action(f"⚠️ Ticker Start Failed: {e}")
 
     else:
         logic.log_action('❌ Scan Failed.')

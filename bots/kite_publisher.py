@@ -15,7 +15,7 @@ TOKEN_SYNC_INTERVAL = 2       # Seconds between token sync checks
 AUTH_CHECK_INTERVAL = 30      # Seconds between auth.txt change checks
 MARKET_OPEN         = (9, 0)  # HH, MM
 MARKET_CLOSE        = (15, 30)# HH, MM
-EOD_CLEANUP_TIME    = (15, 32)# HH, MM — 2 mins after close, clear active_tokens
+EOD_CLEANUP_TIME    = (16, 0) # HH, MM — clear active_tokens at 4PM
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -166,6 +166,7 @@ def main():
                     subscribed_tokens = set()
                     ticker = build_ticker(api_key, access_token, r, subscribed_tokens)
                     log.info("KiteTicker rebuilt with new token")
+                    time.sleep(5)  # Wait for connection to establish before sync loop resumes
                     continue
 
             # ── Token sync: add/remove from KiteTicker ────────────────────────
@@ -174,15 +175,21 @@ def main():
             to_remove = subscribed_tokens - current_tokens
 
             if to_add:
-                ticker.subscribe(list(to_add))
-                ticker.set_mode(ticker.MODE_LTP, list(to_add))
-                subscribed_tokens.update(to_add)
-                log.info(f"Subscribed new tokens: {to_add}")
+                try:
+                    ticker.subscribe(list(to_add))
+                    ticker.set_mode(ticker.MODE_LTP, list(to_add))
+                    subscribed_tokens.update(to_add)
+                    log.info(f"Subscribed new tokens: {to_add}")
+                except Exception as e:
+                    log.warning(f"Subscribe failed, will retry: {e}")
 
             if to_remove:
-                ticker.unsubscribe(list(to_remove))
-                subscribed_tokens.difference_update(to_remove)
-                log.info(f"Unsubscribed tokens: {to_remove}")
+                try:
+                    ticker.unsubscribe(list(to_remove))
+                    subscribed_tokens.difference_update(to_remove)
+                    log.info(f"Unsubscribed tokens: {to_remove}")
+                except Exception as e:
+                    log.warning(f"Unsubscribe failed, will retry: {e}")
 
         except Exception as e:
             log.error(f"Main loop error: {e}")
