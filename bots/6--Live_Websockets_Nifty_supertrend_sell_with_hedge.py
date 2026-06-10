@@ -31,7 +31,7 @@ strike_difference = 50
 strike_hedge_gap = 10
 lot_size = 65
 exit_check_interval_seconds = 1
-token_swap_time = "11:10"
+token_swap_time = "09:00"
 
 gd_path = '/app/data/'
 results_folder = 'Nifty_sell_supertrend_results_websockets'
