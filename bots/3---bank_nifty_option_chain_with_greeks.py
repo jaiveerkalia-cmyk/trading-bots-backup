@@ -18,6 +18,7 @@ OPTION_PREFIX = 'NFO:'
 SPOT_SYMBOL = 'NSE:NIFTY BANK'
 QUOTE_BATCH_SIZE = 420
 QUOTE_BATCH_PAUSE = 0.25
+QUOTE_MAX_ATTEMPTS = 10
 SLOT_GRACE_SECONDS = 10
 PREP_HOUR = 9
 PREP_MINUTE = 0
@@ -227,13 +228,19 @@ def collect_slot(state, slot_time):
     timestamp = slot_label(slot_time)
     kite = state['kite']
 
-    try:
-        quotes = fetch_quotes(kite, state['all_symbols'])
-        spot_price = get_spot_price(quotes)
-    except RuntimeError as exc:
-        print('Slot {} skipped: {}'.format(timestamp, exc))
-        print('It took {0:.2f}s | 0 rows across 0 files'.format(time.time() - started_at))
-        return False
+    for attempt in range(1, QUOTE_MAX_ATTEMPTS + 1):
+        try:
+            quotes = fetch_quotes(kite, state['all_symbols'])
+            spot_price = get_spot_price(quotes)
+            break
+        except RuntimeError as exc:
+            if attempt == QUOTE_MAX_ATTEMPTS:
+                print('Slot {} skipped after {} attempts: {}'.format(timestamp, QUOTE_MAX_ATTEMPTS, exc))
+                print('It took {0:.2f}s | 0 rows across 0 files'.format(time.time() - started_at))
+                return False
+            backoff_seconds = attempt
+            print('Slot {} quote attempt {}/{} failed: {}; retrying in {}s'.format(timestamp, attempt, QUOTE_MAX_ATTEMPTS, exc, backoff_seconds))
+            time.sleep(backoff_seconds)
 
     for expiry in state['expiry_list']:
         rows = []
@@ -284,6 +291,7 @@ if __name__ == '__main__':
     next_slot_to_process = None
     last_wait_target = None
     day_end_printed_for = None
+    missing_slots = []
 
     while True:
         now = datetime.now()
@@ -301,15 +309,18 @@ if __name__ == '__main__':
             next_slot_to_process = None
             last_wait_target = None
             day_end_printed_for = None
+            missing_slots = []
 
         if now.weekday() >= 5 or now >= close_end:
             if state is not None and next_slot_to_process is not None and next_slot_to_process <= close_slot and last_processed_slot != next_slot_to_process:
-                collect_slot(state, next_slot_to_process)
+                if not collect_slot(state, next_slot_to_process):
+                    missing_slots.append(slot_label(next_slot_to_process))
                 last_processed_slot = next_slot_to_process
                 next_slot_to_process = next_collection_slot(next_slot_to_process)
                 continue
             if now.weekday() < 5 and day_end_printed_for != today:
                 print('Day_end')
+                print('Missing slots: {}'.format(', '.join(missing_slots) if missing_slots else 'None'))
                 print('==========================')
                 day_end_printed_for = today
             target = next_trading_prep(now)
@@ -361,6 +372,7 @@ if __name__ == '__main__':
                 next_slot_to_process = initial_collection_slot(datetime.now())
             except Exception as exc:
                 print('Slot {} skipped: {}'.format(slot_label(next_slot_to_process), short_error(exc)))
+                missing_slots.append(slot_label(next_slot_to_process))
                 last_processed_slot = next_slot_to_process
                 next_slot_to_process = next_collection_slot(next_slot_to_process)
                 continue
@@ -373,6 +385,7 @@ if __name__ == '__main__':
             next_slot_to_process = next_collection_slot(next_slot_to_process)
             continue
 
-        collect_slot(state, next_slot_to_process)
+        if not collect_slot(state, next_slot_to_process):
+            missing_slots.append(slot_label(next_slot_to_process))
         last_processed_slot = next_slot_to_process
         next_slot_to_process = next_collection_slot(next_slot_to_process)

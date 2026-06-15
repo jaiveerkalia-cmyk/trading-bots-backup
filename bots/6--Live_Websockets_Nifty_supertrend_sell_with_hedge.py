@@ -42,7 +42,7 @@ results_folder = 'Nifty_sell_supertrend_results_websockets'
 # live_mode: 1 = live trading (real orders placed), 0 = paper trading
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
-    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
+    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:40', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
     1: {'lots_num': 10, 'live_mode': 0, 'start_time': '11:15', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
     2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
     3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:25', 'supertrend_period': 4, 'stop_percent': 0.3, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
