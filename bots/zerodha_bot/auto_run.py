@@ -678,22 +678,8 @@ class AutoController:
         if self.state == 'SECOND_LEG':
             lots = int(params['lots'])
             total_pnl = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
-            
-            if total_pnl >= AutoConfig.GLB_TARGET_FLAT:
-                self.clear_leg_fields('Call')
-                self.clear_leg_fields('Put')
-                self.state = 'DONE'
-                self.log("🎯 Global Target Hit. Triggers DISARMED.")
-                if not shared_state.get('daily_pnl_written', False):
-                    try:
-                        self.logic.close_all_positions("Global Target", save_pnl=True)
-                        shared_state['daily_pnl_written'] = True
-                        shared_state['sound_queue'].append('success')
-                    except: pass
-                shared_state['active_trades']['Call'] = None
-                shared_state['active_trades']['Put'] = None
-                
-            elif total_pnl <= -(AutoConfig.GLB_STOP_PER_LOT * lots):
+
+            if total_pnl <= -(AutoConfig.GLB_STOP_PER_LOT * lots):
                 self.clear_leg_fields('Call')
                 self.clear_leg_fields('Put')
                 self.state = 'DONE'
