@@ -1,0 +1,161 @@
+from __future__ import annotations
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal
+from datetime import datetime
+import uuid
+
+
+def _uid() -> str:
+    return str(uuid.uuid4())
+
+
+# ── Market data ────────────────────────────────────────────────────────────────
+
+class Tick(BaseModel):
+    exchange: str
+    symbol: str          # canonical BASE/QUOTE e.g. "BTC/USDT"
+    price: float
+    volume: float
+    timestamp: datetime
+
+
+class Candle(BaseModel):
+    exchange: str
+    symbol: str
+    interval: str        # '1m' | '5m' | '15m' | '1h' | '4h' | '1d'
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    timestamp: datetime
+
+
+class OrderBookLevel(BaseModel):
+    price: float
+    qty: float
+
+
+class OrderBook(BaseModel):
+    exchange: str
+    symbol: str
+    bids: List[OrderBookLevel]   # sorted desc by price
+    asks: List[OrderBookLevel]   # sorted asc by price
+    timestamp: datetime
+
+
+# ── Orders ─────────────────────────────────────────────────────────────────────
+
+class Order(BaseModel):
+    id: str = Field(default_factory=_uid)
+    exchange_order_id: Optional[str] = None
+    exchange: str
+    symbol: str
+    side: Literal['buy', 'sell']
+    order_type: Literal['market', 'limit', 'stop_limit']
+    price: Optional[float] = None        # limit price
+    stop_price: Optional[float] = None   # stop trigger price
+    qty: float
+    qty_mode: Literal['base', 'quote'] = 'base'
+    status: Literal['pending', 'working', 'filled', 'cancelled', 'rejected'] = 'pending'
+    filled_qty: float = 0.0
+    avg_fill_price: Optional[float] = None
+    is_paper: bool = False
+    slot_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ── Positions ──────────────────────────────────────────────────────────────────
+
+class Position(BaseModel):
+    exchange: str
+    symbol: str
+    side: Literal['long', 'short']
+    entry_price: float
+    current_price: float
+    qty: float
+    leverage: int = 1
+    margin_mode: Literal['cross', 'isolated'] = 'cross'
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    liquidation_price: Optional[float] = None
+    funding_rate: Optional[float] = None
+    is_paper: bool = False
+    slot_id: Optional[str] = None
+    opened_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ── Trade slots ────────────────────────────────────────────────────────────────
+
+class EntryLeg(BaseModel):
+    """One price level in a laddered/scaled entry"""
+    price: float
+    qty: float
+    order_type: Literal['market', 'limit', 'stop_limit'] = 'limit'
+    order_id: Optional[str] = None        # set once order is placed
+    filled: bool = False
+
+
+class TradeSlot(BaseModel):
+    id: str = Field(default_factory=_uid)
+    exchange: str
+    symbol: str
+    side: Literal['long', 'short']
+    instrument_type: Literal['spot', 'futures'] = 'spot'
+
+    # Entry config
+    entries: List[EntryLeg] = []
+
+    # Exit config
+    stop_price: Optional[float] = None
+    target_price: Optional[float] = None
+
+    # Position sizing
+    leverage: int = 1
+    margin_mode: Literal['cross', 'isolated'] = 'cross'
+    qty_mode: Literal['base', 'quote', 'risk'] = 'risk'
+    risk_pct: float = 0.5               # used when qty_mode == 'risk'
+
+    # Runtime state
+    status: Literal['pending', 'active', 'closed', 'stopped'] = 'pending'
+    position: Optional[Position] = None
+    orders: List[Order] = []
+    sl_order_id: Optional[str] = None
+    target_order_id: Optional[str] = None
+
+    # Metadata
+    is_paper: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    closed_at: Optional[datetime] = None
+    realized_pnl: float = 0.0
+
+
+# ── Alerts ─────────────────────────────────────────────────────────────────────
+
+class Alert(BaseModel):
+    id: str = Field(default_factory=_uid)
+    exchange: str
+    symbol: str
+    upper: Optional[float] = None
+    lower: Optional[float] = None
+    period: Literal['current', '1m', '5m'] = 'current'
+    triggered: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ── Activity log ───────────────────────────────────────────────────────────────
+
+class LogEntry(BaseModel):
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    level: Literal['info', 'warning', 'error', 'success'] = 'info'
+    message: str
+    exchange: Optional[str] = None
+    symbol: Optional[str] = None
+
+
+# ── Engine summary (published to Redis for UI) ─────────────────────────────────
+
+class PnLSummary(BaseModel):
+    unrealized: float = 0.0
+    realized: float = 0.0
