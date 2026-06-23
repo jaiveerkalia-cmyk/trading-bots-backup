@@ -15,19 +15,18 @@ logger = logging.getLogger(__name__)
 
 class BinanceAdapter(BaseExchangeAdapter):
 
-    supports_stop_limit  = True
-    supports_futures     = True
-    supports_leverage    = True
-    supports_ws_ticker   = True
+    supports_stop_limit   = True
+    supports_futures      = True
+    supports_leverage     = True
+    supports_ws_ticker    = True
     supports_ws_orderbook = True
-    supports_ws_candles  = True
+    supports_ws_candles   = True
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         super().__init__(api_key, api_secret, testnet)
-        self.name = 'binance'
+        self.name      = 'binance'
         self._spot:    Optional[ccxtpro.binance] = None
         self._futures: Optional[ccxtpro.binance] = None
-        # symbol -> list of running asyncio Tasks for WS loops
         self._ws_tasks: dict[str, list[asyncio.Task]] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -36,9 +35,20 @@ class BinanceAdapter(BaseExchangeAdapter):
         base_opts = {
             'apiKey': self.api_key,
             'secret': self.api_secret,
+            'options': {
+                # Only return newly closed candles on each watch_ohlcv call —
+                # prevents ccxt.pro accumulating a full candle history list in RAM
+                'newUpdates': True,
+            },
         }
-        self._spot = ccxtpro.binance({**base_opts, 'options': {'defaultType': 'spot'}})
-        self._futures = ccxtpro.binance({**base_opts, 'options': {'defaultType': 'future'}})
+        self._spot = ccxtpro.binance({
+            **base_opts,
+            'options': {**base_opts['options'], 'defaultType': 'spot'},
+        })
+        self._futures = ccxtpro.binance({
+            **base_opts,
+            'options': {**base_opts['options'], 'defaultType': 'future'},
+        })
 
         if self.testnet:
             self._spot.set_sandbox_mode(True)
@@ -74,7 +84,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         while True:
             try:
                 raw = await ex.watch_ticker(symbol)
-                await cb(Tick(
+                tick = Tick(
                     exchange=self.name,
                     symbol=symbol,
                     price=float(raw.get('last') or raw.get('close') or 0),
@@ -82,7 +92,9 @@ class BinanceAdapter(BaseExchangeAdapter):
                     timestamp=datetime.fromtimestamp(
                         raw['timestamp'] / 1000, tz=timezone.utc
                     ) if raw.get('timestamp') else datetime.now(timezone.utc),
-                ))
+                )
+                await cb(tick)
+                del tick, raw   # explicit drop — helps GC in tight loops
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -96,19 +108,29 @@ class BinanceAdapter(BaseExchangeAdapter):
         self._ws_tasks.setdefault(symbol, []).append(t)
 
     async def _orderbook_loop(self, symbol: str, cb: Callable) -> None:
-        ex = self._get_ex(symbol)
+        """
+        Pass limit=DEFAULT_ORDERBOOK_DEPTH to watch_order_book so ccxt.pro's
+        internal book cache is bounded to N levels — not thousands.
+        We read directly from the returned object without making a second copy.
+        """
+        ex    = self._get_ex(symbol)
+        depth = settings.DEFAULT_ORDERBOOK_DEPTH
         while True:
             try:
-                raw = await ex.watch_order_book(symbol, limit=settings.DEFAULT_ORDERBOOK_DEPTH)
-                await cb(OrderBook(
+                raw  = await ex.watch_order_book(symbol, limit=depth)
+                book = OrderBook(
                     exchange=self.name,
                     symbol=symbol,
-                    bids=[OrderBookLevel(price=float(p), qty=float(q)) for p, q in raw['bids']],
-                    asks=[OrderBookLevel(price=float(p), qty=float(q)) for p, q in raw['asks']],
+                    bids=[OrderBookLevel(price=float(p), qty=float(q))
+                          for p, q in raw['bids'][:depth]],
+                    asks=[OrderBookLevel(price=float(p), qty=float(q))
+                          for p, q in raw['asks'][:depth]],
                     timestamp=datetime.fromtimestamp(
                         raw['timestamp'] / 1000, tz=timezone.utc
                     ) if raw.get('timestamp') else datetime.now(timezone.utc),
-                ))
+                )
+                await cb(book)
+                del book        # drop immediately after publish
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -122,6 +144,10 @@ class BinanceAdapter(BaseExchangeAdapter):
         self._ws_tasks.setdefault(symbol, []).append(t)
 
     async def _candles_loop(self, symbol: str, interval: str, cb: Callable) -> None:
+        """
+        newUpdates=True (set at client level) means ccxt.pro returns only
+        newly closed candles here — no growing history list in RAM.
+        """
         ex = self._get_ex(symbol)
         while True:
             try:
@@ -193,7 +219,8 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list[Order]:
         try:
-            return [self._parse_order(o) for o in await self._spot.fetch_open_orders(symbol)]
+            return [self._parse_order(o)
+                    for o in await self._spot.fetch_open_orders(symbol)]
         except Exception as e:
             logger.error(f"Binance get_open_orders error: {e}")
             return []
@@ -207,11 +234,8 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     async def get_positions(self) -> list[Position]:
         try:
-            positions = []
-            for p in await self._futures.fetch_positions():
-                if not float(p.get('contracts') or 0):
-                    continue
-                positions.append(Position(
+            return [
+                Position(
                     exchange=self.name,
                     symbol=p['symbol'],
                     side='long' if p['side'] == 'long' else 'short',
@@ -223,8 +247,10 @@ class BinanceAdapter(BaseExchangeAdapter):
                     unrealized_pnl=float(p.get('unrealizedPnl') or 0),
                     liquidation_price=float(p.get('liquidationPrice') or 0) or None,
                     funding_rate=float(p.get('fundingRate') or 0) or None,
-                ))
-            return positions
+                )
+                for p in await self._futures.fetch_positions()
+                if float(p.get('contracts') or 0)
+            ]
         except Exception as e:
             logger.error(f"Binance get_positions error: {e}")
             return []
@@ -232,7 +258,8 @@ class BinanceAdapter(BaseExchangeAdapter):
     async def get_balance(self) -> dict[str, float]:
         try:
             bal = await self._spot.fetch_balance()
-            return {k: float(v['free']) for k, v in bal.items()
+            return {k: float(v['free'])
+                    for k, v in bal.items()
                     if isinstance(v, dict) and v.get('free')}
         except Exception as e:
             logger.error(f"Binance get_balance error: {e}")
@@ -257,10 +284,10 @@ class BinanceAdapter(BaseExchangeAdapter):
     # ── Symbol normalisation ──────────────────────────────────────────────────
 
     def normalize_symbol(self, raw: str) -> str:
-        return raw  # ccxt uses BASE/QUOTE natively
+        return raw
 
     def to_exchange_symbol(self, canonical: str) -> str:
-        return canonical  # ccxt translates internally on each call
+        return canonical
 
     async def get_tradable_symbols(self) -> list[str]:
         try:
@@ -273,7 +300,6 @@ class BinanceAdapter(BaseExchangeAdapter):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_ex(self, symbol: str):
-        """Route to futures instance if the symbol is a known futures market."""
         if self._futures and symbol in (self._futures.markets or {}):
             return self._futures
         return self._spot
@@ -296,4 +322,8 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     @staticmethod
     def _map_status(s: str) -> str:
-        return {'open': 'working', 'closed': 'filled', 'canceled': 'cancelled'}.get(s, 'pending')
+        return {
+            'open':     'working',
+            'closed':   'filled',
+            'canceled': 'cancelled',
+        }.get(s, 'pending')

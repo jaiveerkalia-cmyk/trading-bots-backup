@@ -17,13 +17,11 @@ from common import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-REST_INDIA    = "https://api.india.delta.exchange"
-WS_INDIA      = "wss://socket.india.delta.exchange"
-REST_TESTNET  = "https://cdn-ind.testnet.deltaex.org"
-WS_TESTNET    = "wss://socket.testnet.delta.exchange"
+REST_INDIA   = "https://api.india.delta.exchange"
+WS_INDIA     = "wss://socket.india.delta.exchange"
+REST_TESTNET = "https://cdn-ind.testnet.deltaex.org"
+WS_TESTNET   = "wss://socket.testnet.delta.exchange"
 
-# Delta WS candle channel names
 _INTERVAL_MAP = {
     '1m':  'candlestick_1m',
     '5m':  'candlestick_5m',
@@ -47,41 +45,38 @@ class DeltaAdapter(BaseExchangeAdapter):
         super().__init__(api_key, api_secret, testnet)
         self.name      = 'delta'
         self._rest_url = REST_TESTNET if testnet else REST_INDIA
-        self._ws_url   = WS_TESTNET  if testnet else WS_INDIA
+        self._ws_url   = WS_TESTNET   if testnet else WS_INDIA
 
         self._exchange: Optional[ccxt_async.delta] = None
-        self._session:  Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
+        self._session:   Optional[aiohttp.ClientSession] = None
 
-        # WS state
-        self._ws:              Optional[aiohttp.ClientWebSocketResponse] = None
-        self._ws_task:         Optional[asyncio.Task] = None
-        self._ws_ready         = asyncio.Event()
+        self._ws:       Optional[aiohttp.ClientWebSocketResponse] = None
+        self._ws_task:  Optional[asyncio.Task] = None
+        self._ws_ready  = asyncio.Event()
 
-        # channel_key -> list of callbacks
-        # channel_key format:  "ticker:BTC/USDT"  |  "l2_orderbook:BTC/USDT"  |  "candlestick_1m:BTC/USDT"
+        # channel_key ('ticker:BTC/USDT') -> list of callbacks
         self._subs: dict[str, list[Callable]] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        self._session = aiohttp.ClientSession()
+        # Limit TCP connection pool — Delta needs at most 2-3 connections
+        self._connector = aiohttp.TCPConnector(
+            limit=5,
+            limit_per_host=3,
+            ttl_dns_cache=300,
+        )
+        self._session = aiohttp.ClientSession(connector=self._connector)
 
-        # ccxt async for all REST operations — override base URL to India endpoint
         self._exchange = ccxt_async.delta({
             'apiKey': self.api_key,
             'secret': self.api_secret,
-            'urls': {
-                'api': {
-                    'public':  self._rest_url,
-                    'private': self._rest_url,
-                }
-            },
+            'urls': {'api': {'public': self._rest_url, 'private': self._rest_url}},
         })
         await self._exchange.load_markets()
 
-        # Start persistent WS loop
         self._ws_task = asyncio.create_task(self._ws_loop())
-        # Wait up to 10s for first WS connect before returning
         try:
             await asyncio.wait_for(self._ws_ready.wait(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -98,15 +93,20 @@ class DeltaAdapter(BaseExchangeAdapter):
             await self._exchange.close()
         if self._session:
             await self._session.close()
+        if self._connector:
+            await self._connector.close()
+        self._subs.clear()
         logger.info("Delta Exchange adapter disconnected")
 
     # ── WebSocket core ────────────────────────────────────────────────────────
 
     async def _ws_loop(self) -> None:
-        """Persistent WS connection with infinite auto-reconnect."""
         while True:
             try:
-                async with self._session.ws_connect(self._ws_url) as ws:
+                # max_msg_size=1MB — Delta messages are small JSON, no need for 4MB default
+                async with self._session.ws_connect(
+                    self._ws_url, max_msg_size=1024 * 1024
+                ) as ws:
                     self._ws = ws
                     await self._send_auth(ws)
                     await self._resubscribe(ws)
@@ -115,9 +115,11 @@ class DeltaAdapter(BaseExchangeAdapter):
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            # Parse, dispatch, drop — no accumulation
                             await self._handle_message(json.loads(msg.data))
+                            del msg
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            logger.warning(f"Delta WS closed/error: {msg}")
+                            logger.warning(f"Delta WS closed/error: {msg.type}")
                             break
             except asyncio.CancelledError:
                 break
@@ -141,11 +143,12 @@ class DeltaAdapter(BaseExchangeAdapter):
         })
 
     async def _resubscribe(self, ws) -> None:
-        """Re-send all active subscriptions after reconnect."""
         channels: dict[str, list[str]] = {}
         for key in self._subs:
             channel, canonical = key.split(':', 1)
-            channels.setdefault(channel, []).append(self.to_exchange_symbol(canonical))
+            channels.setdefault(channel, []).append(
+                self.to_exchange_symbol(canonical)
+            )
         for channel, symbols in channels.items():
             await ws.send_json({
                 'type': 'subscribe',
@@ -159,7 +162,7 @@ class DeltaAdapter(BaseExchangeAdapter):
                 'payload': {'channels': [{'name': channel, 'symbols': [delta_symbol]}]},
             })
 
-    # ── WS message dispatch ───────────────────────────────────────────────────
+    # ── WS message dispatch — parse, call, drop ───────────────────────────────
 
     async def _handle_message(self, msg: dict) -> None:
         t = msg.get('type', '')
@@ -169,10 +172,13 @@ class DeltaAdapter(BaseExchangeAdapter):
             await self._on_orderbook(msg)
         elif t == 'candlestick':
             await self._on_candle(msg)
-        # 'subscriptions', 'heartbeat', 'key-auth' etc. are silently ignored
+        # heartbeat / subscriptions / key-auth — silently ignored
 
     async def _on_ticker(self, msg: dict) -> None:
         symbol = self.normalize_symbol(msg.get('symbol', ''))
+        cbs    = self._subs.get(f"ticker:{symbol}")
+        if not cbs:
+            return
         tick = Tick(
             exchange=self.name,
             symbol=symbol,
@@ -180,15 +186,24 @@ class DeltaAdapter(BaseExchangeAdapter):
             volume=float(msg.get('volume') or 0),
             timestamp=datetime.now(timezone.utc),
         )
-        for cb in self._subs.get(f"ticker:{symbol}", []):
+        for cb in cbs:
             await cb(tick)
+        del tick
 
     async def _on_orderbook(self, msg: dict) -> None:
         symbol = self.normalize_symbol(msg.get('symbol', ''))
-        bids = [OrderBookLevel(price=float(b['limit_price']), qty=float(b['size']))
-                for b in msg.get('buy', [])]
-        asks = [OrderBookLevel(price=float(a['limit_price']), qty=float(a['size']))
-                for a in msg.get('sell', [])]
+        cbs    = self._subs.get(f"l2_orderbook:{symbol}")
+        if not cbs:
+            return
+        depth  = settings.DEFAULT_ORDERBOOK_DEPTH
+        bids   = [
+            OrderBookLevel(price=float(b['limit_price']), qty=float(b['size']))
+            for b in msg.get('buy', [])[:depth]
+        ]
+        asks   = [
+            OrderBookLevel(price=float(a['limit_price']), qty=float(a['size']))
+            for a in msg.get('sell', [])[:depth]
+        ]
         book = OrderBook(
             exchange=self.name,
             symbol=symbol,
@@ -196,13 +211,17 @@ class DeltaAdapter(BaseExchangeAdapter):
             asks=sorted(asks, key=lambda x:  x.price),
             timestamp=datetime.now(timezone.utc),
         )
-        for cb in self._subs.get(f"l2_orderbook:{symbol}", []):
+        for cb in cbs:
             await cb(book)
+        del book, bids, asks
 
     async def _on_candle(self, msg: dict) -> None:
         symbol   = self.normalize_symbol(msg.get('symbol', ''))
         interval = msg.get('resolution', '1m')
-        candle   = Candle(
+        cbs      = self._subs.get(f"candlestick_{interval}:{symbol}")
+        if not cbs:
+            return
+        candle = Candle(
             exchange=self.name,
             symbol=symbol,
             interval=interval,
@@ -213,10 +232,11 @@ class DeltaAdapter(BaseExchangeAdapter):
             volume=float(msg.get('volume') or 0),
             timestamp=datetime.now(timezone.utc),
         )
-        for cb in self._subs.get(f"candlestick_{interval}:{symbol}", []):
+        for cb in cbs:
             await cb(candle)
+        del candle
 
-    # ── WS subscriptions (public API) ─────────────────────────────────────────
+    # ── WS subscriptions ──────────────────────────────────────────────────────
 
     async def subscribe_ticker(
         self, symbol: str, callback: Callable[[Tick], Awaitable[None]]
@@ -283,7 +303,8 @@ class DeltaAdapter(BaseExchangeAdapter):
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list[Order]:
         try:
-            return [self._parse_order(o) for o in await self._exchange.fetch_open_orders(symbol)]
+            return [self._parse_order(o)
+                    for o in await self._exchange.fetch_open_orders(symbol)]
         except Exception as e:
             logger.error(f"Delta get_open_orders error: {e}")
             return []
@@ -297,11 +318,8 @@ class DeltaAdapter(BaseExchangeAdapter):
 
     async def get_positions(self) -> list[Position]:
         try:
-            positions = []
-            for p in await self._exchange.fetch_positions():
-                if not float(p.get('contracts') or 0):
-                    continue
-                positions.append(Position(
+            return [
+                Position(
                     exchange=self.name,
                     symbol=p['symbol'],
                     side='long' if p['side'] == 'long' else 'short',
@@ -313,8 +331,10 @@ class DeltaAdapter(BaseExchangeAdapter):
                     unrealized_pnl=float(p.get('unrealizedPnl') or 0),
                     liquidation_price=float(p.get('liquidationPrice') or 0) or None,
                     funding_rate=float(p.get('fundingRate') or 0) or None,
-                ))
-            return positions
+                )
+                for p in await self._exchange.fetch_positions()
+                if float(p.get('contracts') or 0)
+            ]
         except Exception as e:
             logger.error(f"Delta get_positions error: {e}")
             return []
@@ -322,7 +342,8 @@ class DeltaAdapter(BaseExchangeAdapter):
     async def get_balance(self) -> dict[str, float]:
         try:
             bal = await self._exchange.fetch_balance()
-            return {k: float(v['free']) for k, v in bal.items()
+            return {k: float(v['free'])
+                    for k, v in bal.items()
                     if isinstance(v, dict) and v.get('free')}
         except Exception as e:
             logger.error(f"Delta get_balance error: {e}")
@@ -347,20 +368,16 @@ class DeltaAdapter(BaseExchangeAdapter):
     # ── Symbol normalisation ──────────────────────────────────────────────────
 
     def normalize_symbol(self, raw: str) -> str:
-        """Delta native (e.g. 'BTCUSDT', 'ETHUSD') -> canonical 'BTC/USDT'."""
         if '/' in raw:
             return raw
-        # Check ccxt markets first — most reliable
         if self._exchange and raw in (self._exchange.markets or {}):
             return self._exchange.markets[raw].get('symbol', raw)
-        # Fallback: strip known quote suffixes
         for q in ('USDT', 'USD', 'BTC', 'ETH', 'INR'):
             if raw.endswith(q):
                 return f"{raw[:-len(q)]}/{q}"
         return raw
 
     def to_exchange_symbol(self, canonical: str) -> str:
-        """Canonical 'BTC/USDT' -> Delta native 'BTCUSDT'."""
         return canonical.replace('/', '') if '/' in canonical else canonical
 
     async def get_tradable_symbols(self) -> list[str]:
@@ -391,4 +408,8 @@ class DeltaAdapter(BaseExchangeAdapter):
 
     @staticmethod
     def _map_status(s: str) -> str:
-        return {'open': 'working', 'closed': 'filled', 'canceled': 'cancelled'}.get(s, 'pending')
+        return {
+            'open':     'working',
+            'closed':   'filled',
+            'canceled': 'cancelled',
+        }.get(s, 'pending')
