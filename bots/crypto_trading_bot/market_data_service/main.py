@@ -106,50 +106,54 @@ async def _control_loop(
     adapters: dict,
     publisher: RedisPublisher,
 ) -> None:
-    """
-    Listen for subscribe/unsubscribe commands from trading engine.
-    Command format:
-      subscribe:   {"cmd":"subscribe",   "exchange":"binance", "symbol":"BTC/USDT",
-                    "streams":["ticker","orderbook","candles:1m"]}
-      unsubscribe: {"cmd":"unsubscribe", "exchange":"binance", "symbol":"BTC/USDT"}
-    """
     pubsub = redis.pubsub()
     await pubsub.subscribe(CONTROL_CHANNEL)
     logger.info(f"Listening on {CONTROL_CHANNEL}")
 
-    async for msg in pubsub.listen():
-        if msg['type'] != 'message':
-            continue
+    while True:
         try:
-            cmd      = json.loads(msg['data'])
-            action   = cmd.get('cmd')
-            exchange = cmd.get('exchange', '')
-            symbol   = cmd.get('symbol', '')
+            msg = await pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=1.0
+            )
+            if msg and msg['type'] == 'message':
+                try:
+                    cmd      = json.loads(msg['data'])
+                    action   = cmd.get('cmd')
+                    exchange = cmd.get('exchange', '')
+                    symbol   = cmd.get('symbol', '')
 
-            if action == 'subscribe':
-                sub = {
-                    'exchange': exchange,
-                    'symbol':   symbol,
-                    'streams':  cmd.get('streams', DEFAULT_STREAMS),
-                }
-                # Persist so we survive restarts
-                await redis.sadd(ACTIVE_SUBS_KEY, json.dumps(sub))
-                await _do_subscribe(sub, adapters, publisher)
+                    if action == 'subscribe':
+                        sub = {
+                            'exchange': exchange,
+                            'symbol':   symbol,
+                            'streams':  cmd.get('streams', DEFAULT_STREAMS),
+                        }
+                        await redis.sadd(ACTIVE_SUBS_KEY, json.dumps(sub))
+                        await _do_subscribe(sub, adapters, publisher)
 
-            elif action == 'unsubscribe':
-                adapter = adapters.get(exchange)
-                if adapter:
-                    await adapter.unsubscribe(symbol)
-                # Remove from persistence
-                for raw in await redis.smembers(ACTIVE_SUBS_KEY):
-                    s = json.loads(raw)
-                    if s.get('exchange') == exchange and s.get('symbol') == symbol:
-                        await redis.srem(ACTIVE_SUBS_KEY, raw)
-                logger.info(f"Unsubscribed: {exchange} {symbol}")
+                    elif action == 'unsubscribe':
+                        adapter = adapters.get(exchange)
+                        if adapter:
+                            await adapter.unsubscribe(symbol)
+                        for raw in await redis.smembers(ACTIVE_SUBS_KEY):
+                            s = json.loads(raw)
+                            if s.get('exchange') == exchange and s.get('symbol') == symbol:
+                                await redis.srem(ACTIVE_SUBS_KEY, raw)
+                        logger.info(f"Unsubscribed: {exchange} {symbol}")
 
+                except Exception as e:
+                    logger.error(f"Control command error: {e}")
+
+            await asyncio.sleep(0.1)
+
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.error(f"Control command error: {e}")
+            logger.error(f"Control loop error: {e}")
+            await asyncio.sleep(1)
 
+    await pubsub.unsubscribe(CONTROL_CHANNEL)
+    await pubsub.aclose()
 
 async def _do_subscribe(
     sub: dict,

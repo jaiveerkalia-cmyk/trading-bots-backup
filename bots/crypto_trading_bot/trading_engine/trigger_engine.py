@@ -11,17 +11,18 @@ from typing import Callable, Awaitable, TYPE_CHECKING
 
 import redis.asyncio as aioredis
 
-from common.models import TradeSlot, Alert
+from common.models import Alert
 from common import redis_keys, settings
 
 if TYPE_CHECKING:
     from trading_engine.trade_slot import SlotManager
+    from trading_engine.paper_engine import PaperEngine
 
 logger = logging.getLogger('trigger_engine')
 
 
 class TriggerEngine:
-    __slots__ = ('_redis', '_slots', '_on_exit', '_on_alert', '_task')
+    __slots__ = ('_redis', '_slots', '_paper', '_on_exit', '_on_alert', '_task')
 
     def __init__(
         self,
@@ -29,9 +30,11 @@ class TriggerEngine:
         slot_manager:  'SlotManager',
         on_exit:       Callable[[str, str], Awaitable[None]],
         on_alert:      Callable[[Alert],    Awaitable[None]],
+        paper_engine:  'PaperEngine',
     ):
         self._redis    = redis_client
         self._slots    = slot_manager
+        self._paper    = paper_engine
         self._on_exit  = on_exit
         self._on_alert = on_alert
         self._task: asyncio.Task | None = None
@@ -55,12 +58,23 @@ class TriggerEngine:
             await asyncio.sleep(settings.ENGINE_STATE_PUBLISH_INTERVAL)
 
     async def _check_all(self) -> None:
+        # Track updated symbols to avoid redundant mark price updates
+        updated: set[str] = set()
+
         for slot in self._slots.get_active_slots():
             if not slot.position:
                 continue
+
             price = await self._price(slot.exchange, slot.symbol)
             if price <= 0:
                 continue
+
+            # Update paper position mark price + unrealized PnL
+            sym_key = f"{slot.exchange}:{slot.symbol}"
+            if slot.position.is_paper and sym_key not in updated:
+                await self._paper.update_mark_prices(slot.exchange, slot.symbol, price)
+                updated.add(sym_key)
+
             # Stop
             if slot.stop_price:
                 hit = (
@@ -68,9 +82,10 @@ class TriggerEngine:
                     (slot.side == 'short' and price >= slot.stop_price)
                 )
                 if hit:
-                    logger.info(f"Stop hit [{slot.symbol}] {price} <= {slot.stop_price}")
+                    logger.info(f"Stop hit [{slot.symbol}] price={price} stop={slot.stop_price}")
                     await self._on_exit(slot.id, 'stop_hit')
                     continue
+
             # Target
             if slot.target_price:
                 hit = (
@@ -78,9 +93,10 @@ class TriggerEngine:
                     (slot.side == 'short' and price <= slot.target_price)
                 )
                 if hit:
-                    logger.info(f"Target hit [{slot.symbol}] {price} >= {slot.target_price}")
+                    logger.info(f"Target hit [{slot.symbol}] price={price} target={slot.target_price}")
                     await self._on_exit(slot.id, 'target_hit')
 
+        # Alerts
         for alert in self._slots.get_alerts():
             if alert.triggered:
                 continue

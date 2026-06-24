@@ -9,7 +9,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import pandas as pd
-import pandas_ta as ta
+import ta
 from nicegui import ui
 
 from common import settings
@@ -20,10 +20,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger('ui.price_chart')
 
 _INDICATORS = {
-    'EMA 20':  {'fn': lambda df: ta.ema(df['c'], length=20),  'color': '#3b82f6'},
-    'EMA 50':  {'fn': lambda df: ta.ema(df['c'], length=50),  'color': '#f59e0b'},
-    'EMA 200': {'fn': lambda df: ta.ema(df['c'], length=200), 'color': '#8b5cf6'},
-    'BB':      {'fn': lambda df: ta.bbands(df['c'], length=20), 'color': '#6b7280', 'multi': True},
+    'EMA 20':  {'fn': lambda df: ta.trend.ema_indicator(df['c'], window=20),  'color': '#3b82f6'},
+    'EMA 50':  {'fn': lambda df: ta.trend.ema_indicator(df['c'], window=50),  'color': '#f59e0b'},
+    'EMA 200': {'fn': lambda df: ta.trend.ema_indicator(df['c'], window=200), 'color': '#8b5cf6'},
+    'BB Upper':{'fn': lambda df: ta.volatility.BollingerBands(df['c']).bollinger_hband(), 'color': '#6b7280'},
+    'BB Lower':{'fn': lambda df: ta.volatility.BollingerBands(df['c']).bollinger_lband(), 'color': '#6b7280'},
 }
 
 _INIT_JS = """
@@ -68,13 +69,11 @@ def build(state: 'UIState', shared: dict) -> dict:
 
             iv = ui.select(
                 options=settings.CHART_INTERVALS, value=state.watch_interval,
+                on_change=lambda e: (setattr(state, 'watch_interval', e.value),
+                                     last_ts.update({'v': None}),
+                                     _reset_series()),
             ).props('dense dark outlined label=Interval').classes('w-20')
 
-            def on_interval(e):
-                state.watch_interval = e.args
-                last_ts['v'] = None
-                _reset_series()
-            iv.on('update:model-value', on_interval)
 
             ui.label('Indicators:').classes('text-gray-500 text-xs ml-2')
             for name in _INDICATORS:

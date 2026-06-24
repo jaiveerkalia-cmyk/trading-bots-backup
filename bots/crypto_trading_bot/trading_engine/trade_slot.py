@@ -1,8 +1,3 @@
-"""
-SlotManager — single in-memory store for all TradeSlots.
-Only place that creates, mutates, or deletes slots.
-Persists to Redis so state survives engine restarts.
-"""
 from __future__ import annotations
 import asyncio
 import json
@@ -23,13 +18,11 @@ class SlotManager:
     __slots__ = ('_redis', '_slots', '_alerts', '_history', '_lock')
 
     def __init__(self, redis_client: aioredis.Redis):
-        self._redis:   aioredis.Redis           = redis_client
-        self._slots:   dict[str, TradeSlot]     = {}
-        self._alerts:  list[Alert]              = []
-        self._history: list[Order]              = []
+        self._redis:   aioredis.Redis       = redis_client
+        self._slots:   dict[str, TradeSlot] = {}
+        self._alerts:  list[Alert]          = []
+        self._history: list[Order]          = []
         self._lock     = asyncio.Lock()
-
-    # ── Startup ───────────────────────────────────────────────────────────────
 
     async def load(self) -> None:
         try:
@@ -57,8 +50,6 @@ class SlotManager:
         except Exception as e:
             logger.error(f"Slot persist error: {e}")
 
-    # ── Slot CRUD ─────────────────────────────────────────────────────────────
-
     async def create_slot(self, slot: TradeSlot) -> TradeSlot:
         async with self._lock:
             self._slots[slot.id] = slot
@@ -72,7 +63,9 @@ class SlotManager:
             self._slots[slot.id] = slot
         await self._persist()
 
-    async def close_slot(self, slot_id: str, realized_pnl: float = 0.0) -> Optional[TradeSlot]:
+    async def close_slot(
+        self, slot_id: str, realized_pnl: float = 0.0
+    ) -> Optional[TradeSlot]:
         async with self._lock:
             slot = self._slots.get(slot_id)
             if not slot:
@@ -81,10 +74,10 @@ class SlotManager:
             slot.closed_at    = datetime.now(timezone.utc)
             slot.realized_pnl = realized_pnl
             slot.position     = None
+            seen = {o.id for o in self._history}
             for o in slot.orders:
-                if o.status in ('filled', 'cancelled', 'rejected'):
+                if o.status in ('filled', 'cancelled', 'rejected') and o.id not in seen:
                     self._history.append(o)
-            # Cap history — full record is in CSV
             if len(self._history) > 500:
                 self._history = self._history[-500:]
         await self._persist()
@@ -94,22 +87,35 @@ class SlotManager:
     def get_slot(self, slot_id: str) -> Optional[TradeSlot]:
         return self._slots.get(slot_id)
 
-    def get_all_slots(self)      -> list[TradeSlot]: return list(self._slots.values())
-    def get_active_slots(self)   -> list[TradeSlot]: return [s for s in self._slots.values() if s.status == 'active']
-    def get_all_positions(self)  -> list[Position]:  return [s.position for s in self._slots.values() if s.position]
-    def get_order_history(self)  -> list[Order]:     return self._history
-    def get_open_orders(self)    -> list[Order]:
-        return [o for s in self._slots.values() for o in s.orders
-                if o.status in ('pending', 'working')]
+    def get_all_slots(self)     -> list[TradeSlot]: return list(self._slots.values())
+    def get_active_slots(self)  -> list[TradeSlot]: return [s for s in self._slots.values() if s.status == 'active']
+    def get_all_positions(self) -> list[Position]:  return [s.position for s in self._slots.values() if s.position]
 
-    # ── Alerts ────────────────────────────────────────────────────────────────
+    def get_order_history(self) -> list[Order]:
+        """
+        Returns filled/cancelled orders from both closed slots (self._history)
+        AND currently active slots — so history is complete while trades are open.
+        """
+        history = list(self._history)
+        seen    = {o.id for o in history}
+        for slot in self._slots.values():
+            for o in slot.orders:
+                if o.status in ('filled', 'cancelled', 'rejected') and o.id not in seen:
+                    history.append(o)
+                    seen.add(o.id)
+        return sorted(history, key=lambda o: o.created_at, reverse=True)
 
-    def add_alert(self, alert: Alert)         -> None: self._alerts.append(alert)
-    def delete_alert(self, alert_id: str)     -> None: self._alerts = [a for a in self._alerts if a.id != alert_id]
-    def get_alerts(self)                      -> list[Alert]: return self._alerts
-    def clear_triggered_alerts(self)          -> None: self._alerts = [a for a in self._alerts if not a.triggered]
+    def get_open_orders(self) -> list[Order]:
+        return [
+            o for s in self._slots.values()
+            for o in s.orders
+            if o.status in ('pending', 'working')
+        ]
 
-    # ── Market data subscription control ─────────────────────────────────────
+    def add_alert(self, alert: Alert)     -> None: self._alerts.append(alert)
+    def delete_alert(self, alert_id: str) -> None: self._alerts = [a for a in self._alerts if a.id != alert_id]
+    def get_alerts(self)                  -> list[Alert]: return self._alerts
+    def clear_triggered_alerts(self)      -> None: self._alerts = [a for a in self._alerts if not a.triggered]
 
     async def _pub_market_data(self, slot: TradeSlot, subscribe: bool) -> None:
         cmd = {

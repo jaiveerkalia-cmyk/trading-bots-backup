@@ -1,10 +1,12 @@
 from pathlib import Path
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 import os
 
 load_dotenv()
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+IST = ZoneInfo('Asia/Kolkata')
+
 BASE_DIR            = Path(__file__).parent.parent
 DATA_DIR            = BASE_DIR / 'data'
 TRADES_DIR          = DATA_DIR / 'trades'
@@ -16,48 +18,44 @@ KEYS_FILE           = CONFIG_DIR / 'exchange_keys.enc'
 for _d in (TRADES_DIR, DAILY_PNL_DIR, STATE_SNAPSHOTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# ── Redis ──────────────────────────────────────────────────────────────────────
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 REDIS_DB   = 0
 
-# ── Redis TTLs (seconds) — prevents stale market data accumulating ─────────────
-TICK_TTL         = 60     # latest tick key expires after 60s of no updates
-DEPTH_TTL        = 30     # order book snapshot expires after 30s
-CANDLE_TTL       = 300    # latest candle key expires after 5 min
-# Engine state keys have no TTL — managed explicitly by trading_engine
+TICK_TTL   = 60
+DEPTH_TTL  = 30
+CANDLE_TTL = 300
 
-# ── UI ─────────────────────────────────────────────────────────────────────────
 UI_HOST = '0.0.0.0'
 UI_PORT = int(os.getenv('UI_PORT', 9100))
 
-# ── Trading defaults ───────────────────────────────────────────────────────────
 DEFAULT_RISK_PCT    = 0.5
 DEFAULT_LEVERAGE    = 1
 DEFAULT_MARGIN_MODE = 'cross'
 
-# ── Market data ────────────────────────────────────────────────────────────────
 CANDLE_INTERVALS        = ['1m', '5m', '15m', '1h', '4h', '1d']
-DEFAULT_ORDERBOOK_DEPTH = 20     # levels per side — hard cap in both book and ccxt
+CHART_INTERVALS         = ['1m', '5m', '15m', '1h']
+DEFAULT_ORDERBOOK_DEPTH = 20
 
-# ── Queues — bounded to prevent slow consumers accumulating memory ─────────────
-MARKET_DATA_QUEUE_SIZE = 100   # per-symbol publish queue in market_data_service
-COMMAND_QUEUE_SIZE     = 50    # trading engine command queue
+MARKET_DATA_QUEUE_SIZE = 100
+COMMAND_QUEUE_SIZE     = 50
 
-# ── PnL chart — rolling window kept as deque(maxlen=N) in UI ──────────────────
-PNL_CHART_POINTS = 300        # ~5 min of 1s samples
+PNL_CHART_POINTS   = 1440   # 24h of 1-min samples
+PNL_CHART_INTERVAL = 60     # sample every 60 seconds
 
-# ── Supported exchanges ────────────────────────────────────────────────────────
 SUPPORTED_EXCHANGES = ['binance', 'delta']
 
-# ── Timing ─────────────────────────────────────────────────────────────────────
 ENGINE_STATE_PUBLISH_INTERVAL = 1.0
 UI_REFRESH_INTERVAL           = 1.0
 WS_RECONNECT_DELAY            = 5
-WS_MAX_RECONNECT_ATTEMPTS     = 0   # infinite
+WS_MAX_RECONNECT_ATTEMPTS     = 0
 
-# ── Activity log ───────────────────────────────────────────────────────────────
-LOG_MAX_ENTRIES = 200    # Redis LIST capped at this length via LTRIM on every write
+LOG_MAX_ENTRIES = 200
 
-CHART_INTERVALS = ['1m', '5m', '15m', '1h']
+# Exchange fees — taker rate (conservative, used for all orders)
+EXCHANGE_FEES = {
+    'binance': 0.001,   # 0.1%
+    'delta':   0.0005,  # 0.05%
+}
 
+ALERT_SOUND_DURATION_DEFAULT = 5

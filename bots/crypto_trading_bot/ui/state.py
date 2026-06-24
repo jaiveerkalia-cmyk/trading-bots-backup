@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import redis.asyncio as aioredis
 
 from common import redis_keys, settings
+from common.settings import IST
 
 logger = logging.getLogger('ui.state')
 
@@ -15,9 +16,9 @@ class UIState:
     __slots__ = (
         'slots', 'positions', 'open_orders', 'order_history',
         'alerts', 'pnl', 'live_mode', 'connected_exchanges',
-        'log_entries', 'pnl_history', 'candle_buffer',
+        'log_entries', 'pnl_history', 'last_prices',
         'watch_exchange', 'watch_symbol', 'watch_interval',
-        '_redis',
+        'starting_balance', '_last_pnl_ts', '_redis',
     )
 
     def __init__(self, redis_client: aioredis.Redis):
@@ -27,16 +28,19 @@ class UIState:
         self.open_orders:         list[dict] = []
         self.order_history:       list[dict] = []
         self.alerts:              list[dict] = []
-        self.pnl:                 dict       = {'unrealized': 0.0, 'realized': 0.0}
-        self.live_mode:           bool       = False
-        self.connected_exchanges: list[str]  = []
+        self.pnl:                 dict = {'unrealized': 0.0, 'realized': 0.0}
+        self.live_mode:           bool = False
+        self.connected_exchanges: list[str] = []
         self.log_entries:         list[dict] = []
-        self.pnl_history: deque[tuple[str, float]] = deque(maxlen=settings.PNL_CHART_POINTS)
-        # '{exchange}:{symbol}:{interval}' -> deque of compact candle dicts
-        self.candle_buffer: dict[str, deque[dict]] = {}
-        self.watch_exchange  = 'binance'
-        self.watch_symbol    = 'BTC/USDT'
-        self.watch_interval  = '1m'
+        self.pnl_history: deque[tuple[str, float]] = deque(
+            maxlen=settings.PNL_CHART_POINTS
+        )
+        self.last_prices:     dict[str, float] = {}
+        self.watch_exchange   = 'binance'
+        self.watch_symbol     = 'BTC/USDT'
+        self.watch_interval   = '1m'
+        self.starting_balance = 10000.0
+        self._last_pnl_ts: datetime | None = None
 
     async def refresh(self) -> None:
         try:
@@ -50,8 +54,8 @@ class UIState:
                 pipe.get(redis_keys.LIVE_MODE_KEY)
                 pipe.get(redis_keys.CONNECTED_EXCHANGES_KEY)
                 pipe.lrange(redis_keys.LOG_KEY, 0, settings.LOG_MAX_ENTRIES - 1)
-                pipe.get(redis_keys.latest_candle_key(
-                    self.watch_exchange, self.watch_symbol, self.watch_interval
+                pipe.get(redis_keys.latest_tick_key(
+                    self.watch_exchange, self.watch_symbol
                 ))
                 results = await pipe.execute()
 
@@ -65,28 +69,31 @@ class UIState:
             self.connected_exchanges = json.loads(results[7]) if results[7] else []
             self.log_entries         = [json.loads(e) for e in (results[8] or [])]
 
-            # Rolling PnL for chart
-            ts  = datetime.now(timezone.utc).strftime('%H:%M:%S')
-            pnl = float(self.pnl.get('unrealized', 0)) + float(self.pnl.get('realized', 0))
-            self.pnl_history.append((ts, pnl))
-
-            # Candle buffer for price chart
+            # Last tick price for watched symbol
             if results[9]:
-                candle = json.loads(results[9])
-                key    = f"{self.watch_exchange}:{self.watch_symbol}:{self.watch_interval}"
-                if key not in self.candle_buffer:
-                    self.candle_buffer[key] = deque(maxlen=500)
-                buf = self.candle_buffer[key]
-                if not buf or candle.get('ts') != buf[-1].get('ts'):
-                    buf.append(candle)
+                tick = json.loads(results[9])
+                key  = f"{self.watch_exchange}:{self.watch_symbol}"
+                self.last_prices[key] = float(tick.get('p', 0))
+
+            # PnL history — sample every PNL_CHART_INTERVAL seconds
+            now = datetime.now(IST)
+            if (self._last_pnl_ts is None or
+                    (now - self._last_pnl_ts).total_seconds() >= settings.PNL_CHART_INTERVAL):
+                ts  = now.strftime('%H:%M')
+                pnl = (float(self.pnl.get('unrealized', 0)) +
+                       float(self.pnl.get('realized', 0)))
+                self.pnl_history.append((ts, pnl))
+                self._last_pnl_ts = now
 
         except Exception as e:
             logger.error(f"UIState refresh error: {e}")
 
-    def get_candles(self) -> list[dict]:
-        key = f"{self.watch_exchange}:{self.watch_symbol}:{self.watch_interval}"
-        return list(self.candle_buffer.get(key, []))
+    def get_last_price(self) -> float:
+        return self.last_prices.get(
+            f"{self.watch_exchange}:{self.watch_symbol}", 0.0
+        )
 
-    def clear_candles(self) -> None:
-        key = f"{self.watch_exchange}:{self.watch_symbol}:{self.watch_interval}"
-        self.candle_buffer.pop(key, None)
+    def get_current_balance(self) -> float:
+        return (self.starting_balance +
+                float(self.pnl.get('realized', 0)) +
+                float(self.pnl.get('unrealized', 0)))
