@@ -47,11 +47,9 @@ async def index() -> None:
         <style>
           body { background: #111827; margin: 0; }
           .q-table__container { background: transparent !important; }
-          .q-table thead tr th {
-            background: #1f2937; color: #9ca3af; font-size: 11px;
-          }
-          .q-table tbody tr td { font-size: 11px; color: #d1d5db; }
-          .q-table tbody tr:hover td { background: #1f2937 !important; }
+          .q-table thead tr th { background:#1f2937;color:#9ca3af;font-size:11px; }
+          .q-table tbody tr td { font-size:11px;color:#d1d5db; }
+          .q-table tbody tr:hover td { background:#1f2937 !important; }
         </style>
     """)
 
@@ -68,39 +66,36 @@ async def index() -> None:
     _state.watch_symbol     = shared['symbol']
     _state.starting_balance = shared['balance']
 
-    # ── Layout ────────────────────────────────────────────────────────────────
-
+    # ── Top bar ───────────────────────────────────────────────────────────────
     tb = top_bar.build(_state, _redis, shared)
 
     with ui.element('div').classes('w-full px-3 py-2'):
 
-        # Row 1: Short | Alerts+CloseAll | Long
-        with ui.row().classes('w-full gap-3 mb-3 items-start flex-nowrap'):
+        # ── Row 1: TradingView chart — full width ─────────────────────────────
+        tv = tv_widget.build(_state, shared)
+
+        # ── Row 2: PnL curve — full width, short ──────────────────────────────
+        pnl = pnl_chart.build(_state)
+
+        # ── Row 3: Short | Alerts+CloseAll | Long ─────────────────────────────
+        with ui.row().classes('w-full gap-3 mt-3 mb-3 items-start flex-nowrap'):
             with ui.element('div').classes('flex-1 min-w-0'):
-                trade_ticket.build('short', _state, _redis, shared)
+                short_updater = trade_ticket.build('short', _state, _redis, shared)
             with ui.element('div').style('width:300px; flex-shrink:0;'):
                 ap = alerts_panel.build(_state, _redis, shared)
             with ui.element('div').classes('flex-1 min-w-0'):
-                trade_ticket.build('long', _state, _redis, shared)
+                long_updater = trade_ticket.build('long', _state, _redis, shared)
 
-        # Row 2: TradingView chart | PnL curve
-        with ui.row().classes('w-full gap-3 mb-3 items-start'):
-            with ui.element('div').classes('flex-1 min-w-0'):
-                tv = tv_widget.build(_state, shared)
-            with ui.element('div').style('width:340px; flex-shrink:0;'):
-                pnl = pnl_chart.build(_state)
-
-        # Row 3: Activity log
+        # ── Row 4: Activity log ───────────────────────────────────────────────
         al = activity_log.build(_state)
 
-        # Rows 4-6: Tables
+        # ── Rows 5-7: Tables ──────────────────────────────────────────────────
         with ui.element('div').classes('w-full mt-2 flex flex-col gap-3'):
             pos = positions_table.build(_state, _redis)
             oo  = orders_table.build(_state, _redis)
             oh  = history_table.build(_state)
 
     # ── Timer ─────────────────────────────────────────────────────────────────
-
     updaters = [
         tb['update'],
         ap['update'],
@@ -110,6 +105,8 @@ async def index() -> None:
         pos['update'],
         oo['update'],
         oh['update'],
+        short_updater['update'],
+        long_updater['update'],
     ]
 
     async def refresh() -> None:

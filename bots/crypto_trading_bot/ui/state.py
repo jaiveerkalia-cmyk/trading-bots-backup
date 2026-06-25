@@ -3,6 +3,7 @@ import json
 import logging
 from collections import deque
 from datetime import datetime, timezone
+from typing import Optional
 
 import redis.asyncio as aioredis
 
@@ -16,9 +17,10 @@ class UIState:
     __slots__ = (
         'slots', 'positions', 'open_orders', 'order_history',
         'alerts', 'pnl', 'live_mode', 'connected_exchanges',
-        'log_entries', 'pnl_history', 'last_prices',
+        'log_entries', 'pnl_history', 'last_prices', 'mark_prices',
         'watch_exchange', 'watch_symbol', 'watch_interval',
-        'starting_balance', '_last_pnl_ts', '_redis',
+        'starting_balance', 'pnl_offset',
+        '_last_pnl_ts', '_redis',
     )
 
     def __init__(self, redis_client: aioredis.Redis):
@@ -32,18 +34,19 @@ class UIState:
         self.live_mode:           bool = False
         self.connected_exchanges: list[str] = []
         self.log_entries:         list[dict] = []
-        self.pnl_history: deque[tuple[str, float]] = deque(
-            maxlen=settings.PNL_CHART_POINTS
-        )
-        self.last_prices:     dict[str, float] = {}
-        self.watch_exchange   = 'binance'
-        self.watch_symbol     = 'BTC/USDT'
-        self.watch_interval   = '1m'
+        self.pnl_history: deque[tuple[str, float]] = deque(maxlen=settings.PNL_CHART_POINTS)
+        self.last_prices:   dict[str, float] = {}   # last trade price
+        self.mark_prices:   dict[str, float] = {}   # futures mark price
+        self.watch_exchange  = settings.SUPPORTED_EXCHANGES[0]
+        self.watch_symbol    = 'BTC/USDT'
+        self.watch_interval  = '1m'
         self.starting_balance = 10000.0
+        self.pnl_offset: float = 0.0
         self._last_pnl_ts: datetime | None = None
 
     async def refresh(self) -> None:
         try:
+            key = f"{self.watch_exchange}:{self.watch_symbol}"
             async with self._redis.pipeline(transaction=False) as pipe:
                 pipe.get(redis_keys.SLOTS_KEY)
                 pipe.get(redis_keys.POSITIONS_KEY)
@@ -54,9 +57,8 @@ class UIState:
                 pipe.get(redis_keys.LIVE_MODE_KEY)
                 pipe.get(redis_keys.CONNECTED_EXCHANGES_KEY)
                 pipe.lrange(redis_keys.LOG_KEY, 0, settings.LOG_MAX_ENTRIES - 1)
-                pipe.get(redis_keys.latest_tick_key(
-                    self.watch_exchange, self.watch_symbol
-                ))
+                pipe.get(redis_keys.latest_tick_key(self.watch_exchange, self.watch_symbol))
+                pipe.get(redis_keys.mark_price_key(self.watch_exchange, self.watch_symbol))
                 results = await pipe.execute()
 
             self.slots               = json.loads(results[0]) if results[0] else []
@@ -69,31 +71,68 @@ class UIState:
             self.connected_exchanges = json.loads(results[7]) if results[7] else []
             self.log_entries         = [json.loads(e) for e in (results[8] or [])]
 
-            # Last tick price for watched symbol
+            # Last trade price (chart price)
             if results[9]:
                 tick = json.loads(results[9])
-                key  = f"{self.watch_exchange}:{self.watch_symbol}"
                 self.last_prices[key] = float(tick.get('p', 0))
+                # Also extract mark price from tick JSON if present
+                if 'mp' in tick:
+                    self.mark_prices[key] = float(tick['mp'])
+
+            # Explicit mark price key (futures)
+            if results[10]:
+                self.mark_prices[key] = float(json.loads(results[10]).get('p', 0))
+
+            # If no explicit mark price, fall back to last trade
+            if key not in self.mark_prices:
+                self.mark_prices[key] = self.last_prices.get(key, 0.0)
 
             # PnL history — sample every PNL_CHART_INTERVAL seconds
             now = datetime.now(IST)
             if (self._last_pnl_ts is None or
                     (now - self._last_pnl_ts).total_seconds() >= settings.PNL_CHART_INTERVAL):
-                ts  = now.strftime('%H:%M')
-                pnl = (float(self.pnl.get('unrealized', 0)) +
-                       float(self.pnl.get('realized', 0)))
-                self.pnl_history.append((ts, pnl))
+                u, r = self.get_display_pnl()
+                self.pnl_history.append((now.strftime('%H:%M'), round(r + u, 4)))
                 self._last_pnl_ts = now
 
         except Exception as e:
             logger.error(f"UIState refresh error: {e}")
 
     def get_last_price(self) -> float:
+        """Last trade price — used for chart display reference."""
         return self.last_prices.get(
             f"{self.watch_exchange}:{self.watch_symbol}", 0.0
         )
 
+    def get_mark_price(self) -> float:
+        """
+        Mark price for futures — used for fills/PnL calculations.
+        Same as last trade price for spot.
+        """
+        return self.mark_prices.get(
+            f"{self.watch_exchange}:{self.watch_symbol}",
+            self.get_last_price(),
+        )
+
+    def is_futures(self) -> bool:
+        return 'futures' in self.watch_exchange
+
+    def get_display_pnl(self) -> tuple[float, float]:
+        u = float(self.pnl.get('unrealized', 0))
+        r = float(self.pnl.get('realized',   0)) - self.pnl_offset
+        return u, r
+
     def get_current_balance(self) -> float:
-        return (self.starting_balance +
-                float(self.pnl.get('realized', 0)) +
-                float(self.pnl.get('unrealized', 0)))
+        u, r = self.get_display_pnl()
+        return self.starting_balance + r + u
+
+    def reset_portfolio(self) -> None:
+        self.pnl_offset   = float(self.pnl.get('realized', 0))
+        self._last_pnl_ts = None
+        self.pnl_history.clear()
+
+    def get_slot(self, slot_id: str) -> Optional[dict]:
+        for s in self.slots:
+            if s.get('id') == slot_id:
+                return s
+        return None

@@ -1,7 +1,3 @@
-"""
-Publishes engine state to Redis every ENGINE_STATE_PUBLISH_INTERVAL seconds.
-UI is a pure reader of these keys — this is the only engine↔UI interface.
-"""
 from __future__ import annotations
 import asyncio
 import json
@@ -12,7 +8,6 @@ from typing import TYPE_CHECKING
 
 import redis.asyncio as aioredis
 
-from common.models import LogEntry, PnLSummary
 from common import redis_keys, settings
 
 if TYPE_CHECKING:
@@ -27,7 +22,6 @@ class StatePublisher:
     def __init__(self, redis_client: aioredis.Redis, slot_manager: 'SlotManager'):
         self._redis     = redis_client
         self._slots     = slot_manager
-        # Pending log entries buffered until next publish cycle — bounded deque
         self._log: deque[dict] = deque(maxlen=settings.LOG_MAX_ENTRIES)
         self._live_mode = False
         self._task: asyncio.Task | None = None
@@ -43,14 +37,8 @@ class StatePublisher:
     def set_live_mode(self, live: bool) -> None:
         self._live_mode = live
 
-    def log(
-        self,
-        message:  str,
-        level:    str = 'info',
-        exchange: str | None = None,
-        symbol:   str | None = None,
-    ) -> None:
-        """Buffer a log entry for the next publish cycle."""
+    def log(self, message: str, level: str = 'info',
+            exchange: str | None = None, symbol: str | None = None) -> None:
         self._log.append({
             'ts':  datetime.now(timezone.utc).isoformat(),
             'lvl': level,
@@ -73,13 +61,14 @@ class StatePublisher:
         slots     = self._slots.get_all_slots()
         positions = self._slots.get_all_positions()
         open_ord  = self._slots.get_open_orders()
+        # get_order_history() returns newest-first — take first 200 (newest)
         history   = self._slots.get_order_history()
         alerts    = self._slots.get_alerts()
 
         unrealized = sum(p.unrealized_pnl for p in positions)
         realized   = sum(s.realized_pnl   for s in slots)
 
-        sep = (',', ':')  # compact separators throughout
+        sep = (',', ':')
 
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.set(redis_keys.SLOTS_KEY,
@@ -88,22 +77,20 @@ class StatePublisher:
                      json.dumps([p.model_dump(mode='json') for p in positions], separators=sep))
             pipe.set(redis_keys.OPEN_ORDERS_KEY,
                      json.dumps([o.model_dump(mode='json') for o in open_ord[:100]], separators=sep))
-            # Order history capped at 200 in Redis — full history lives in CSV
+            # [:200] — first 200 of newest-first list = 200 most recent orders
             pipe.set(redis_keys.ORDER_HISTORY_KEY,
-                     json.dumps([o.model_dump(mode='json') for o in history[-200:]], separators=sep))
+                     json.dumps([o.model_dump(mode='json') for o in history[:200]], separators=sep))
             pipe.set(redis_keys.ALERTS_KEY,
                      json.dumps([a.model_dump(mode='json') for a in alerts], separators=sep))
             pipe.set(redis_keys.PNL_KEY,
                      json.dumps({'unrealized': unrealized, 'realized': realized}, separators=sep))
             pipe.set(redis_keys.LIVE_MODE_KEY, '1' if self._live_mode else '0')
 
-            # Flush buffered log entries into Redis LIST, then trim
             if self._log:
                 entries = list(self._log)
                 self._log.clear()
                 for entry in entries:
-                    pipe.lpush(redis_keys.LOG_KEY,
-                               json.dumps(entry, separators=sep))
+                    pipe.lpush(redis_keys.LOG_KEY, json.dumps(entry, separators=sep))
                 pipe.ltrim(redis_keys.LOG_KEY, 0, settings.LOG_MAX_ENTRIES - 1)
 
             await pipe.execute()

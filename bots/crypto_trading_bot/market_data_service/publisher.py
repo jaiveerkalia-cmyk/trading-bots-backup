@@ -1,8 +1,3 @@
-"""
-RedisPublisher — single async queue draining to Redis.
-One consumer task, bounded queue (drops oldest on overflow), pipeline per write.
-Objects are serialised inline and immediately discarded after publish.
-"""
 from __future__ import annotations
 import asyncio
 import json
@@ -43,10 +38,6 @@ class RedisPublisher:
                 pass
 
     async def publish(self, data: MarketData) -> None:
-        """
-        Non-blocking enqueue. If queue is full, drop oldest item
-        rather than blocking the WS receive loop.
-        """
         if self._queue.full():
             try:
                 self._queue.get_nowait()
@@ -70,7 +61,6 @@ class RedisPublisher:
                 logger.error(f"Publisher drain error: {e}")
 
     async def _push(self, data: MarketData) -> None:
-        """Serialise once, write to pub/sub channel + latest-value key in one pipeline."""
         try:
             if isinstance(data, Tick):
                 payload = _tick_json(data)
@@ -78,45 +68,60 @@ class RedisPublisher:
                 key     = redis_keys.latest_tick_key(data.exchange, data.symbol)
                 ttl     = settings.TICK_TTL
 
+                async with self._redis.pipeline(transaction=False) as pipe:
+                    pipe.publish(channel, payload)
+                    pipe.set(key, payload, ex=ttl)
+                    # Publish mark price separately for futures — used for fills/PnL
+                    if data.mark_price is not None:
+                        mp = json.dumps(
+                            {'p': data.mark_price, 'ts': _ts(data.timestamp)},
+                            separators=(',', ':'),
+                        )
+                        pipe.set(
+                            redis_keys.mark_price_key(data.exchange, data.symbol),
+                            mp, ex=ttl,
+                        )
+                    await pipe.execute()
+                del payload
+
             elif isinstance(data, Candle):
                 payload = _candle_json(data)
                 channel = redis_keys.candle_channel(data.exchange, data.symbol, data.interval)
                 key     = redis_keys.latest_candle_key(data.exchange, data.symbol, data.interval)
                 ttl     = settings.CANDLE_TTL
+                async with self._redis.pipeline(transaction=False) as pipe:
+                    pipe.publish(channel, payload)
+                    pipe.set(key, payload, ex=ttl)
+                    await pipe.execute()
+                del payload
 
             elif isinstance(data, OrderBook):
                 payload = _book_json(data)
                 channel = redis_keys.depth_channel(data.exchange, data.symbol)
                 key     = redis_keys.latest_depth_key(data.exchange, data.symbol)
                 ttl     = settings.DEPTH_TTL
-            else:
-                return
-
-            async with self._redis.pipeline(transaction=False) as pipe:
-                pipe.publish(channel, payload)
-                pipe.set(key, payload, ex=ttl)
-                await pipe.execute()
-
-            del payload
+                async with self._redis.pipeline(transaction=False) as pipe:
+                    pipe.publish(channel, payload)
+                    pipe.set(key, payload, ex=ttl)
+                    await pipe.execute()
+                del payload
 
         except Exception as e:
             logger.error(f"Redis push error: {e}")
 
-
-# ── Compact JSON serialisers ───────────────────────────────────────────────────
-# json.dumps with separators=(',',':') gives minimal output.
-# No intermediate dict kept alive — built and serialised in one expression.
 
 def _ts(dt: datetime) -> str:
     return dt.isoformat()
 
 
 def _tick_json(t: Tick) -> str:
-    return json.dumps(
-        {'e': t.exchange, 's': t.symbol,
-         'p': t.price,    'v': t.volume, 'ts': _ts(t.timestamp)},
-        separators=(',', ':'),
-    )
+    d: dict = {
+        'e': t.exchange, 's': t.symbol,
+        'p': t.price,    'v': t.volume, 'ts': _ts(t.timestamp),
+    }
+    if t.mark_price   is not None: d['mp'] = t.mark_price
+    if t.funding_rate is not None: d['fr'] = t.funding_rate
+    return json.dumps(d, separators=(',', ':'))
 
 
 def _candle_json(c: Candle) -> str:
@@ -131,8 +136,8 @@ def _candle_json(c: Candle) -> str:
 def _book_json(b: OrderBook) -> str:
     return json.dumps(
         {'e': b.exchange, 's': b.symbol,
-         'bids': [[lvl.price, lvl.qty] for lvl in b.bids],
-         'asks': [[lvl.price, lvl.qty] for lvl in b.asks],
+         'bids': [[lv.price, lv.qty] for lv in b.bids],
+         'asks': [[lv.price, lv.qty] for lv in b.asks],
          'ts': _ts(b.timestamp)},
         separators=(',', ':'),
     )

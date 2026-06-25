@@ -13,29 +13,31 @@ from common import redis_keys, settings
 logger = logging.getLogger('paper_engine')
 
 
+def _fee_rate(exchange: str, order_type: str) -> float:
+    fees = settings.EXCHANGE_FEES.get(exchange, {'maker': 0.001, 'taker': 0.001})
+    return fees['maker'] if order_type == 'limit' else fees['taker']
+
+
+def _is_futures(exchange: str) -> bool:
+    return 'futures' in exchange
+
+
 class PaperEngine:
     __slots__ = ('_redis', '_positions', '_pending_limits', '_lock')
 
     def __init__(self, redis_client: aioredis.Redis):
         self._redis          = redis_client
         self._positions:      dict[str, Position] = {}
-        self._pending_limits: list[dict]          = []   # working limit orders
+        self._pending_limits: list[dict]          = []
         self._lock           = asyncio.Lock()
 
     async def fill_order(self, order: Order) -> Order:
-        """
-        Market: fill immediately at VWAP.
-        Limit/stop-limit: fill immediately if already through, else return working.
-        """
         if order.order_type == 'market':
-            price = await self._fill_price(order)
+            price = await self._market_fill_price(order)
             return self._do_fill(order, price)
-
-        current = await self._last_tick(order.exchange, order.symbol)
+        current = await self._reference_price(order.exchange, order.symbol)
         if self._is_fillable(order, current):
             return self._do_fill(order, order.price or current)
-
-        # Add to pending queue — paper_fill_checker watches these
         order.exchange_order_id = f"PAPER-{order.id[:8]}"
         order.status            = 'working'
         order.updated_at        = datetime.now(timezone.utc)
@@ -45,8 +47,7 @@ class PaperEngine:
                 'exchange': order.exchange,
                 'symbol':   order.symbol,
             })
-        logger.info(f"[PAPER] Limit working: {order.side} {order.qty} "
-                    f"{order.symbol} @ {order.price}")
+        logger.info(f"[PAPER] Limit working: {order.side} {order.qty} {order.symbol} @ {order.price}")
         return order
 
     def _is_fillable(self, order: Order, price: float) -> bool:
@@ -70,18 +71,50 @@ class PaperEngine:
         order.filled_qty        = order.qty
         order.avg_fill_price    = round(price, 8)
         order.updated_at        = datetime.now(timezone.utc)
-        logger.info(f"[PAPER] FILLED {order.side.upper()} {order.qty} "
-                    f"{order.symbol} @ {price:.6f}")
+        logger.info(f"[PAPER] FILLED {order.side.upper()} {order.qty} {order.symbol} @ {price:.6f}")
         return order
 
-    async def check_pending_fills(
-        self, exchange: str, symbol: str, price: float
-    ) -> list[Order]:
-        """Called by paper_fill_checker — returns newly filled orders."""
+    async def _market_fill_price(self, order: Order) -> float:
+        """
+        Futures market orders fill at mark price.
+        Spot market orders fill at VWAP through order book.
+        """
+        if _is_futures(order.exchange):
+            try:
+                raw = await self._redis.get(
+                    redis_keys.mark_price_key(order.exchange, order.symbol)
+                )
+                if raw:
+                    return float(json.loads(raw).get('p', 0))
+            except Exception:
+                pass
+        # Spot: VWAP
+        book = await self._fetch_book(order.exchange, order.symbol)
+        if book:
+            levels = (
+                [(l.price, l.qty) for l in book.asks] if order.side == 'buy'
+                else [(l.price, l.qty) for l in book.bids]
+            )
+            tq = tv = 0.0
+            for p, q in levels:
+                take = min(q, order.qty - tq)
+                tq  += take
+                tv  += p * take
+                if tq >= order.qty * 0.99:
+                    break
+            if tq > 0:
+                return round(tv / tq, 8)
+        return await self._last_tick(order.exchange, order.symbol)
+
+    async def _reference_price(self, exchange: str, symbol: str) -> float:
+        """Price used to check if limit orders are immediately fillable."""
+        return await self._last_tick(exchange, symbol)
+
+    async def check_pending_fills(self, exchange: str, symbol: str, price: float) -> list[Order]:
         if not self._pending_limits:
             return []
-        filled:    list[Order] = []
-        remaining: list[dict]  = []
+        filled: list[Order] = []
+        remaining: list[dict] = []
         async with self._lock:
             for item in self._pending_limits:
                 if item['exchange'] != exchange or item['symbol'] != symbol:
@@ -103,24 +136,18 @@ class PaperEngine:
         ]
         return len(self._pending_limits) < before
 
-    async def _fill_price(self, order: Order) -> float:
-        book = await self._fetch_book(order.exchange, order.symbol)
-        if book:
-            levels = (
-                [(l.price, l.qty) for l in book.asks]
-                if order.side == 'buy'
-                else [(l.price, l.qty) for l in book.bids]
-            )
-            total_qty = total_val = 0.0
-            for price, qty in levels:
-                take       = min(qty, order.qty - total_qty)
-                total_qty += take
-                total_val += price * take
-                if total_qty >= order.qty * 0.99:
-                    break
-            if total_qty > 0:
-                return round(total_val / total_qty, 8)
-        return await self._last_tick(order.exchange, order.symbol)
+    async def modify_pending(self, order_id: str, new_price: float, new_qty: float) -> bool:
+        """Modify a working paper limit order."""
+        async with self._lock:
+            for item in self._pending_limits:
+                if item['order'].id == order_id:
+                    o = item['order']
+                    if new_price > 0: o.price = new_price
+                    if new_qty   > 0: o.qty   = new_qty
+                    o.updated_at = datetime.now(timezone.utc)
+                    logger.info(f"[PAPER] Modified: {o.symbol} @ {o.price}")
+                    return True
+        return False
 
     async def _fetch_book(self, exchange: str, symbol: str) -> Optional[OrderBook]:
         try:
@@ -148,15 +175,14 @@ class PaperEngine:
         return 0.0
 
     async def open_position(self, slot_id: str, order: Order, side: str) -> Position:
-        fee_rate   = settings.EXCHANGE_FEES.get(order.exchange, 0.001)
-        entry_fee  = (order.avg_fill_price or 0) * order.filled_qty * fee_rate
+        rate      = _fee_rate(order.exchange, order.order_type)
+        entry_fee = (order.avg_fill_price or 0) * order.filled_qty * rate
         pos = Position(
-            exchange=order.exchange, symbol=order.symbol,
-            side=side,
+            exchange=order.exchange, symbol=order.symbol, side=side,
             entry_price=order.avg_fill_price or 0.0,
             current_price=order.avg_fill_price or 0.0,
             qty=order.filled_qty,
-            unrealized_pnl=-entry_fee,   # start with entry fee already deducted
+            unrealized_pnl=-entry_fee,
             is_paper=True, slot_id=slot_id,
         )
         async with self._lock:
@@ -170,19 +196,21 @@ class PaperEngine:
     def get_position(self, slot_id: str) -> Optional[Position]:
         return self._positions.get(slot_id)
 
-    async def update_mark_prices(
-        self, exchange: str, symbol: str, price: float
-    ) -> None:
-        fee_rate = settings.EXCHANGE_FEES.get(exchange, 0.001)
+    async def update_mark_prices(self, exchange: str, symbol: str, price: float) -> None:
+        """
+        For futures: price = mark price (from trigger_engine._price which uses mark_price_key).
+        For spot:    price = last trade price.
+        """
+        taker_fee = settings.EXCHANGE_FEES.get(exchange, {'taker': 0.001})['taker']
         async with self._lock:
             for pos in self._positions.values():
                 if pos.exchange == exchange and pos.symbol == symbol:
-                    pos.current_price  = price
-                    entry_fee          = pos.entry_price * pos.qty * fee_rate
-                    exit_fee           = price           * pos.qty * fee_rate
-                    gross              = (
-                        (price - pos.entry_price) * pos.qty
-                        if pos.side == 'long'
+                    pos.current_price   = price
+                    entry_fee_rate      = _fee_rate(exchange, 'limit')
+                    entry_fee           = pos.entry_price * pos.qty * entry_fee_rate
+                    exit_fee            = price           * pos.qty * taker_fee
+                    gross               = (
+                        (price - pos.entry_price) * pos.qty if pos.side == 'long'
                         else (pos.entry_price - price) * pos.qty
                     )
-                    pos.unrealized_pnl = round(gross - entry_fee - exit_fee, 4)
+                    pos.unrealized_pnl  = round(gross - entry_fee - exit_fee, 4)

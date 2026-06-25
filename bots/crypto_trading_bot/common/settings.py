@@ -40,10 +40,17 @@ DEFAULT_ORDERBOOK_DEPTH = 20
 MARKET_DATA_QUEUE_SIZE = 100
 COMMAND_QUEUE_SIZE     = 50
 
-PNL_CHART_POINTS   = 1440   # 24h of 1-min samples
-PNL_CHART_INTERVAL = 60     # sample every 60 seconds
+PNL_CHART_POINTS   = 1440
+PNL_CHART_INTERVAL = 60
 
-SUPPORTED_EXCHANGES = ['binance', 'delta']
+# binance_futures uses the same Binance API key as binance
+SUPPORTED_EXCHANGES = ['binance', 'binance_futures', 'delta']
+
+EXCHANGE_FEES = {
+    'binance':         {'maker': 0.001,  'taker': 0.001},   # spot: 0.1%/0.1%
+    'binance_futures': {'maker': 0.0002, 'taker': 0.0004},  # USDT perp: 0.02%/0.04%
+    'delta':           {'maker': 0.0002, 'taker': 0.0005},
+}
 
 ENGINE_STATE_PUBLISH_INTERVAL = 1.0
 UI_REFRESH_INTERVAL           = 1.0
@@ -52,10 +59,7 @@ WS_MAX_RECONNECT_ATTEMPTS     = 0
 
 LOG_MAX_ENTRIES = 200
 
-# Exchange fees — taker rate (conservative, used for all orders)
-EXCHANGE_FEES = {
-    'binance': 0.001,   # 0.1%
-    'delta':   0.0005,  # 0.05%
-}
+PNL_CHART_POINTS   = 1440
+PNL_CHART_INTERVAL = 60
 
 ALERT_SOUND_DURATION_DEFAULT = 5

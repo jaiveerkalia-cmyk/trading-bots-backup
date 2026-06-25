@@ -1,8 +1,3 @@
-"""
-Software trigger/exit engine.
-Polls Redis tick prices every ENGINE_STATE_PUBLISH_INTERVAL seconds.
-Used as fallback for conditions the exchange doesn't handle natively.
-"""
 from __future__ import annotations
 import asyncio
 import json
@@ -58,24 +53,22 @@ class TriggerEngine:
             await asyncio.sleep(settings.ENGINE_STATE_PUBLISH_INTERVAL)
 
     async def _check_all(self) -> None:
-        # Track updated symbols to avoid redundant mark price updates
         updated: set[str] = set()
 
         for slot in self._slots.get_active_slots():
             if not slot.position:
                 continue
 
+            # Use mark price for futures, last tick price for spot
             price = await self._price(slot.exchange, slot.symbol)
             if price <= 0:
                 continue
 
-            # Update paper position mark price + unrealized PnL
             sym_key = f"{slot.exchange}:{slot.symbol}"
             if slot.position.is_paper and sym_key not in updated:
                 await self._paper.update_mark_prices(slot.exchange, slot.symbol, price)
                 updated.add(sym_key)
 
-            # Stop
             if slot.stop_price:
                 hit = (
                     (slot.side == 'long'  and price <= slot.stop_price) or
@@ -86,7 +79,6 @@ class TriggerEngine:
                     await self._on_exit(slot.id, 'stop_hit')
                     continue
 
-            # Target
             if slot.target_price:
                 hit = (
                     (slot.side == 'long'  and price >= slot.target_price) or
@@ -96,11 +88,11 @@ class TriggerEngine:
                     logger.info(f"Target hit [{slot.symbol}] price={price} target={slot.target_price}")
                     await self._on_exit(slot.id, 'target_hit')
 
-        # Alerts
         for alert in self._slots.get_alerts():
             if alert.triggered:
                 continue
-            price = await self._price(alert.exchange, alert.symbol)
+            # Alerts checked against LTP (tick price), not mark price
+            price = await self._ltp(alert.exchange, alert.symbol)
             if price <= 0:
                 continue
             triggered = (
@@ -113,6 +105,22 @@ class TriggerEngine:
                 await self._on_alert(alert)
 
     async def _price(self, exchange: str, symbol: str) -> float:
+        """
+        For futures exchanges: returns mark price (used for stop/target checks and PnL).
+        For spot exchanges: returns last trade price.
+        """
+        try:
+            if 'futures' in exchange:
+                raw = await self._redis.get(redis_keys.mark_price_key(exchange, symbol))
+                if raw:
+                    return float(json.loads(raw).get('p', 0))
+            raw = await self._redis.get(redis_keys.latest_tick_key(exchange, symbol))
+            return float(json.loads(raw).get('p', 0)) if raw else 0.0
+        except Exception:
+            return 0.0
+
+    async def _ltp(self, exchange: str, symbol: str) -> float:
+        """Last trade price — used for alerts."""
         try:
             raw = await self._redis.get(redis_keys.latest_tick_key(exchange, symbol))
             return float(json.loads(raw).get('p', 0)) if raw else 0.0

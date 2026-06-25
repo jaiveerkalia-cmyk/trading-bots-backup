@@ -63,9 +63,7 @@ class SlotManager:
             self._slots[slot.id] = slot
         await self._persist()
 
-    async def close_slot(
-        self, slot_id: str, realized_pnl: float = 0.0
-    ) -> Optional[TradeSlot]:
+    async def close_slot(self, slot_id: str, realized_pnl: float = 0.0) -> Optional[TradeSlot]:
         async with self._lock:
             slot = self._slots.get(slot_id)
             if not slot:
@@ -78,10 +76,10 @@ class SlotManager:
             for o in slot.orders:
                 if o.status in ('filled', 'cancelled', 'rejected') and o.id not in seen:
                     self._history.append(o)
-            if len(self._history) > 500:
-                self._history = self._history[-500:]
+            if len(self._history) > 1000:
+                self._history = self._history[-1000:]
         await self._persist()
-        logger.info(f"Slot closed: {slot_id[:8]} pnl={realized_pnl:.2f}")
+        logger.info(f"Slot closed: {slot_id[:8]} pnl={realized_pnl:.4f}")
         return slot
 
     def get_slot(self, slot_id: str) -> Optional[TradeSlot]:
@@ -92,12 +90,10 @@ class SlotManager:
     def get_all_positions(self) -> list[Position]:  return [s.position for s in self._slots.values() if s.position]
 
     def get_order_history(self) -> list[Order]:
-        """
-        Returns filled/cancelled orders from both closed slots (self._history)
-        AND currently active slots — so history is complete while trades are open.
-        """
+        """Returns all filled/cancelled orders, newest first."""
         history = list(self._history)
         seen    = {o.id for o in history}
+        # Include filled orders from ALL slots (active + closed)
         for slot in self._slots.values():
             for o in slot.orders:
                 if o.status in ('filled', 'cancelled', 'rejected') and o.id not in seen:
@@ -106,14 +102,39 @@ class SlotManager:
         return sorted(history, key=lambda o: o.created_at, reverse=True)
 
     def get_open_orders(self) -> list[Order]:
-        return [
+        """Returns working orders + virtual stop/target orders for active paper slots."""
+        orders = [
             o for s in self._slots.values()
             for o in s.orders
             if o.status in ('pending', 'working')
         ]
+        # Add virtual trigger orders for active paper slots so they're visible in UI
+        for slot in self.get_active_slots():
+            if not slot.position or not slot.is_paper:
+                continue
+            close_side = 'sell' if slot.side == 'long' else 'buy'
+            if slot.stop_price and not slot.sl_order_id:
+                orders.append(Order(
+                    id=f"VSTOP-{slot.id[:8]}",
+                    exchange=slot.exchange, symbol=slot.symbol,
+                    side=close_side, order_type='stop_limit',
+                    stop_price=slot.stop_price, price=slot.stop_price,
+                    qty=slot.position.qty,
+                    status='working', is_paper=True, slot_id=slot.id,
+                ))
+            if slot.target_price and not slot.target_order_id:
+                orders.append(Order(
+                    id=f"VTGT-{slot.id[:8]}",
+                    exchange=slot.exchange, symbol=slot.symbol,
+                    side=close_side, order_type='limit',
+                    price=slot.target_price,
+                    qty=slot.position.qty,
+                    status='working', is_paper=True, slot_id=slot.id,
+                ))
+        return orders
 
     def add_alert(self, alert: Alert)     -> None: self._alerts.append(alert)
-    def delete_alert(self, alert_id: str) -> None: self._alerts = [a for a in self._alerts if a.id != alert_id]
+    def delete_alert(self, aid: str)      -> None: self._alerts = [a for a in self._alerts if a.id != aid]
     def get_alerts(self)                  -> list[Alert]: return self._alerts
     def clear_triggered_alerts(self)      -> None: self._alerts = [a for a in self._alerts if not a.triggered]
 
