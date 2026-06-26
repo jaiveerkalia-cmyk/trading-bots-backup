@@ -29,6 +29,8 @@ async def startup() -> None:
         decode_responses=True, max_connections=5,
     )
     _state = UIState(_redis)
+    # Restore persisted portfolio settings (balance + PnL offset)
+    await _state.load_portfolio()
 
 
 @app.on_shutdown
@@ -55,58 +57,42 @@ async def index() -> None:
 
     ui.dark_mode(True)
 
+    # Use persisted balance; default exchange = first in SUPPORTED_EXCHANGES
     shared: dict = {
-        'exchange': settings.SUPPORTED_EXCHANGES[0],
+        'exchange': settings.SUPPORTED_EXCHANGES[0],   # binance_futures
         'symbol':   'BTC/USDT',
         'risk_pct': settings.DEFAULT_RISK_PCT,
-        'balance':  10000.0,
+        'balance':  _state.starting_balance,            # restored from Redis
     }
 
-    _state.watch_exchange   = shared['exchange']
-    _state.watch_symbol     = shared['symbol']
-    _state.starting_balance = shared['balance']
+    _state.watch_exchange = shared['exchange']
+    _state.watch_symbol   = shared['symbol']
 
-    # ── Top bar ───────────────────────────────────────────────────────────────
     tb = top_bar.build(_state, _redis, shared)
 
     with ui.element('div').classes('w-full px-3 py-2'):
-
-        # ── Row 1: TradingView chart — full width ─────────────────────────────
-        tv = tv_widget.build(_state, shared)
-
-        # ── Row 2: PnL curve — full width, short ──────────────────────────────
+        tv  = tv_widget.build(_state, shared)
         pnl = pnl_chart.build(_state)
 
-        # ── Row 3: Short | Alerts+CloseAll | Long ─────────────────────────────
         with ui.row().classes('w-full gap-3 mt-3 mb-3 items-start flex-nowrap'):
             with ui.element('div').classes('flex-1 min-w-0'):
-                short_updater = trade_ticket.build('short', _state, _redis, shared)
+                short_upd = trade_ticket.build('short', _state, _redis, shared)
             with ui.element('div').style('width:300px; flex-shrink:0;'):
                 ap = alerts_panel.build(_state, _redis, shared)
             with ui.element('div').classes('flex-1 min-w-0'):
-                long_updater = trade_ticket.build('long', _state, _redis, shared)
+                long_upd = trade_ticket.build('long', _state, _redis, shared)
 
-        # ── Row 4: Activity log ───────────────────────────────────────────────
-        al = activity_log.build(_state)
+        al  = activity_log.build(_state)
 
-        # ── Rows 5-7: Tables ──────────────────────────────────────────────────
         with ui.element('div').classes('w-full mt-2 flex flex-col gap-3'):
             pos = positions_table.build(_state, _redis)
             oo  = orders_table.build(_state, _redis)
             oh  = history_table.build(_state)
 
-    # ── Timer ─────────────────────────────────────────────────────────────────
     updaters = [
-        tb['update'],
-        ap['update'],
-        tv['update'],
-        pnl['update'],
-        al['update'],
-        pos['update'],
-        oo['update'],
-        oh['update'],
-        short_updater['update'],
-        long_updater['update'],
+        tb['update'], ap['update'], tv['update'], pnl['update'],
+        al['update'], pos['update'], oo['update'], oh['update'],
+        short_upd['update'], long_upd['update'],
     ]
 
     async def refresh() -> None:

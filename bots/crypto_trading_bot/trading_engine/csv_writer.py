@@ -1,91 +1,150 @@
 """
-Single-writer async CSV queue.
-All components call enqueue_trade() / enqueue_pnl().
-One drain task serialises all writes — no concurrent file access.
+Unified portfolio CSV writer.
+
+One file per day:  <PORTFOLIO_DIR>/portfolio_YYYY-MM-DD.csv
+
+All trade opens, closes, partial closes and PnL snapshots go here.
+enqueue_trade() and enqueue_pnl() are kept for backward compatibility.
 """
 from __future__ import annotations
+
 import asyncio
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from common import settings
 
 logger = logging.getLogger('csv_writer')
 
-TRADE_COLS = [
-    'timestamp', 'exchange', 'symbol', 'side', 'order_type',
-    'qty', 'entry_price', 'exit_price', 'pnl', 'is_paper', 'slot_id',
+PORTFOLIO_COLS: list[str] = [
+    'timestamp',
+    'event_type',       # open | close | partial_close | snapshot
+    'exchange',
+    'symbol',
+    'side',
+    'order_type',
+    'qty',
+    'entry_price',
+    'exit_price',
+    'trade_pnl',
+    'realized_pnl',     # cumulative session realized PnL
+    'portfolio_value',  # starting_balance + realized  (caller fills if known)
+    'is_paper',
+    'slot_id',
+    'notes',
 ]
-PNL_COLS = ['date', 'realized_pnl', 'trade_count']
 
-_Kind = Literal['trade', 'pnl']
+_Kind = Literal['open', 'close', 'partial_close', 'snapshot']
 
 
 class CSVWriter:
     __slots__ = ('_queue', '_task')
 
-    def __init__(self):
-        self._queue: asyncio.Queue[tuple[_Kind, dict]] = asyncio.Queue(maxsize=500)
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=500)
         self._task:  asyncio.Task | None = None
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
     async def start(self) -> None:
-        self._ensure_headers()
+        self._ensure_header()
         self._task = asyncio.create_task(self._drain())
-        logger.info("CSVWriter started")
+        logger.info("CSVWriter started → %s", self._today_path())
 
     async def stop(self) -> None:
         if self._task:
-            await self._queue.join()   # flush remaining before exit
+            await self._queue.join()
             self._task.cancel()
 
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    async def enqueue_event(self, row: dict) -> None:
+        """Enqueue a fully-formed portfolio row (keys = PORTFOLIO_COLS)."""
+        await self._put(row)
+
     async def enqueue_trade(self, row: dict) -> None:
-        await self._put('trade', row)
+        """Backward-compatible shim — maps old trade dict to unified schema."""
+        mapped: dict = {
+            'timestamp':       row.get('timestamp', self._now()),
+            'event_type':      'close' if row.get('exit_price') else 'open',
+            'exchange':        row.get('exchange',    ''),
+            'symbol':          row.get('symbol',      ''),
+            'side':            row.get('side',        ''),
+            'order_type':      row.get('order_type',  ''),
+            'qty':             row.get('qty',         ''),
+            'entry_price':     row.get('entry_price', ''),
+            'exit_price':      row.get('exit_price',  ''),
+            'trade_pnl':       row.get('pnl', row.get('trade_pnl', '')),
+            'realized_pnl':    row.get('realized_pnl',    ''),
+            'portfolio_value': row.get('portfolio_value', ''),
+            'is_paper':        row.get('is_paper',        ''),
+            'slot_id':         row.get('slot_id',         ''),
+            'notes':           row.get('notes',           ''),
+        }
+        await self._put(mapped)
 
     async def enqueue_pnl(self, row: dict) -> None:
-        await self._put('pnl', row)
+        """Backward-compatible shim — maps old PnL summary to snapshot row."""
+        mapped: dict = {
+            'timestamp':       row.get('date', self._now()),
+            'event_type':      'snapshot',
+            'exchange':        '',
+            'symbol':          '',
+            'side':            '',
+            'order_type':      '',
+            'qty':             '',
+            'entry_price':     '',
+            'exit_price':      '',
+            'trade_pnl':       '',
+            'realized_pnl':    row.get('realized_pnl',    ''),
+            'portfolio_value': row.get('portfolio_value', ''),
+            'is_paper':        '',
+            'slot_id':         '',
+            'notes':           f"trade_count={row.get('trade_count', '')}",
+        }
+        await self._put(mapped)
 
-    async def _put(self, kind: _Kind, row: dict) -> None:
+    # ── Internals ──────────────────────────────────────────────────────────────
+
+    async def _put(self, row: dict) -> None:
         try:
-            self._queue.put_nowait((kind, row))
+            self._queue.put_nowait(row)
         except asyncio.QueueFull:
-            logger.warning(f"CSVWriter queue full — dropping {kind} row")
+            logger.warning("CSVWriter queue full — row dropped")
 
     async def _drain(self) -> None:
         while True:
             try:
-                kind, row = await self._queue.get()
-                self._write(kind, row)
+                row = await self._queue.get()
+                self._write(row)
                 self._queue.task_done()
-                del row
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"CSV write error: {e}")
+            except Exception as exc:
+                logger.error("CSV write error: %s", exc)
 
-    def _write(self, kind: _Kind, row: dict) -> None:
-        today = datetime.utcnow().strftime('%Y-%m-%d')
-        if kind == 'trade':
-            path = settings.TRADES_DIR   / f"trades_{today}.csv"
-            cols = TRADE_COLS
-        else:
-            path = settings.DAILY_PNL_DIR / f"pnl_{today}.csv"
-            cols = PNL_COLS
+    def _write(self, row: dict) -> None:
+        path     = self._today_path()
         new_file = not path.exists() or path.stat().st_size == 0
-        with path.open('a', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+        with path.open('a', newline='') as fh:
+            w = csv.DictWriter(fh, fieldnames=PORTFOLIO_COLS, extrasaction='ignore')
             if new_file:
                 w.writeheader()
-            w.writerow(row)
+            w.writerow({col: row.get(col, '') for col in PORTFOLIO_COLS})
 
-    def _ensure_headers(self) -> None:
-        today = datetime.utcnow().strftime('%Y-%m-%d')
-        for name, cols in (
-            (f"trades_{today}.csv", TRADE_COLS),
-            (f"pnl_{today}.csv",    PNL_COLS),
-        ):
-            path = settings.TRADES_DIR / name if 'trade' in name else settings.DAILY_PNL_DIR / name
-            if not path.exists():
-                with path.open('w', newline='') as f:
-                    csv.DictWriter(f, fieldnames=cols).writeheader()
+    def _ensure_header(self) -> None:
+        path = self._today_path()
+        if not path.exists():
+            with path.open('w', newline='') as fh:
+                csv.DictWriter(fh, fieldnames=PORTFOLIO_COLS).writeheader()
+
+    @staticmethod
+    def _today_path():
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        return settings.PORTFOLIO_DIR / f"portfolio_{today}.csv"
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()

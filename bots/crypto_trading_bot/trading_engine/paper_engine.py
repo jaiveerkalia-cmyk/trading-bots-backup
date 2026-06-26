@@ -19,7 +19,7 @@ def _fee_rate(exchange: str, order_type: str) -> float:
 
 
 def _is_futures(exchange: str) -> bool:
-    return 'futures' in exchange
+    return 'futures' in exchange or exchange == 'delta'
 
 
 class PaperEngine:
@@ -38,6 +38,7 @@ class PaperEngine:
         current = await self._reference_price(order.exchange, order.symbol)
         if self._is_fillable(order, current):
             return self._do_fill(order, order.price or current)
+        # Working limit order
         order.exchange_order_id = f"PAPER-{order.id[:8]}"
         order.status            = 'working'
         order.updated_at        = datetime.now(timezone.utc)
@@ -47,8 +48,65 @@ class PaperEngine:
                 'exchange': order.exchange,
                 'symbol':   order.symbol,
             })
-        logger.info(f"[PAPER] Limit working: {order.side} {order.qty} {order.symbol} @ {order.price}")
+        logger.info(
+            f"[PAPER] Limit working: {order.side} {order.qty} "
+            f"{order.symbol} @ {order.price}"
+        )
         return order
+
+    async def _market_fill_price(self, order: Order) -> float:
+        """
+        Futures: mark price.
+        Spot: VWAP through order book.
+        Falls back to reference_price supplied by UI if no live data yet.
+        """
+        if _is_futures(order.exchange):
+            try:
+                raw = await self._redis.get(
+                    redis_keys.mark_price_key(order.exchange, order.symbol)
+                )
+                if raw:
+                    p = float(json.loads(raw).get('p', 0))
+                    if p > 0:
+                        return p
+            except Exception:
+                pass
+
+        # Spot VWAP
+        book = await self._fetch_book(order.exchange, order.symbol)
+        if book:
+            levels = (
+                [(l.price, l.qty) for l in book.asks] if order.side == 'buy'
+                else [(l.price, l.qty) for l in book.bids]
+            )
+            tq = tv = 0.0
+            for p, q in levels:
+                take = min(q, order.qty - tq)
+                tq  += take
+                tv  += p * take
+                if tq >= order.qty * 0.99:
+                    break
+            if tq > 0:
+                return round(tv / tq, 8)
+
+        # Last trade price
+        p = await self._last_tick(order.exchange, order.symbol)
+        if p > 0:
+            return p
+
+        # Last resort: reference price sent from UI at time of order submission
+        if order.reference_price and order.reference_price > 0:
+            logger.warning(
+                f"[PAPER] No live price for {order.symbol} — using UI reference "
+                f"{order.reference_price}"
+            )
+            return order.reference_price
+
+        return 0.0
+
+    async def _reference_price(self, exchange: str, symbol: str) -> float:
+        """Price used to check if limit is immediately fillable."""
+        return await self._last_tick(exchange, symbol)
 
     def _is_fillable(self, order: Order, price: float) -> bool:
         if not price:
@@ -71,46 +129,15 @@ class PaperEngine:
         order.filled_qty        = order.qty
         order.avg_fill_price    = round(price, 8)
         order.updated_at        = datetime.now(timezone.utc)
-        logger.info(f"[PAPER] FILLED {order.side.upper()} {order.qty} {order.symbol} @ {price:.6f}")
+        logger.info(
+            f"[PAPER] FILLED {order.side.upper()} {order.qty} "
+            f"{order.symbol} @ {price:.6f}"
+        )
         return order
 
-    async def _market_fill_price(self, order: Order) -> float:
-        """
-        Futures market orders fill at mark price.
-        Spot market orders fill at VWAP through order book.
-        """
-        if _is_futures(order.exchange):
-            try:
-                raw = await self._redis.get(
-                    redis_keys.mark_price_key(order.exchange, order.symbol)
-                )
-                if raw:
-                    return float(json.loads(raw).get('p', 0))
-            except Exception:
-                pass
-        # Spot: VWAP
-        book = await self._fetch_book(order.exchange, order.symbol)
-        if book:
-            levels = (
-                [(l.price, l.qty) for l in book.asks] if order.side == 'buy'
-                else [(l.price, l.qty) for l in book.bids]
-            )
-            tq = tv = 0.0
-            for p, q in levels:
-                take = min(q, order.qty - tq)
-                tq  += take
-                tv  += p * take
-                if tq >= order.qty * 0.99:
-                    break
-            if tq > 0:
-                return round(tv / tq, 8)
-        return await self._last_tick(order.exchange, order.symbol)
-
-    async def _reference_price(self, exchange: str, symbol: str) -> float:
-        """Price used to check if limit orders are immediately fillable."""
-        return await self._last_tick(exchange, symbol)
-
-    async def check_pending_fills(self, exchange: str, symbol: str, price: float) -> list[Order]:
+    async def check_pending_fills(
+        self, exchange: str, symbol: str, price: float
+    ) -> list[Order]:
         if not self._pending_limits:
             return []
         filled: list[Order] = []
@@ -120,10 +147,10 @@ class PaperEngine:
                 if item['exchange'] != exchange or item['symbol'] != symbol:
                     remaining.append(item)
                     continue
-                order = item['order']
-                if self._is_fillable(order, price):
-                    self._do_fill(order, order.price or price)
-                    filled.append(order)
+                o = item['order']
+                if self._is_fillable(o, price):
+                    self._do_fill(o, o.price or price)
+                    filled.append(o)
                 else:
                     remaining.append(item)
             self._pending_limits = remaining
@@ -136,8 +163,9 @@ class PaperEngine:
         ]
         return len(self._pending_limits) < before
 
-    async def modify_pending(self, order_id: str, new_price: float, new_qty: float) -> bool:
-        """Modify a working paper limit order."""
+    async def modify_pending(
+        self, order_id: str, new_price: float, new_qty: float
+    ) -> bool:
         async with self._lock:
             for item in self._pending_limits:
                 if item['order'].id == order_id:
@@ -145,45 +173,25 @@ class PaperEngine:
                     if new_price > 0: o.price = new_price
                     if new_qty   > 0: o.qty   = new_qty
                     o.updated_at = datetime.now(timezone.utc)
-                    logger.info(f"[PAPER] Modified: {o.symbol} @ {o.price}")
                     return True
         return False
 
-    async def _fetch_book(self, exchange: str, symbol: str) -> Optional[OrderBook]:
-        try:
-            raw = await self._redis.get(redis_keys.latest_depth_key(exchange, symbol))
-            if not raw:
-                return None
-            d = json.loads(raw)
-            return OrderBook(
-                exchange=exchange, symbol=symbol,
-                bids=[OrderBookLevel(price=b[0], qty=b[1]) for b in d.get('bids', [])],
-                asks=[OrderBookLevel(price=a[0], qty=a[1]) for a in d.get('asks', [])],
-                timestamp=datetime.now(timezone.utc),
-            )
-        except Exception as e:
-            logger.warning(f"Book fetch error [{exchange} {symbol}]: {e}")
-            return None
-
-    async def _last_tick(self, exchange: str, symbol: str) -> float:
-        try:
-            raw = await self._redis.get(redis_keys.latest_tick_key(exchange, symbol))
-            if raw:
-                return float(json.loads(raw).get('p', 0))
-        except Exception:
-            pass
-        return 0.0
-
-    async def open_position(self, slot_id: str, order: Order, side: str) -> Position:
+    async def open_position(
+        self, slot_id: str, order: Order, side: str
+    ) -> Position:
         rate      = _fee_rate(order.exchange, order.order_type)
         entry_fee = (order.avg_fill_price or 0) * order.filled_qty * rate
         pos = Position(
-            exchange=order.exchange, symbol=order.symbol, side=side,
+            exchange=order.exchange,
+            symbol=order.symbol,
+            side=side,
             entry_price=order.avg_fill_price or 0.0,
             current_price=order.avg_fill_price or 0.0,
             qty=order.filled_qty,
             unrealized_pnl=-entry_fee,
-            is_paper=True, slot_id=slot_id,
+            entry_fee_paid=entry_fee,
+            is_paper=True,
+            slot_id=slot_id,
         )
         async with self._lock:
             self._positions[slot_id] = pos
@@ -193,24 +201,132 @@ class PaperEngine:
         async with self._lock:
             return self._positions.pop(slot_id, None)
 
+    async def partial_close_position(
+        self,
+        slot_id:   str,
+        close_qty: float,
+    ) -> tuple['Position | None', float]:
+        """
+        Partially close a paper position.
+
+        Returns (updated_position, realized_pnl).
+        Returns (None, realized_pnl) when the position is fully exhausted.
+        """
+        async with self._lock:
+            pos = self._positions.get(slot_id)
+            if not pos:
+                return None, 0.0
+
+            close_qty = min(close_qty, pos.qty)
+            frac      = close_qty / pos.qty if pos.qty > 0 else 1.0
+
+            taker_fee         = settings.EXCHANGE_FEES.get(
+                pos.exchange, {'taker': 0.001}
+            )['taker']
+            entry_fee_partial = pos.entry_fee_paid * frac
+            exit_fee          = pos.current_price * close_qty * taker_fee
+
+            gross = (
+                (pos.current_price - pos.entry_price) * close_qty
+                if pos.side == 'long'
+                else (pos.entry_price - pos.current_price) * close_qty
+            )
+            realized = round(gross - entry_fee_partial - exit_fee, 6)
+
+            remaining = round(pos.qty - close_qty, 8)
+            if remaining <= 1e-10:
+                self._positions.pop(slot_id, None)
+                return None, realized
+
+            # Reduce position
+            pos.qty            -= close_qty
+            pos.entry_fee_paid -= entry_fee_partial
+
+            # Recalculate unrealized PnL for remaining qty
+            rem_exit_fee = pos.current_price * pos.qty * taker_fee
+            gross_rem = (
+                (pos.current_price - pos.entry_price) * pos.qty
+                if pos.side == 'long'
+                else (pos.entry_price - pos.current_price) * pos.qty
+            )
+            pos.unrealized_pnl = round(
+                gross_rem - pos.entry_fee_paid - rem_exit_fee, 6
+            )
+        return pos, realized
+    
     def get_position(self, slot_id: str) -> Optional[Position]:
         return self._positions.get(slot_id)
 
-    async def update_mark_prices(self, exchange: str, symbol: str, price: float) -> None:
+    async def update_mark_prices(
+        self, exchange: str, symbol: str, price: float
+    ) -> None:
         """
-        For futures: price = mark price (from trigger_engine._price which uses mark_price_key).
-        For spot:    price = last trade price.
+        price = mark price for futures (from trigger_engine._price which reads mark_price_key)
+              = last trade price for spot
         """
-        taker_fee = settings.EXCHANGE_FEES.get(exchange, {'taker': 0.001})['taker']
+        taker_fee = settings.EXCHANGE_FEES.get(
+            exchange, {'taker': 0.001}
+        )['taker']
+
+        # Also try to get funding rate from tick data
+        funding_rate: Optional[float] = None
+        try:
+            raw = await self._redis.get(
+                redis_keys.latest_tick_key(exchange, symbol)
+            )
+            if raw:
+                d = json.loads(raw)
+                if 'fr' in d:
+                    funding_rate = float(d['fr'])
+        except Exception:
+            pass
+
         async with self._lock:
             for pos in self._positions.values():
                 if pos.exchange == exchange and pos.symbol == symbol:
-                    pos.current_price   = price
-                    entry_fee_rate      = _fee_rate(exchange, 'limit')
-                    entry_fee           = pos.entry_price * pos.qty * entry_fee_rate
-                    exit_fee            = price           * pos.qty * taker_fee
-                    gross               = (
-                        (price - pos.entry_price) * pos.qty if pos.side == 'long'
+                    pos.current_price = price
+                    exit_fee          = price * pos.qty * taker_fee
+                    gross             = (
+                        (price - pos.entry_price) * pos.qty
+                        if pos.side == 'long'
                         else (pos.entry_price - price) * pos.qty
                     )
-                    pos.unrealized_pnl  = round(gross - entry_fee - exit_fee, 4)
+                    # Use stored entry_fee_paid — no recalculation error
+                    pos.unrealized_pnl = round(
+                        gross - pos.entry_fee_paid - exit_fee, 6
+                    )
+                    if funding_rate is not None:
+                        pos.funding_rate = funding_rate
+
+    async def _fetch_book(
+        self, exchange: str, symbol: str
+    ) -> Optional[OrderBook]:
+        try:
+            raw = await self._redis.get(
+                redis_keys.latest_depth_key(exchange, symbol)
+            )
+            if not raw:
+                return None
+            d = json.loads(raw)
+            return OrderBook(
+                exchange=exchange, symbol=symbol,
+                bids=[OrderBookLevel(price=b[0], qty=b[1])
+                      for b in d.get('bids', [])],
+                asks=[OrderBookLevel(price=a[0], qty=a[1])
+                      for a in d.get('asks', [])],
+                timestamp=datetime.now(timezone.utc),
+            )
+        except Exception as e:
+            logger.warning(f"Book fetch error [{exchange} {symbol}]: {e}")
+            return None
+
+    async def _last_tick(self, exchange: str, symbol: str) -> float:
+        try:
+            raw = await self._redis.get(
+                redis_keys.latest_tick_key(exchange, symbol)
+            )
+            if raw:
+                return float(json.loads(raw).get('p', 0))
+        except Exception:
+            pass
+        return 0.0

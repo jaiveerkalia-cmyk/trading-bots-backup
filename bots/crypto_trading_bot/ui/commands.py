@@ -22,6 +22,7 @@ async def _push(redis: aioredis.Redis, cmd: dict) -> None:
 
 async def open_slot(redis, slot)                           -> None: await _push(redis, {'type': redis_keys.CMD_OPEN_SLOT,    'slot': slot})
 async def close_slot(redis, slot_id)                       -> None: await _push(redis, {'type': redis_keys.CMD_CLOSE_SLOT,   'slot_id': slot_id})
+async def partial_close_slot(redis, slot_id: str, qty: float) -> None: await _push(redis, {'type':    redis_keys.CMD_PARTIAL_CLOSE_SLOT,'slot_id': slot_id,'qty':   qty,})
 async def cancel_order(redis, slot_id, order_id)           -> None: await _push(redis, {'type': redis_keys.CMD_CANCEL_ORDER, 'slot_id': slot_id, 'order_id': order_id})
 async def set_alert(redis, alert)                          -> None: await _push(redis, {'type': redis_keys.CMD_SET_ALERT,    'alert': alert})
 async def delete_alert(redis, alert_id)                    -> None: await _push(redis, {'type': redis_keys.CMD_DELETE_ALERT, 'alert_id': alert_id})

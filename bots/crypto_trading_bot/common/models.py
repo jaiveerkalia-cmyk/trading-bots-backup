@@ -15,11 +15,11 @@ class Tick(BaseModel):
     model_config = ConfigDict(slots=True)
     exchange:     str
     symbol:       str
-    price:        float           # last trade price (chart price)
+    price:        float           # last trade price
     volume:       float
     timestamp:    datetime
-    mark_price:   Optional[float] = None   # futures only — used for fills/PnL
-    funding_rate: Optional[float] = None   # futures perpetual funding rate
+    mark_price:   Optional[float] = None
+    funding_rate: Optional[float] = None
 
 
 class Candle(BaseModel):
@@ -62,6 +62,7 @@ class Order(BaseModel):
     order_type:        Literal['market', 'limit', 'stop_limit']
     price:             Optional[float] = None
     stop_price:        Optional[float] = None
+    reference_price:   Optional[float] = None   # paper fallback for market orders
     qty:               float
     qty_mode:          Literal['base', 'quote'] = 'base'
     status:            Literal['pending', 'working', 'filled', 'cancelled', 'rejected'] = 'pending'
@@ -89,6 +90,7 @@ class Position(BaseModel):
     realized_pnl:      float           = 0.0
     liquidation_price: Optional[float] = None
     funding_rate:      Optional[float] = None
+    entry_fee_paid:    float           = 0.0   # actual fee paid on entry
     is_paper:          bool            = False
     slot_id:           Optional[str]   = None
     opened_at:         datetime        = Field(default_factory=datetime.utcnow)
@@ -98,11 +100,12 @@ class Position(BaseModel):
 
 class EntryLeg(BaseModel):
     model_config = ConfigDict(slots=True)
-    price:      float
-    qty:        float
-    order_type: Literal['market', 'limit', 'stop_limit'] = 'limit'
-    order_id:   Optional[str] = None
-    filled:     bool          = False
+    price:           float
+    qty:             float
+    order_type:      Literal['market', 'limit', 'stop_limit'] = 'limit'
+    order_id:        Optional[str]   = None
+    filled:          bool            = False
+    reference_price: Optional[float] = None   # UI mark/last price at time of submission
 
 
 class TradeSlot(BaseModel):
@@ -143,8 +146,6 @@ class Alert(BaseModel):
     triggered:  bool            = False
     created_at: datetime        = Field(default_factory=datetime.utcnow)
 
-
-# ── Activity log ───────────────────────────────────────────────────────────────
 
 class LogEntry(BaseModel):
     model_config = ConfigDict(slots=True)

@@ -7,15 +7,16 @@ load_dotenv()
 
 IST = ZoneInfo('Asia/Kolkata')
 
-BASE_DIR            = Path(__file__).parent.parent
+BASE_DIR            = Path(__file__).resolve().parent.parent   # ← was dropped by edit
 DATA_DIR            = BASE_DIR / 'data'
-TRADES_DIR          = DATA_DIR / 'trades'
-DAILY_PNL_DIR       = DATA_DIR / 'daily_pnl'
+TRADES_DIR          = DATA_DIR / 'trades'        # kept for backward compat
+DAILY_PNL_DIR       = DATA_DIR / 'daily_pnl'    # kept for backward compat
+PORTFOLIO_DIR       = DATA_DIR / 'portfolio'     # unified daily CSV
 STATE_SNAPSHOTS_DIR = DATA_DIR / 'state_snapshots'
 CONFIG_DIR          = BASE_DIR / 'config'
 KEYS_FILE           = CONFIG_DIR / 'exchange_keys.enc'
 
-for _d in (TRADES_DIR, DAILY_PNL_DIR, STATE_SNAPSHOTS_DIR):
+for _d in (TRADES_DIR, DAILY_PNL_DIR, PORTFOLIO_DIR, STATE_SNAPSHOTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -43,12 +44,12 @@ COMMAND_QUEUE_SIZE     = 50
 PNL_CHART_POINTS   = 1440
 PNL_CHART_INTERVAL = 60
 
-# binance_futures uses the same Binance API key as binance
-SUPPORTED_EXCHANGES = ['binance', 'binance_futures', 'delta']
+# binance_futures first so it is the default selection
+SUPPORTED_EXCHANGES = ['binance_futures', 'binance', 'delta']
 
 EXCHANGE_FEES = {
-    'binance':         {'maker': 0.001,  'taker': 0.001},   # spot: 0.1%/0.1%
-    'binance_futures': {'maker': 0.0002, 'taker': 0.0004},  # USDT perp: 0.02%/0.04%
+    'binance':         {'maker': 0.001,  'taker': 0.001},
+    'binance_futures': {'maker': 0.0002, 'taker': 0.0004},
     'delta':           {'maker': 0.0002, 'taker': 0.0005},
 }
 
@@ -57,9 +58,7 @@ UI_REFRESH_INTERVAL           = 1.0
 WS_RECONNECT_DELAY            = 5
 WS_MAX_RECONNECT_ATTEMPTS     = 0
 
-LOG_MAX_ENTRIES = 200
+PAPER_FILL_CHECK_INTERVAL = 0.5
 
-PNL_CHART_POINTS   = 1440
-PNL_CHART_INTERVAL = 60
-
+LOG_MAX_ENTRIES              = 200
 ALERT_SOUND_DURATION_DEFAULT = 5
