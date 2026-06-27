@@ -162,13 +162,22 @@ async def _handle(
             logger.error("CMD_OPEN_SLOT: slot has no entry leg")
             return
 
+        # For stop-market orders: entry.price is the trigger level, not a limit price
+        if entry.order_type == 'stop_limit':
+            order_price      = None
+            order_stop_price = entry.price          # trigger level
+        else:
+            order_price      = entry.price if (entry.price and entry.price > 0) else None
+            order_stop_price = None
+
         order = Order(
             exchange        = slot.exchange,
             symbol          = slot.symbol,
-            side            = 'buy' if slot.side == 'long' else 'sell',  # ← was slot.side
+            side            = 'buy' if slot.side == 'long' else 'sell',
             order_type      = entry.order_type,
             qty             = entry.qty,
-            price           = entry.price,            # ← was limit_price
+            price           = order_price,
+            stop_price      = order_stop_price,
             slot_id         = slot.id,
             reference_price = entry.reference_price,
         )
@@ -178,12 +187,14 @@ async def _handle(
         if order.status == 'filled':
             slot.status = 'active'
             if order.is_paper:
-                slot.position = await paper_engine.open_position(slot.id, order, slot.side)  # ← assign
+                slot.position = await paper_engine.open_position(slot.id, order, slot.side)
+                slot.position.leverage = slot.leverage   # propagate leverage
             await _csv_open(csv_writer, slot_manager, slot, order)
         elif order.status in ('open', 'pending', 'working'):
             slot.status = 'working'
 
         await slot_manager.update_slot(slot)
+        
         state_publisher.log(
             f"Open order placed {slot.symbol} ({entry.order_type})",
             exchange=slot.exchange, symbol=slot.symbol,
@@ -370,6 +381,9 @@ async def _handle(
             level='warning' if live else 'info',
         )
 
+    elif action == redis_keys.CMD_RESET_ALERTS:
+        slot_manager.clear_triggered_alerts()
+        state_publisher.log("Alerts reset")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trigger-exit callback
@@ -441,6 +455,7 @@ async def _paper_fill_checker(
                         continue
                     slot.status   = 'active'
                     slot.position = await paper_engine.open_position(slot.id, order, slot.side)  # ← assign
+                    slot.position.leverage = slot.leverage
                     await slot_manager.update_slot(slot)
                     await _csv_open(csv_writer, slot_manager, slot, order)
                     state_publisher.log(
@@ -541,13 +556,22 @@ async def main() -> None:
         slot_id, reason,
         slot_manager, order_manager, state_pub, csv_writer, notifier,
     )
+    
+    # Define before TriggerEngine so it closes over state_pub and notifier
+    async def _on_alert_fired(alert) -> None:
+        price = alert.upper if alert.upper is not None else alert.lower
+        direction = '▲' if alert.upper is not None else '▼'
+        price_str = f"{price:g}" if price is not None else '—'
+        msg = f"[ALERT] {alert.symbol} {direction}{price_str} triggered"
+        state_pub.log(msg, level='warning',
+                      exchange=alert.exchange, symbol=alert.symbol)
+        await notifier.send(msg)
+
     trigger = TriggerEngine(
         redis_client = redis,
         slot_manager = slot_manager,
         on_exit      = on_exit,
-        on_alert     = lambda alert: notifier.send(
-            f"[ALERT] {alert.exchange} {alert.symbol}"
-        ),
+        on_alert     = _on_alert_fired,   # ← was a lambda that never logged
         paper_engine = paper_engine,
     )
 

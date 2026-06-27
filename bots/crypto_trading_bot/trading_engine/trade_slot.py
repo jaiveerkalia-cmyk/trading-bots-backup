@@ -143,7 +143,7 @@ class SlotManager:
             'cmd':      'subscribe' if subscribe else 'unsubscribe',
             'exchange': slot.exchange,
             'symbol':   slot.symbol,
-            'streams':  ['ticker', 'orderbook', 'candles:1m', 'candles:5m'],
+            'streams':  ['ticker'],
         }
         try:
             await self._redis.publish('market_data:control', json.dumps(cmd))

@@ -22,7 +22,8 @@ class UIState:
         'log_entries', 'pnl_history', 'last_prices', 'mark_prices',
         'watch_exchange', 'watch_symbol', 'watch_interval',
         'starting_balance', 'pnl_offset',
-        '_last_pnl_ts', '_redis',
+        '_last_pnl_ts', '_redis', '_prev_pos_count',
+        'ui_prefs', '_ui_prefs_loaded',
     )
 
     def __init__(self, redis_client: aioredis.Redis):
@@ -47,11 +48,13 @@ class UIState:
         self.starting_balance = 10000.0
         self.pnl_offset:      float = 0.0
         self._last_pnl_ts:    datetime | None = None
+        self._prev_pos_count: int  = 0
+        self.ui_prefs:        dict = {}
+        self._ui_prefs_loaded:bool = False
 
     # ── Portfolio persistence ─────────────────────────────────────────────────
 
     async def load_portfolio(self) -> None:
-        """Load persisted balance and PnL offset from Redis on startup."""
         try:
             raw = await self._redis.get(_PORTFOLIO_KEY)
             if raw:
@@ -59,25 +62,55 @@ class UIState:
                 self.starting_balance = float(d.get('starting_balance', 10000.0))
                 self.pnl_offset       = float(d.get('pnl_offset',       0.0))
                 logger.info(
-                    f"Portfolio loaded: balance={self.starting_balance} "
-                    f"offset={self.pnl_offset}"
+                    "Portfolio loaded: balance=%s offset=%s",
+                    self.starting_balance, self.pnl_offset,
                 )
         except Exception as e:
-            logger.error(f"Portfolio load error: {e}")
+            logger.error("Portfolio load error: %s", e)
 
     async def save_portfolio(self) -> None:
-        """Persist balance and PnL offset to Redis."""
         try:
             await self._redis.set(_PORTFOLIO_KEY, json.dumps({
                 'starting_balance': self.starting_balance,
                 'pnl_offset':       self.pnl_offset,
             }))
         except Exception as e:
-            logger.error(f"Portfolio save error: {e}")
+            logger.error("Portfolio save error: %s", e)
+
+    # ── UI preferences persistence ────────────────────────────────────────────
+
+    async def load_ui_prefs(self) -> None:
+        """Load chart height, interval, alert sound prefs from Redis."""
+        try:
+            raw = await self._redis.get(redis_keys.UI_PREFS_KEY)
+            if raw:
+                self.ui_prefs = json.loads(raw)
+                # Sync watch_interval from saved pref
+                if 'chart_interval' in self.ui_prefs:
+                    self.watch_interval = self.ui_prefs['chart_interval']
+                logger.info("UI prefs loaded: %s", self.ui_prefs)
+        except Exception as e:
+            logger.error("UI prefs load error: %s", e)
+        self._ui_prefs_loaded = True
+
+    async def save_ui_prefs(self, prefs: dict) -> None:
+        """Merge new keys into UI prefs and persist to Redis."""
+        self.ui_prefs.update(prefs)
+        try:
+            await self._redis.set(
+                redis_keys.UI_PREFS_KEY,
+                json.dumps(self.ui_prefs),
+            )
+        except Exception as e:
+            logger.error("UI prefs save error: %s", e)
 
     # ── Refresh ───────────────────────────────────────────────────────────────
 
     async def refresh(self) -> None:
+        # Load UI prefs on the very first refresh (avoids changing startup code)
+        if not self._ui_prefs_loaded:
+            await self.load_ui_prefs()
+
         try:
             sym_key = f"{self.watch_exchange}:{self.watch_symbol}"
             async with self._redis.pipeline(transaction=False) as pipe:
@@ -113,8 +146,6 @@ class UIState:
                 self.last_prices[sym_key] = float(tick.get('p', 0))
                 if 'mp' in tick:
                     self.mark_prices[sym_key] = float(tick['mp'])
-                if 'fr' in tick:
-                    pass  # funding rate stored per-tick, used by paper engine
 
             if results[10]:
                 self.mark_prices[sym_key] = float(
@@ -124,16 +155,22 @@ class UIState:
             if sym_key not in self.mark_prices:
                 self.mark_prices[sym_key] = self.last_prices.get(sym_key, 0.0)
 
-            # PnL history — 1-min samples
+            # PnL history — only while positions are open; reset on new position
             now = datetime.now(IST)
-            if (self._last_pnl_ts is None or
-                    (now - self._last_pnl_ts).total_seconds() >= settings.PNL_CHART_INTERVAL):
-                u, r = self.get_display_pnl()
-                self.pnl_history.append((now.strftime('%H:%M'), round(r + u, 4)))
-                self._last_pnl_ts = now
+            new_pos_count = len(self.positions)
+            if new_pos_count > 0 and self._prev_pos_count == 0:
+                self.pnl_history.clear()
+                self._last_pnl_ts = None
+            if new_pos_count > 0:
+                if (self._last_pnl_ts is None or
+                        (now - self._last_pnl_ts).total_seconds() >= settings.PNL_CHART_INTERVAL):
+                    u = sum(float(p.get('unrealized_pnl', 0)) for p in self.positions)
+                    self.pnl_history.append((now.strftime('%H:%M'), round(u, 4)))
+                    self._last_pnl_ts = now
+            self._prev_pos_count = new_pos_count
 
         except Exception as e:
-            logger.error(f"UIState refresh error: {e}")
+            logger.error("UIState refresh error: %s", e)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

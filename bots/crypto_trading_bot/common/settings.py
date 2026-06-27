@@ -38,7 +38,7 @@ CANDLE_INTERVALS        = ['1m', '5m', '15m', '1h', '4h', '1d']
 CHART_INTERVALS         = ['1m', '5m', '15m', '1h']
 DEFAULT_ORDERBOOK_DEPTH = 20
 
-MARKET_DATA_QUEUE_SIZE = 100
+MARKET_DATA_QUEUE_SIZE = 10   # was 100 — only ticker subscribed now
 COMMAND_QUEUE_SIZE     = 50
 
 PNL_CHART_POINTS   = 1440

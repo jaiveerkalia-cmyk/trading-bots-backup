@@ -1,7 +1,12 @@
+"""
+RedisPublisher — deduplicates tick messages to avoid hammering Redis
+when price is unchanged. Only publishes if price changed OR 1 s has elapsed.
+"""
 from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Union
 
@@ -16,14 +21,19 @@ MarketData = Union[Tick, Candle, OrderBook]
 
 
 class RedisPublisher:
-    __slots__ = ('_redis', '_queue', '_task')
+    __slots__ = (
+        '_redis', '_queue', '_task',
+        '_last_price', '_last_pub_ts',   # dedup state
+    )
 
-    def __init__(self, redis_client: aioredis.Redis):
+    def __init__(self, redis_client: aioredis.Redis) -> None:
         self._redis  = redis_client
         self._queue: asyncio.Queue[MarketData] = asyncio.Queue(
             maxsize=settings.MARKET_DATA_QUEUE_SIZE
         )
         self._task: asyncio.Task | None = None
+        self._last_price:  dict[str, float] = {}   # key -> last published price
+        self._last_pub_ts: dict[str, float] = {}   # key -> last publish monotonic time
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._drain())
@@ -58,40 +68,20 @@ class RedisPublisher:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Publisher drain error: {e}")
+                logger.error("Publisher drain error: %s", e)
 
     async def _push(self, data: MarketData) -> None:
         try:
             if isinstance(data, Tick):
-                payload = _tick_json(data)
-                channel = redis_keys.tick_channel(data.exchange, data.symbol)
-                key     = redis_keys.latest_tick_key(data.exchange, data.symbol)
-                ttl     = settings.TICK_TTL
-
-                async with self._redis.pipeline(transaction=False) as pipe:
-                    pipe.publish(channel, payload)
-                    pipe.set(key, payload, ex=ttl)
-                    # Publish mark price separately for futures — used for fills/PnL
-                    if data.mark_price is not None:
-                        mp = json.dumps(
-                            {'p': data.mark_price, 'ts': _ts(data.timestamp)},
-                            separators=(',', ':'),
-                        )
-                        pipe.set(
-                            redis_keys.mark_price_key(data.exchange, data.symbol),
-                            mp, ex=ttl,
-                        )
-                    await pipe.execute()
-                del payload
+                await self._push_tick(data)
 
             elif isinstance(data, Candle):
                 payload = _candle_json(data)
                 channel = redis_keys.candle_channel(data.exchange, data.symbol, data.interval)
                 key     = redis_keys.latest_candle_key(data.exchange, data.symbol, data.interval)
-                ttl     = settings.CANDLE_TTL
                 async with self._redis.pipeline(transaction=False) as pipe:
                     pipe.publish(channel, payload)
-                    pipe.set(key, payload, ex=ttl)
+                    pipe.set(key, payload, ex=settings.CANDLE_TTL)
                     await pipe.execute()
                 del payload
 
@@ -99,15 +89,47 @@ class RedisPublisher:
                 payload = _book_json(data)
                 channel = redis_keys.depth_channel(data.exchange, data.symbol)
                 key     = redis_keys.latest_depth_key(data.exchange, data.symbol)
-                ttl     = settings.DEPTH_TTL
                 async with self._redis.pipeline(transaction=False) as pipe:
                     pipe.publish(channel, payload)
-                    pipe.set(key, payload, ex=ttl)
+                    pipe.set(key, payload, ex=settings.DEPTH_TTL)
                     await pipe.execute()
                 del payload
 
         except Exception as e:
-            logger.error(f"Redis push error: {e}")
+            logger.error("Redis push error: %s", e)
+
+    async def _push_tick(self, data: Tick) -> None:
+        """Publish tick, skipping Redis write if price unchanged within 1 s."""
+        key = f"{data.exchange}:{data.symbol}"
+        now = time.monotonic()
+
+        price_changed = (data.price != self._last_price.get(key))
+        time_elapsed  = (now - self._last_pub_ts.get(key, 0)) >= 1.0
+
+        if not price_changed and not time_elapsed:
+            return   # deduplicate — skip unchanged tick within 1 s window
+
+        self._last_price[key]  = data.price
+        self._last_pub_ts[key] = now
+
+        payload = _tick_json(data)
+        channel = redis_keys.tick_channel(data.exchange, data.symbol)
+        lkey    = redis_keys.latest_tick_key(data.exchange, data.symbol)
+
+        async with self._redis.pipeline(transaction=False) as pipe:
+            pipe.publish(channel, payload)
+            pipe.set(lkey, payload, ex=settings.TICK_TTL)
+            if data.mark_price is not None:
+                mp = json.dumps(
+                    {'p': data.mark_price, 'ts': _ts(data.timestamp)},
+                    separators=(',', ':'),
+                )
+                pipe.set(
+                    redis_keys.mark_price_key(data.exchange, data.symbol),
+                    mp, ex=settings.TICK_TTL,
+                )
+            await pipe.execute()
+        del payload
 
 
 def _ts(dt: datetime) -> str:

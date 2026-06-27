@@ -39,6 +39,7 @@ LIVE_MODE_KEY           = "engine:live_mode"
 CONNECTED_EXCHANGES_KEY = "engine:connected"
 LOG_KEY                 = "engine:log"
 
+UI_PREFS_KEY = 'ui:prefs'   # chart height, interval, alert sound prefs
 
 # ── Command queue ──────────────────────────────────────────────────────────────
 
@@ -54,4 +55,4 @@ CMD_DELETE_ALERT   = "delete_alert"
 CMD_CLOSE_ALL      = "close_all"
 CMD_SET_LIVE_MODE  = "set_live_mode"
 CMD_PARTIAL_CLOSE_SLOT = 'partial_close_slot'
-
+CMD_RESET_ALERTS = 'reset_alerts'

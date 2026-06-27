@@ -27,6 +27,7 @@ async def cancel_order(redis, slot_id, order_id)           -> None: await _push(
 async def set_alert(redis, alert)                          -> None: await _push(redis, {'type': redis_keys.CMD_SET_ALERT,    'alert': alert})
 async def delete_alert(redis, alert_id)                    -> None: await _push(redis, {'type': redis_keys.CMD_DELETE_ALERT, 'alert_id': alert_id})
 async def close_all(redis)                                 -> None: await _push(redis, {'type': redis_keys.CMD_CLOSE_ALL})
+async def reset_alerts(redis) -> None: await _push(redis, {'type': redis_keys.CMD_RESET_ALERTS})
 async def set_live_mode(redis, live)                       -> None: await _push(redis, {'type': redis_keys.CMD_SET_LIVE_MODE, 'live': live})
 async def update_slot(redis, slot_id, **kw: Any)           -> None: await _push(redis, {'type': redis_keys.CMD_UPDATE_SLOT, 'slot_id': slot_id, **kw})
 async def modify_order(

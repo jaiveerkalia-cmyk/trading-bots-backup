@@ -36,8 +36,14 @@ class PaperEngine:
             price = await self._market_fill_price(order)
             return self._do_fill(order, price)
         current = await self._reference_price(order.exchange, order.symbol)
+        # was: return self._do_fill(order, order.price or current)
         if self._is_fillable(order, current):
-            return self._do_fill(order, order.price or current)
+            fill_price = (
+                current                   # stop-market: fill at current price
+                if order.order_type == 'stop_limit'
+                else (order.price or current)   # limit: fill at limit price
+            )
+            return self._do_fill(order, fill_price)
         # Working limit order
         order.exchange_order_id = f"PAPER-{order.id[:8]}"
         order.status            = 'working'
@@ -148,8 +154,10 @@ class PaperEngine:
                     remaining.append(item)
                     continue
                 o = item['order']
+                # was: self._do_fill(o, o.price or price)
                 if self._is_fillable(o, price):
-                    self._do_fill(o, o.price or price)
+                    fill_price = price if o.order_type == 'stop_limit' else (o.price or price)
+                    self._do_fill(o, fill_price)
                     filled.append(o)
                 else:
                     remaining.append(item)

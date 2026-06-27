@@ -1,21 +1,12 @@
 """
 TradingView chart widget.
-
-Key behaviours
-──────────────
-- Widget is created ONCE per session; symbol changes use setSymbol() JS API
-  so drawings and layout customisations survive exchange / symbol switches.
-- Interval changes from our dropdown call chart().setResolution() — no reinit.
-- A height slider lets the user resize the chart inline.
-- A position-level bar below the chart shows Entry / Stop / Target for the
-  symbol currently being watched (updated every tick, zero DOM cost).
-- Drawing toolbar is always visible (hide_side_toolbar: false).
+Height and interval are persisted to Redis via state.ui_prefs so they survive
+container restarts and browser refreshes.
 """
 from __future__ import annotations
-
+import asyncio
 import json
 from typing import TYPE_CHECKING
-
 from nicegui import ui
 
 if TYPE_CHECKING:
@@ -24,33 +15,20 @@ if TYPE_CHECKING:
 _CONTAINER_ID = 'tv_chart_container'
 
 _INTERVAL_MAP: dict[str, str] = {
-    '1m':  '1',
-    '3m':  '3',
-    '5m':  '5',
-    '15m': '15',
-    '30m': '30',
-    '1h':  '60',
-    '2h':  '120',
-    '4h':  '240',
-    '6h':  '360',
-    '12h': '720',
-    '1d':  '1D',
-    '1w':  '1W',
+    '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+    '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
+    '1d': '1D', '1w': '1W',
 }
 
-
-# ── Symbol formatter ──────────────────────────────────────────────────────────
 
 def _tv_symbol(exchange: str, symbol: str) -> str:
     sym = symbol.replace('/', '').replace('-', '').upper()
     if 'futures' in exchange or exchange == 'delta':
-        return f'BINANCE:{sym}.P'   # perpetual futures
+        return f'BINANCE:{sym}.P'
     if exchange in ('binance', 'binance_spot'):
         return f'BINANCE:{sym}'
     return sym
 
-
-# ── Widget init JS ────────────────────────────────────────────────────────────
 
 def _init_js(tv_symbol: str, interval: str) -> str:
     iv  = _INTERVAL_MAP.get(interval, '1')
@@ -68,19 +46,15 @@ def _init_js(tv_symbol: str, interval: str) -> str:
         'enable_publishing': False,
         'save_image':        True,
         'hide_top_toolbar':  False,
-        'hide_side_toolbar': False,   # keep drawing tools visible
+        'hide_side_toolbar': False,
         'withdateranges':    True,
         'container_id':      _CONTAINER_ID,
     })
-    # Try a soft symbol-update first (preserves drawings).
-    # Fall back to full re-init only when necessary.
     return f"""
 (function tryInit() {{
     if (typeof TradingView === 'undefined') {{ setTimeout(tryInit, 400); return; }}
     var el = document.getElementById('{_CONTAINER_ID}');
     if (!el) {{ setTimeout(tryInit, 400); return; }}
-
-    // Soft update — avoids destroying the widget and losing drawings
     if (window._tvWidget && window._tvWidgetReady) {{
         try {{
             window._tvWidget.setSymbol('{tv_symbol}', '{iv}', function() {{}});
@@ -89,8 +63,6 @@ def _init_js(tv_symbol: str, interval: str) -> str:
             console.warn('[TV] setSymbol failed, reinitialising:', e);
         }}
     }}
-
-    // Full init
     el.innerHTML = '';
     window._tvWidgetReady = false;
     window._tvWidget = new TradingView.widget({cfg});
@@ -107,42 +79,38 @@ def _set_resolution_js(iv_tv: str) -> str:
     return f"""
 (function() {{
     if (!window._tvWidget || !window._tvWidgetReady) return;
-    try {{
-        window._tvWidget.chart().setResolution('{iv_tv}', function() {{}});
-    }} catch (e) {{
-        console.warn('[TV] setResolution not available:', e);
-    }}
+    try {{ window._tvWidget.chart().setResolution('{iv_tv}', function() {{}}); }}
+    catch (e) {{ console.warn('[TV] setResolution:', e); }}
 }})();
 """
 
 
-# ── Component builder ─────────────────────────────────────────────────────────
-
 def build(state: 'UIState', shared: dict) -> dict:
+    # Load persisted prefs (available after first state.refresh())
+    saved_height   = state.ui_prefs.get('chart_height',   440)
+    saved_interval = state.ui_prefs.get('chart_interval', '15m')
+
+    # Sync state interval with saved pref
+    if saved_interval and saved_interval != state.watch_interval:
+        state.watch_interval = saved_interval
+
     last = {
         'symbol':      None,
         'interval':    None,
         'initialized': False,
-        'height':      440,
+        'height':      saved_height,
     }
 
-    # ── Outer card ────────────────────────────────────────────────────────────
-    with ui.card().classes(
-        'w-full bg-gray-900 p-0 rounded-xl overflow-hidden shadow-lg'
-    ):
-        # ── Header bar ────────────────────────────────────────────────────────
-        with ui.row().classes(
-            'w-full items-center px-3 py-1.5 bg-gray-800/80 gap-3 flex-wrap'
-        ):
+    with ui.card().classes('w-full bg-gray-900 p-0 rounded-xl overflow-hidden shadow-lg'):
+        with ui.row().classes('w-full items-center px-3 py-1.5 bg-gray-800/80 gap-3 flex-wrap'):
             ui.label('Chart').classes(
                 'text-gray-300 text-xs font-semibold uppercase tracking-wider'
             )
 
-            # Interval selector
             iv_select = (
                 ui.select(
                     options=list(_INTERVAL_MAP.keys()),
-                    value=getattr(state, 'watch_interval', '15m'),
+                    value=saved_interval,
                     label=None,
                 )
                 .props('dense dark outlined borderless')
@@ -151,29 +119,19 @@ def build(state: 'UIState', shared: dict) -> dict:
 
             ui.element('div').classes('flex-1')
 
-            # Height slider
             ui.label('H').classes('text-gray-500 text-xs')
-            h_slider = (
-                ui.slider(min=280, max=820, step=40, value=last['height'])
-                .classes('w-28')
-                .props('dense color=grey-7')
-            )
-            h_lbl = ui.label(f"{last['height']}px").classes(
-                'text-gray-500 text-xs w-12'
-            )
+            h_lbl = ui.label(f'{saved_height}px').classes('text-gray-500 text-xs w-12')
 
-        # ── Chart container ───────────────────────────────────────────────────
         chart_wrap = ui.element('div').style(
-            f'width:100%; height:{last["height"]}px;'
+            f'width:100%; height:{saved_height}px;'
         )
         with chart_wrap:
             ui.element('div').style('width:100%; height:100%;') \
                 ._props.__setitem__('id', _CONTAINER_ID)
 
-        # ── Position-level bar ────────────────────────────────────────────────
         levels_bar = ui.row().classes(
-            'w-full px-3 py-1.5 bg-gray-800/60 '
-            'border-t border-gray-700/60 gap-5 items-center flex-wrap'
+            'w-full px-3 py-1.5 bg-gray-800/60 border-t border-gray-700/60 '
+            'gap-5 items-center flex-wrap'
         )
         with levels_bar:
             entry_lbl = ui.label('').classes('text-xs font-mono')
@@ -181,7 +139,7 @@ def build(state: 'UIState', shared: dict) -> dict:
             tgt_lbl   = ui.label('').classes('text-xs font-mono')
         levels_bar.set_visibility(False)
 
-    # ── Interval selector handler ─────────────────────────────────────────────
+    # ── Interval handler ──────────────────────────────────────────────────────
     def _on_interval(e) -> None:
         iv = e.value
         state.watch_interval = iv
@@ -189,37 +147,48 @@ def build(state: 'UIState', shared: dict) -> dict:
             return
         last['interval'] = iv
         ui.run_javascript(_set_resolution_js(_INTERVAL_MAP.get(iv, '1')))
+        asyncio.ensure_future(state.save_ui_prefs({'chart_interval': iv}))
 
     iv_select.on('update:model-value', _on_interval)
 
-    # ── Height slider handler ─────────────────────────────────────────────────
-    def _on_height(e) -> None:
-        h = int(e.value)
+    # ── Height handler ────────────────────────────────────────────────────────
+    def _on_height(h: int) -> None:
         last['height'] = h
         h_lbl.set_text(f'{h}px')
         chart_wrap.style(f'width:100%; height:{h}px;')
+        ui.run_javascript(
+            'try{if(window._tvWidget&&window._tvWidget.resize)'
+            'window._tvWidget.resize();}catch(e){}'
+        )
+        asyncio.ensure_future(state.save_ui_prefs({'chart_height': h}))
 
-    h_slider.on('update:model-value', _on_height)
+    ui.slider(
+        min=280, max=820, step=40, value=saved_height,
+        on_change=lambda e: _on_height(int(e.value)),
+    ).classes('w-28').props('dense color=grey-7')
 
     # ── Tick update ───────────────────────────────────────────────────────────
     def update() -> None:
+        # Sync saved height/interval on first tick if prefs loaded after build
+        if not last['initialized']:
+            new_h = state.ui_prefs.get('chart_height', 440)
+            if new_h != last['height']:
+                _on_height(new_h)
+
         tv_sym = _tv_symbol(
             shared.get('exchange', 'binance'),
             shared.get('symbol', 'BTC/USDT'),
         )
         iv = getattr(state, 'watch_interval', '15m')
 
-        sym_changed = tv_sym != last['symbol']
-        iv_changed  = iv != last['interval']
-
-        if not last['initialized'] or sym_changed:
+        if not last['initialized'] or tv_sym != last['symbol']:
             last.update({'symbol': tv_sym, 'interval': iv, 'initialized': True})
             ui.run_javascript(_init_js(tv_sym, iv))
-        elif iv_changed:
+        elif iv != last['interval']:
             last['interval'] = iv
             ui.run_javascript(_set_resolution_js(_INTERVAL_MAP.get(iv, '1')))
 
-        # ── Position levels overlay ───────────────────────────────────────────
+        # Position levels bar
         pos = None
         for p in state.positions:
             if (p.get('exchange') == shared.get('exchange') and
@@ -234,7 +203,6 @@ def build(state: 'UIState', shared: dict) -> dict:
             side  = pos.get('side', '')
             stop  = float((slot or {}).get('stop_price')   or 0)
             tgt   = float((slot or {}).get('target_price') or 0)
-
             sc    = 'text-green-400' if side == 'long' else 'text-red-400'
             entry_lbl.set_text(f'● Entry  {entry:g}' if entry else '● Entry  —')
             entry_lbl.classes(
