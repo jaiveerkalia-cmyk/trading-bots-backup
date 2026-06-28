@@ -1,10 +1,11 @@
 """
-TriggerEngine — background monitor for stop/target exits and alert triggers.
+TriggerEngine — background monitor for stop/target/pnl_target exits and alerts.
 
 Price-source rules (Binance Futures / Delta):
-  • Stop-loss   → checked against MARK PRICE  (prevents wick manipulation)
-  • Take-profit → checked against LTP          (last trade price)
-  • Alerts      → always LTP
+  • Stop-loss    → MARK PRICE  (prevents wick manipulation)
+  • Take-profit  → LTP
+  • PnL target   → unrealized_pnl from paper_engine (already mark-to-market)
+  • Alerts       → always LTP
 """
 from __future__ import annotations
 
@@ -51,8 +52,6 @@ class TriggerEngine:
         if self._task:
             self._task.cancel()
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
-
     async def _loop(self) -> None:
         while True:
             try:
@@ -70,7 +69,6 @@ class TriggerEngine:
             if not slot.position:
                 continue
 
-            # Mark price: drives stop checks + paper PnL mark-to-market
             mark = await self._price(slot.exchange, slot.symbol)
             if mark <= 0:
                 continue
@@ -80,36 +78,45 @@ class TriggerEngine:
                 await self._paper.update_mark_prices(slot.exchange, slot.symbol, mark)
                 updated.add(sym_key)
 
-            # ── Stop: MARK PRICE only ──────────────────────────────────────
+            # ── Stop: MARK PRICE ──────────────────────────────────────────
             if slot.stop_price:
                 hit = (
                     (slot.side == 'long'  and mark <= slot.stop_price) or
                     (slot.side == 'short' and mark >= slot.stop_price)
                 )
                 if hit:
-                    logger.info(
-                        "Stop hit [%s] mark=%.6g stop=%.6g",
-                        slot.symbol, mark, slot.stop_price,
-                    )
+                    logger.info("Stop hit [%s] mark=%.6g stop=%.6g",
+                                slot.symbol, mark, slot.stop_price)
                     await self._on_exit(slot.id, 'stop_hit')
                     continue
 
-            # ── Target: LTP (last trade price) ────────────────────────────
+            # ── Target: LTP ───────────────────────────────────────────────
             if slot.target_price:
                 ltp = await self._ltp(slot.exchange, slot.symbol)
-                chk = ltp if ltp > 0 else mark     # fall back to mark if LTP absent
+                chk = ltp if ltp > 0 else mark
                 hit = (
                     (slot.side == 'long'  and chk >= slot.target_price) or
                     (slot.side == 'short' and chk <= slot.target_price)
                 )
                 if hit:
-                    logger.info(
-                        "Target hit [%s] ltp=%.6g target=%.6g",
-                        slot.symbol, chk, slot.target_price,
-                    )
+                    logger.info("Target hit [%s] ltp=%.6g target=%.6g",
+                                slot.symbol, chk, slot.target_price)
                     await self._on_exit(slot.id, 'target_hit')
+                    continue
 
-        # ── Alerts: always LTP ────────────────────────────────────────────────
+            # ── PnL target: unrealized PnL threshold ──────────────────────
+            if slot.pnl_target is not None and slot.position:
+                curr_pnl = slot.position.unrealized_pnl
+                hit = (
+                    (slot.pnl_target >= 0 and curr_pnl >= slot.pnl_target) or
+                    (slot.pnl_target <  0 and curr_pnl <= slot.pnl_target)
+                )
+                if hit:
+                    logger.info("PnL target hit [%s] pnl=%.4f target=%.4f",
+                                slot.symbol, curr_pnl, slot.pnl_target)
+                    await self._on_exit(slot.id, 'pnl_target_hit')
+
+        # ── Alerts: LTP ───────────────────────────────────────────────────────
         for alert in self._slots.get_alerts():
             if alert.triggered:
                 continue
@@ -125,13 +132,7 @@ class TriggerEngine:
                 logger.info("Alert triggered [%s] ltp=%.6g", alert.symbol, ltp)
                 await self._on_alert(alert)
 
-    # ── Price helpers ──────────────────────────────────────────────────────────
-
     async def _price(self, exchange: str, symbol: str) -> float:
-        """
-        Mark price for futures/delta, LTP for spot.
-        Used for stop checks and paper PnL mark-to-market.
-        """
         try:
             if 'futures' in exchange or exchange == 'delta':
                 raw = await self._redis.get(
@@ -141,13 +142,11 @@ class TriggerEngine:
                     p = float(json.loads(raw).get('p', 0))
                     if p > 0:
                         return p
-            # Spot or mark unavailable → fall through to LTP
             return await self._ltp(exchange, symbol)
         except Exception:
             return 0.0
 
     async def _ltp(self, exchange: str, symbol: str) -> float:
-        """Last trade price from the tick stream."""
         try:
             raw = await self._redis.get(
                 redis_keys.latest_tick_key(exchange, symbol)

@@ -1,7 +1,8 @@
 """
 Binance USDT-margined Perpetual Futures adapter.
-Uses mark price for paper fills and PnL.
-Last trade price goes in Tick.price; mark price goes in Tick.mark_price.
+RAM optimisations:
+  - Strip raw 'info' field from markets after load_markets() (saves ~30-60 MB).
+  - Clear ccxt ticker / ohlcv caches after every publish so they never accumulate.
 """
 from __future__ import annotations
 import asyncio
@@ -16,6 +17,17 @@ from common.models import Tick, Candle, OrderBook, OrderBookLevel, Order, Positi
 from common import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _trim_markets(ex) -> None:
+    """Remove raw exchange 'info' blob from every market entry to free RAM."""
+    try:
+        for m in (ex.markets or {}).values():
+            m.pop('info', None)
+        for m in (ex.markets_by_id or {}).values():
+            m.pop('info', None)
+    except Exception:
+        pass
 
 
 class BinanceFuturesAdapter(BaseExchangeAdapter):
@@ -33,20 +45,19 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
         self._ex: Optional[ccxtpro.binance] = None
         self._ws_tasks: dict[str, list[asyncio.Task]] = {}
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-
     async def connect(self) -> None:
         self._ex = ccxtpro.binance({
             'apiKey': self.api_key,
             'secret': self.api_secret,
             'options': {
                 'defaultType': 'future',
-                'newUpdates': True,
+                'newUpdates':  True,     # return only new candles — prevents history accumulation
             },
         })
         if self.testnet:
             self._ex.set_sandbox_mode(True)
         await self._ex.load_markets()
+        _trim_markets(self._ex)          # ← strip heavy metadata immediately after load
         logger.info("Binance Futures connected — perpetual markets loaded")
 
     async def disconnect(self) -> None:
@@ -69,35 +80,36 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
     async def _ticker_loop(self, symbol: str, cb: Callable) -> None:
         while True:
             try:
-                raw  = await self._ex.watch_ticker(symbol)
-                info = raw.get('info', {})
-
-                last_price   = float(raw.get('last') or raw.get('close') or 0)
-                # ccxt futures ticker has markPrice in info dict
-                mark_price   = float(
-                    info.get('markPrice') or
-                    raw.get('markPrice') or
-                    last_price
+                raw        = await self._ex.watch_ticker(symbol)
+                info       = raw.get('info', {})
+                last_price = float(raw.get('last') or raw.get('close') or 0)
+                mark_price = float(
+                    info.get('markPrice') or raw.get('markPrice') or last_price
                 )
-                funding_rate = float(info.get('lastFundingRate') or 0) or None
-
+                funding    = float(info.get('lastFundingRate') or 0) or None
                 tick = Tick(
-                    exchange=self.name,
-                    symbol=symbol,
-                    price=last_price,
-                    mark_price=mark_price,
-                    funding_rate=funding_rate,
-                    volume=float(raw.get('baseVolume') or 0),
-                    timestamp=datetime.fromtimestamp(
-                        raw['timestamp'] / 1000, tz=timezone.utc
-                    ) if raw.get('timestamp') else datetime.now(timezone.utc),
+                    exchange     = self.name,
+                    symbol       = symbol,
+                    price        = last_price,
+                    mark_price   = mark_price,
+                    funding_rate = funding,
+                    volume       = float(raw.get('baseVolume') or 0),
+                    timestamp    = (
+                        datetime.fromtimestamp(raw['timestamp'] / 1000, tz=timezone.utc)
+                        if raw.get('timestamp') else datetime.now(timezone.utc)
+                    ),
                 )
                 await cb(tick)
-                del tick, raw
+                # ── Clear ccxt ticker cache to prevent RAM growth ──────────
+                try:
+                    self._ex.tickers.pop(symbol, None)
+                except Exception:
+                    pass
+                del tick, raw, info
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"BinanceFutures ticker [{symbol}]: {e}")
+                logger.warning("BinanceFutures ticker [%s]: %s", symbol, e)
                 await asyncio.sleep(settings.WS_RECONNECT_DELAY)
 
     async def subscribe_orderbook(
@@ -112,21 +124,27 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             try:
                 raw  = await self._ex.watch_order_book(symbol, limit=depth)
                 book = OrderBook(
-                    exchange=self.name, symbol=symbol,
-                    bids=[OrderBookLevel(price=float(p), qty=float(q))
-                          for p, q in raw['bids'][:depth]],
-                    asks=[OrderBookLevel(price=float(p), qty=float(q))
-                          for p, q in raw['asks'][:depth]],
-                    timestamp=datetime.fromtimestamp(
-                        raw['timestamp'] / 1000, tz=timezone.utc
-                    ) if raw.get('timestamp') else datetime.now(timezone.utc),
+                    exchange = self.name, symbol = symbol,
+                    bids = [OrderBookLevel(price=float(p), qty=float(q))
+                            for p, q in raw['bids'][:depth]],
+                    asks = [OrderBookLevel(price=float(p), qty=float(q))
+                            for p, q in raw['asks'][:depth]],
+                    timestamp = (
+                        datetime.fromtimestamp(raw['timestamp'] / 1000, tz=timezone.utc)
+                        if raw.get('timestamp') else datetime.now(timezone.utc)
+                    ),
                 )
                 await cb(book)
-                del book
+                # ── Evict orderbook from ccxt cache ────────────────────────
+                try:
+                    self._ex.orderbooks.pop(symbol, None)
+                except Exception:
+                    pass
+                del book, raw
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"BinanceFutures orderbook [{symbol}]: {e}")
+                logger.warning("BinanceFutures orderbook [%s]: %s", symbol, e)
                 await asyncio.sleep(settings.WS_RECONNECT_DELAY)
 
     async def subscribe_candles(
@@ -141,28 +159,34 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
                 ohlcvs = await self._ex.watch_ohlcv(symbol, interval)
                 for ts, o, h, l, c, v in ohlcvs:
                     await cb(Candle(
-                        exchange=self.name, symbol=symbol, interval=interval,
+                        exchange  = self.name, symbol = symbol, interval = interval,
                         open=float(o), high=float(h), low=float(l), close=float(c),
-                        volume=float(v),
-                        timestamp=datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
+                        volume    = float(v),
+                        timestamp = datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
                     ))
+                # ── Trim OHLCV cache — keep only last 2 candles ────────────
+                try:
+                    cache = self._ex.ohlcvs.get(symbol, {}).get(interval)
+                    if cache and len(cache) > 2:
+                        self._ex.ohlcvs[symbol][interval] = cache[-2:]
+                except Exception:
+                    pass
+                del ohlcvs
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"BinanceFutures candles [{symbol}/{interval}]: {e}")
+                logger.warning("BinanceFutures candles [%s/%s]: %s", symbol, interval, e)
                 await asyncio.sleep(settings.WS_RECONNECT_DELAY)
 
     async def unsubscribe(self, symbol: str) -> None:
         for t in self._ws_tasks.pop(symbol, []):
             t.cancel()
 
-    # ── REST: orders ──────────────────────────────────────────────────────────
+    # ── REST ──────────────────────────────────────────────────────────────────
 
     async def place_order(self, order: Order) -> Order:
         ccxt_type = {
-            'market':     'market',
-            'limit':      'limit',
-            'stop_limit': 'STOP_MARKET',
+            'market': 'market', 'limit': 'limit', 'stop_limit': 'STOP_MARKET',
         }.get(order.order_type, 'market')
         params: dict = {'reduceOnly': False}
         if order.order_type == 'stop_limit' and order.stop_price:
@@ -178,10 +202,9 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             order.status            = self._map_status(r.get('status', ''))
             order.filled_qty        = float(r.get('filled') or 0)
             order.avg_fill_price    = float(r.get('average') or 0) or None
-            logger.info(f"BinanceFutures order placed: {r['id']}")
         except Exception as e:
             order.status = 'rejected'
-            logger.error(f"BinanceFutures place_order error: {e}")
+            logger.error("BinanceFutures place_order error: %s", e)
         return order
 
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> bool:
@@ -189,20 +212,21 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             await self._ex.cancel_order(exchange_order_id, symbol)
             return True
         except Exception as e:
-            logger.error(f"BinanceFutures cancel_order error: {e}")
+            logger.error("BinanceFutures cancel_order error: %s", e)
             return False
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list[Order]:
         try:
-            return [self._parse_order(o) for o in await self._ex.fetch_open_orders(symbol)]
+            return [self._parse_order(o)
+                    for o in await self._ex.fetch_open_orders(symbol)]
         except Exception as e:
-            logger.error(f"BinanceFutures get_open_orders error: {e}")
+            logger.error("BinanceFutures get_open_orders error: %s", e)
             return []
 
     async def get_order(self, exchange_order_id: str, symbol: str) -> Order:
-        return self._parse_order(await self._ex.fetch_order(exchange_order_id, symbol))
-
-    # ── REST: account ─────────────────────────────────────────────────────────
+        return self._parse_order(
+            await self._ex.fetch_order(exchange_order_id, symbol)
+        )
 
     async def get_positions(self) -> list[Position]:
         try:
@@ -223,7 +247,7 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
                 if float(p.get('contracts') or 0)
             ]
         except Exception as e:
-            logger.error(f"BinanceFutures get_positions error: {e}")
+            logger.error("BinanceFutures get_positions error: %s", e)
             return []
 
     async def get_balance(self) -> dict[str, float]:
@@ -232,7 +256,7 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             return {k: float(v['free']) for k, v in bal.items()
                     if isinstance(v, dict) and v.get('free')}
         except Exception as e:
-            logger.error(f"BinanceFutures get_balance error: {e}")
+            logger.error("BinanceFutures get_balance error: %s", e)
             return {}
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
@@ -240,7 +264,7 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             await self._ex.set_leverage(leverage, symbol)
             return True
         except Exception as e:
-            logger.error(f"BinanceFutures set_leverage error: {e}")
+            logger.error("BinanceFutures set_leverage error: %s", e)
             return False
 
     async def set_margin_mode(self, symbol: str, mode: str) -> bool:
@@ -248,14 +272,11 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             await self._ex.set_margin_mode(mode.upper(), symbol)
             return True
         except Exception as e:
-            logger.error(f"BinanceFutures set_margin_mode error: {e}")
+            logger.error("BinanceFutures set_margin_mode error: %s", e)
             return False
 
-    def normalize_symbol(self, raw: str) -> str:
-        return raw
-
-    def to_exchange_symbol(self, canonical: str) -> str:
-        return canonical
+    def normalize_symbol(self, raw: str) -> str:  return raw
+    def to_exchange_symbol(self, canonical: str) -> str: return canonical
 
     async def get_tradable_symbols(self) -> list[str]:
         try:
@@ -263,7 +284,7 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             return [s for s, m in markets.items()
                     if m.get('active') and m.get('type') in ('swap', 'future')]
         except Exception as e:
-            logger.error(f"BinanceFutures get_tradable_symbols error: {e}")
+            logger.error("BinanceFutures get_tradable_symbols error: %s", e)
             return []
 
     def _parse_order(self, r: dict) -> Order:
@@ -282,4 +303,6 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
 
     @staticmethod
     def _map_status(s: str) -> str:
-        return {'open': 'working', 'closed': 'filled', 'canceled': 'cancelled'}.get(s, 'pending')
+        return {'open': 'working', 'closed': 'filled', 'canceled': 'cancelled'}.get(
+            s, 'pending'
+        )

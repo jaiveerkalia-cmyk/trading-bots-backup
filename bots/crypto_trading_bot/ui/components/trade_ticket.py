@@ -37,7 +37,8 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         'qty_mode':     'risk',
     }
     refs     = {}
-    had_pos  = {'v': None}   # None = uninitialised, avoids spurious clear on first tick
+    # Initialise had_pos with sym key to prevent false clears on context changes
+    had_pos  = {'v': None, 'sym': None}
 
     with ui.card().classes(
         f'w-full p-3 bg-gray-900 border border-{accent}-900 rounded-lg'
@@ -141,7 +142,8 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
 
     def update() -> None:
         ltp  = state.get_last_price()
-        mark = state.get_mark_price()
+        max_val = state.get_mark_price() # Keep original logic naming structure via assignment
+        mark = max_val
         if mark or ltp:
             if state.is_futures() and mark and ltp and abs(mark - ltp) > 0.01:
                 price_lbl.set_text(f'Chart: ${ltp:,.2f}  |  Mark: ${mark:,.2f}')
@@ -155,18 +157,24 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
                 and f.get('stop_price', 0) > 0):
             _recalc(f, shared, refs, state)
 
+        cur_key = f"{shared.get('exchange','')}:{shared.get('symbol','')}"
         has_pos = any(
             p.get('side')     == side
             and p.get('symbol')   == shared.get('symbol')
             and p.get('exchange') == shared.get('exchange')
             for p in state.positions
         )
-        if had_pos['v'] is None:
-            had_pos['v'] = has_pos          # first tick — just record, no clear
-        elif not had_pos['v'] and has_pos:  # position just opened
+        
+        # ── Symbol/exchange changed → reset tracking without clearing form ──
+        if had_pos.get('sym') != cur_key:
+            had_pos['sym'] = cur_key
+            had_pos['v']   = has_pos   # re-initialise for new symbol
+        elif had_pos['v'] is None:
+            had_pos['v'] = has_pos
+        elif not had_pos['v'] and has_pos:   # position opened on THIS symbol
             _clear(f, refs)
             had_pos['v'] = True
-        elif had_pos['v'] and not has_pos:  # position just closed
+        elif had_pos['v'] and not has_pos:   # position closed on THIS symbol
             _clear(f, refs)
             had_pos['v'] = False
 
@@ -228,10 +236,12 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
             )
     else:
         if info_lbl:
-            msg = ('Qty: set stop to auto-calculate'
-                   if order_type == 'market' or entry > 0
-                   else 'Qty: set entry + stop to calculate')
-            info_lbl.set_text(msg)
+            if f.get('qty_mode') == 'manual':
+                info_lbl.set_text('')   # manual mode: no auto-calc message
+            elif order_type == 'market' or entry > 0:
+                info_lbl.set_text('Qty: set stop to auto-calculate')
+            else:
+                info_lbl.set_text('Qty: set entry + stop to calculate')
         if fee_lbl: fee_lbl.set_text('')
         if be_lbl:  be_lbl.set_text('')
 
@@ -278,7 +288,8 @@ async def _place(side: str, f: dict, shared: dict,
     if order_type not in ('market',) and entry <= 0:
         ui.notify('Entry / trigger price required', type='negative')
         return
-    if stop <= 0:
+    # Stop required only for auto-qty (risk mode needs it to calculate qty)
+    if stop <= 0 and f.get('qty_mode') == 'risk':
         ui.notify('Stop price is required', type='negative')
         return
 

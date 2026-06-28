@@ -205,6 +205,44 @@ class PaperEngine:
             self._positions[slot_id] = pos
         return pos
 
+    async def add_to_position(self, slot_id: str, order: Order) -> Position:
+        """
+        Scale into an existing paper position.
+        Recalculates weighted-average entry price and accumulates fees.
+        """
+        async with self._lock:
+            pos = self._positions.get(slot_id)
+            if not pos:
+                # No existing position — create fresh
+                return await self.open_position(slot_id, order, order.side)
+
+            rate          = _fee_rate(order.exchange, order.order_type)
+            new_entry_fee = (order.avg_fill_price or 0) * order.filled_qty * rate
+            new_total_qty = pos.qty + order.filled_qty
+
+            # Weighted-average entry
+            new_avg_entry = (
+                pos.entry_price * pos.qty
+                + (order.avg_fill_price or 0) * order.filled_qty
+            ) / new_total_qty
+
+            pos.entry_price    = round(new_avg_entry, 8)
+            pos.qty            = new_total_qty
+            pos.entry_fee_paid += new_entry_fee
+
+            # Recalculate unrealised PnL
+            taker_fee = settings.EXCHANGE_FEES.get(
+                pos.exchange, {'taker': 0.001}
+            )['taker']
+            exit_fee = pos.current_price * pos.qty * taker_fee
+            gross = (
+                (pos.current_price - pos.entry_price) * pos.qty
+                if pos.side == 'long'
+                else (pos.entry_price - pos.current_price) * pos.qty
+            )
+            pos.unrealized_pnl = round(gross - pos.entry_fee_paid - exit_fee, 6)
+            return pos
+        
     async def close_position(self, slot_id: str) -> Optional[Position]:
         async with self._lock:
             return self._positions.pop(slot_id, None)

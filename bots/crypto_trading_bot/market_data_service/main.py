@@ -1,6 +1,8 @@
 """
-Market data service — ticker-only by default to minimise RAM.
-Orderbook / candle subscriptions only on explicit request via control channel.
+Market data service.
+Adapters are connected LAZILY — only when a subscribe command arrives for that
+exchange. This avoids loading ccxt market data for unused exchanges, which is
+the primary cause of high RAM usage (~150-200 MB per exchange instance).
 """
 from __future__ import annotations
 import asyncio
@@ -27,16 +29,14 @@ logger = logging.getLogger('market_data')
 
 CONTROL_CHANNEL = 'market_data:control'
 ACTIVE_SUBS_KEY = 'market_data:active_subs'
-
-# Ticker only — biggest RAM saving: no orderbook objects, no candle objects
-DEFAULT_STREAMS = ['ticker']
+DEFAULT_STREAMS  = ['ticker']
 
 
 async def main() -> None:
     redis = aioredis.from_url(
         f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}",
         decode_responses=True,
-        max_connections=3,          # was 5
+        max_connections=3,
     )
 
     publisher = RedisPublisher(redis)
@@ -44,34 +44,19 @@ async def main() -> None:
 
     keys    = load_keys()
     testnet = os.getenv('TESTNET', '0') == '1'
+
+    # Adapters connected lazily on first subscribe — NOT all upfront
     adapters: dict[str, BaseExchangeAdapter] = {}
+    pending_connect: set[str] = set()   # exchanges currently being connected
 
-    for exchange in settings.SUPPORTED_EXCHANGES:
-        creds = keys.get(exchange, {})
-        try:
-            adapter = get_adapter(
-                exchange   = exchange,
-                api_key    = creds.get('api_key',    ''),
-                api_secret = creds.get('api_secret', ''),
-                testnet    = testnet,
-            )
-            await adapter.connect()
-            adapters[exchange] = adapter
-            logger.info("Connected: %s", exchange)
-        except Exception as e:
-            logger.error("Failed to connect %s: %s", exchange, e)
+    # Announce no exchanges connected yet; updated as they connect lazily
+    await redis.set(redis_keys.CONNECTED_EXCHANGES_KEY, json.dumps([]), ex=60)
 
-    await redis.set(
-        redis_keys.CONNECTED_EXCHANGES_KEY,
-        json.dumps(list(adapters.keys())),
-        ex=60,
-    )
-
-    await _restore_subs(redis, adapters, publisher)
+    await _restore_subs(redis, adapters, pending_connect, publisher, keys, testnet)
 
     try:
         await asyncio.gather(
-            _control_loop(redis, adapters, publisher),
+            _control_loop(redis, adapters, pending_connect, publisher, keys, testnet),
             _heartbeat(redis, adapters),
         )
     except asyncio.CancelledError:
@@ -80,10 +65,48 @@ async def main() -> None:
         await _shutdown(redis, adapters, publisher)
 
 
+async def _ensure_adapter(
+    exchange:        str,
+    adapters:        dict,
+    pending_connect: set,
+    keys:            dict,
+    testnet:         bool,
+) -> BaseExchangeAdapter | None:
+    """Connect adapter for `exchange` on demand; returns None on failure."""
+    if exchange in adapters:
+        return adapters[exchange]
+    if exchange in pending_connect:
+        # Another coroutine is already connecting — wait a bit and retry
+        await asyncio.sleep(2)
+        return adapters.get(exchange)
+
+    pending_connect.add(exchange)
+    creds = keys.get(exchange, {})
+    try:
+        adapter = get_adapter(
+            exchange   = exchange,
+            api_key    = creds.get('api_key',    ''),
+            api_secret = creds.get('api_secret', ''),
+            testnet    = testnet,
+        )
+        await adapter.connect()
+        adapters[exchange] = adapter
+        logger.info("Lazily connected: %s", exchange)
+        return adapter
+    except Exception as e:
+        logger.error("Failed to connect %s: %s", exchange, e)
+        return None
+    finally:
+        pending_connect.discard(exchange)
+
+
 async def _restore_subs(
-    redis: aioredis.Redis,
-    adapters: dict,
-    publisher: RedisPublisher,
+    redis:           aioredis.Redis,
+    adapters:        dict,
+    pending_connect: set,
+    publisher:       RedisPublisher,
+    keys:            dict,
+    testnet:         bool,
 ) -> None:
     members = await redis.smembers(ACTIVE_SUBS_KEY)
     if not members:
@@ -92,12 +115,9 @@ async def _restore_subs(
     for raw in members:
         try:
             sub = json.loads(raw)
-            # Only restore ticker stream on restart to save RAM
-            sub['streams'] = [s for s in sub.get('streams', DEFAULT_STREAMS)
-                              if s == 'ticker']
-            if not sub['streams']:
-                sub['streams'] = DEFAULT_STREAMS
-            await _do_subscribe(sub, adapters, publisher)
+            # Restore only ticker subscriptions to keep RAM low on restart
+            sub['streams'] = ['ticker']
+            await _do_subscribe(sub, adapters, pending_connect, publisher, keys, testnet)
             count += 1
         except Exception as e:
             logger.warning("Failed to restore sub %s: %s", raw, e)
@@ -105,9 +125,12 @@ async def _restore_subs(
 
 
 async def _control_loop(
-    redis: aioredis.Redis,
-    adapters: dict,
-    publisher: RedisPublisher,
+    redis:           aioredis.Redis,
+    adapters:        dict,
+    pending_connect: set,
+    publisher:       RedisPublisher,
+    keys:            dict,
+    testnet:         bool,
 ) -> None:
     pubsub = redis.pubsub()
     await pubsub.subscribe(CONTROL_CHANNEL)
@@ -132,7 +155,10 @@ async def _control_loop(
                             'streams':  cmd.get('streams', DEFAULT_STREAMS),
                         }
                         await redis.sadd(ACTIVE_SUBS_KEY, json.dumps(sub))
-                        await _do_subscribe(sub, adapters, publisher)
+                        await _do_subscribe(
+                            sub, adapters, pending_connect,
+                            publisher, keys, testnet,
+                        )
 
                     elif action == 'unsubscribe':
                         adapter = adapters.get(exchange)
@@ -140,7 +166,8 @@ async def _control_loop(
                             await adapter.unsubscribe(symbol)
                         for raw in await redis.smembers(ACTIVE_SUBS_KEY):
                             s = json.loads(raw)
-                            if s.get('exchange') == exchange and s.get('symbol') == symbol:
+                            if (s.get('exchange') == exchange
+                                    and s.get('symbol') == symbol):
                                 await redis.srem(ACTIVE_SUBS_KEY, raw)
                         logger.info("Unsubscribed: %s %s", exchange, symbol)
 
@@ -160,17 +187,20 @@ async def _control_loop(
 
 
 async def _do_subscribe(
-    sub: dict,
-    adapters: dict,
-    publisher: RedisPublisher,
+    sub:             dict,
+    adapters:        dict,
+    pending_connect: set,
+    publisher:       RedisPublisher,
+    keys:            dict,
+    testnet:         bool,
 ) -> None:
     exchange = sub.get('exchange', '')
     symbol   = sub.get('symbol', '')
     streams  = sub.get('streams', DEFAULT_STREAMS)
-    adapter  = adapters.get(exchange)
 
+    adapter = await _ensure_adapter(exchange, adapters, pending_connect, keys, testnet)
     if not adapter:
-        logger.warning("No adapter for: %s", exchange)
+        logger.warning("No adapter available for: %s", exchange)
         return
 
     for stream in streams:
@@ -189,10 +219,9 @@ async def _do_subscribe(
 
 
 async def _heartbeat(
-    redis: aioredis.Redis,
+    redis:    aioredis.Redis,
     adapters: dict,
 ) -> None:
-    """Refresh connected-exchanges TTL every 30 s. Force GC every 60 s."""
     tick = 0
     while True:
         await asyncio.sleep(30)
@@ -205,8 +234,6 @@ async def _heartbeat(
             )
         except Exception as e:
             logger.error("Heartbeat error: %s", e)
-
-        # Force garbage collection every 60 s to release cyclic refs
         if tick % 2 == 0:
             collected = gc.collect()
             if collected:
@@ -214,8 +241,8 @@ async def _heartbeat(
 
 
 async def _shutdown(
-    redis: aioredis.Redis,
-    adapters: dict,
+    redis:     aioredis.Redis,
+    adapters:  dict,
     publisher: RedisPublisher,
 ) -> None:
     logger.info("Shutting down market data service...")

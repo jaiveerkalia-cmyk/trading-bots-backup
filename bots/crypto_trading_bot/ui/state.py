@@ -80,14 +80,18 @@ class UIState:
     # ── UI preferences persistence ────────────────────────────────────────────
 
     async def load_ui_prefs(self) -> None:
-        """Load chart height, interval, alert sound prefs from Redis."""
+        if self._ui_prefs_loaded:
+            return   # prevent double load (called both from startup and lazy in refresh)
         try:
             raw = await self._redis.get(redis_keys.UI_PREFS_KEY)
             if raw:
                 self.ui_prefs = json.loads(raw)
-                # Sync watch_interval from saved pref
                 if 'chart_interval' in self.ui_prefs:
                     self.watch_interval = self.ui_prefs['chart_interval']
+                if 'watch_exchange' in self.ui_prefs:
+                    self.watch_exchange = self.ui_prefs['watch_exchange']
+                if 'watch_symbol' in self.ui_prefs:
+                    self.watch_symbol = self.ui_prefs['watch_symbol']
                 logger.info("UI prefs loaded: %s", self.ui_prefs)
         except Exception as e:
             logger.error("UI prefs load error: %s", e)

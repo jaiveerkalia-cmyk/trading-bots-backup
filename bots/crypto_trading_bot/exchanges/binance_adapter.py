@@ -13,6 +13,14 @@ from common import settings
 logger = logging.getLogger(__name__)
 
 
+def _trim_markets(ex) -> None:
+    """Drop the heavy 'info' raw dictionary from markets to save memory."""
+    if not getattr(ex, 'markets', None):
+        return
+    for m in ex.markets.values():
+        m.pop('info', None)
+
+
 class BinanceAdapter(BaseExchangeAdapter):
 
     supports_stop_limit   = True
@@ -58,6 +66,10 @@ class BinanceAdapter(BaseExchangeAdapter):
             self._spot.load_markets(),
             self._futures.load_markets(),
         )
+        
+        _trim_markets(self._spot)
+        _trim_markets(self._futures)
+        
         logger.info("Binance connected — spot + futures markets loaded")
 
     async def disconnect(self) -> None:
@@ -95,6 +107,12 @@ class BinanceAdapter(BaseExchangeAdapter):
                 )
                 await cb(tick)
                 del tick, raw   # explicit drop — helps GC in tight loops
+                
+                try:
+                    ex.tickers.pop(symbol, None)
+                except Exception:
+                    pass
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -131,6 +149,12 @@ class BinanceAdapter(BaseExchangeAdapter):
                 )
                 await cb(book)
                 del book        # drop immediately after publish
+                
+                try:
+                    ex.orderbooks.pop(symbol, None)
+                except Exception:
+                    pass
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -162,6 +186,14 @@ class BinanceAdapter(BaseExchangeAdapter):
                         volume=float(v),
                         timestamp=datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
                     ))
+                    
+                try:
+                    cache = ex.ohlcvs.get(symbol, {}).get(interval)
+                    if cache and len(cache) > 2:
+                        ex.ohlcvs[symbol][interval] = cache[-2:]
+                except Exception:
+                    pass
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:

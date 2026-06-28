@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import json
+import logging
 from typing import TYPE_CHECKING
 from nicegui import ui
 import redis.asyncio as aioredis
@@ -10,33 +12,54 @@ if TYPE_CHECKING:
     from ui.state import UIState
 
 
+async def _subscribe_md(redis: aioredis.Redis, exchange: str, symbol: str) -> None:
+    try:
+        await redis.publish('market_data:control', json.dumps({
+            'cmd': 'subscribe', 'exchange': exchange,
+            'symbol': symbol, 'streams': ['ticker'],
+        }))
+    except Exception as e:
+        logging.getLogger('top_bar').warning("MD subscribe: %s", e)
+
+
 def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
     with ui.row().classes(
         'w-full items-center justify-between px-4 py-2 '
         'bg-gray-900 border-b border-gray-700 flex-wrap gap-3'
     ):
         with ui.row().classes('items-center gap-3 flex-wrap'):
-            ui.label('⚡ Crypto Engine').classes(
-                'text-white font-bold text-sm mr-1'
-            )
+            ui.label('⚡ Crypto Engine').classes('text-white font-bold text-sm mr-1')
+
+            # Exchange selector
+            def _on_exchange(e) -> None:
+                exch = e.value
+                shared.update({'exchange': exch})
+                state.watch_exchange = exch
+                asyncio.ensure_future(state.save_ui_prefs({'watch_exchange': exch}))
+                asyncio.ensure_future(_subscribe_md(redis, exch, shared['symbol']))
 
             ui.select(
                 options=settings.SUPPORTED_EXCHANGES,
                 value=shared['exchange'],
-                on_change=lambda e: (
-                    shared.update({'exchange': e.value}),
-                    setattr(state, 'watch_exchange', e.value),
-                ),
+                on_change=_on_exchange,
             ).props('dense dark outlined label=Exchange').classes('w-36')
 
-            sym = ui.input(value=shared['symbol']).props(
+            # Symbol input
+            sym_inp = ui.input(value=shared['symbol']).props(
                 'dense dark outlined label=Symbol'
             ).classes('w-32')
 
-            def on_sym(_):
-                shared['symbol']   = sym.value
-                state.watch_symbol = sym.value
-            sym.on('blur', on_sym)
+            def _apply_symbol() -> None:
+                s = sym_inp.value.strip().upper()
+                if not s:
+                    return
+                shared['symbol']   = s
+                state.watch_symbol = s
+                asyncio.ensure_future(state.save_ui_prefs({'watch_symbol': s}))
+                asyncio.ensure_future(_subscribe_md(redis, shared['exchange'], s))
+
+            sym_inp.on('blur',        lambda _: _apply_symbol())
+            sym_inp.on('keydown.enter', lambda _: _apply_symbol())
 
             ui.number(
                 value=shared['risk_pct'],
@@ -52,7 +75,7 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                 on_change=lambda e: _on_balance_change(e, state, shared),
             ).props('dense dark outlined label="Balance $"').classes('w-28')
 
-            async def reset():
+            async def reset() -> None:
                 state.reset_portfolio()
                 await state.save_portfolio()
                 ui.notify('Portfolio reset ✓', type='positive')
@@ -64,9 +87,7 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
         with ui.row().classes('items-center gap-4'):
             with ui.column().classes('items-end leading-none gap-0'):
                 ui.label('Starting').classes('text-gray-500 text-xs')
-                start_lbl = ui.label('$0').classes(
-                    'text-sm font-mono text-gray-300'
-                )
+                start_lbl = ui.label('$0').classes('text-sm font-mono text-gray-300')
 
             with ui.column().classes('items-end leading-none gap-0'):
                 ui.label('Current').classes('text-gray-500 text-xs')
@@ -74,32 +95,26 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     'text-sm font-mono font-bold text-white'
                 )
 
-            ui.separator().classes('bg-gray-700').style(
-                'width:1px; height:36px;'
-            )
+            ui.separator().classes('bg-gray-700').style('width:1px; height:36px;')
 
             with ui.column().classes('items-end leading-none gap-0'):
                 ui.label('Unrealized').classes('text-gray-500 text-xs')
-                unr = ui.label('$0.00').classes(
-                    'text-base font-mono font-bold text-white'
-                )
+                unr = ui.label('$0.00').classes('text-base font-mono font-bold text-white')
 
             with ui.column().classes('items-end leading-none gap-0'):
                 ui.label('Realized').classes('text-gray-500 text-xs')
-                rel = ui.label('$0.00').classes(
-                    'text-base font-mono font-bold text-white'
-                )
+                rel = ui.label('$0.00').classes('text-base font-mono font-bold text-white')
 
             mode_btn = ui.button('PAPER').props('unelevated').classes(
                 'bg-green-800 text-white text-xs px-4 font-bold'
             )
 
-            async def toggle_mode():
+            async def toggle_mode() -> None:
                 await commands.set_live_mode(redis, not state.live_mode)
 
             mode_btn.on('click', toggle_mode)
 
-    def update():
+    def update() -> None:
         u, r = state.get_display_pnl()
         s    = state.starting_balance
         c    = state.get_current_balance()

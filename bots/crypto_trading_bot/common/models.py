@@ -131,7 +131,7 @@ class TradeSlot(BaseModel):
     created_at:       datetime        = Field(default_factory=datetime.utcnow)
     closed_at:        Optional[datetime] = None
     realized_pnl:     float           = 0.0
-
+    pnl_target:   Optional[float] = None   # close when unrealized PnL reaches this value
 
 # ── Alerts ─────────────────────────────────────────────────────────────────────
 

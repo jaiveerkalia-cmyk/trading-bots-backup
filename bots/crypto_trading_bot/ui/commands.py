@@ -29,7 +29,6 @@ async def delete_alert(redis, alert_id)                    -> None: await _push(
 async def close_all(redis)                                 -> None: await _push(redis, {'type': redis_keys.CMD_CLOSE_ALL})
 async def reset_alerts(redis) -> None: await _push(redis, {'type': redis_keys.CMD_RESET_ALERTS})
 async def set_live_mode(redis, live)                       -> None: await _push(redis, {'type': redis_keys.CMD_SET_LIVE_MODE, 'live': live})
-async def update_slot(redis, slot_id, **kw: Any)           -> None: await _push(redis, {'type': redis_keys.CMD_UPDATE_SLOT, 'slot_id': slot_id, **kw})
 async def modify_order(
     redis, slot_id: str, order_id: str,
     new_price: Optional[float] = None, new_qty: Optional[float] = None,
@@ -41,3 +40,17 @@ async def modify_order(
         'new_price': new_price,
         'new_qty':   new_qty,
     })
+
+_UNSET = object()
+
+async def update_slot(
+    redis, slot_id: str,
+    stop_price   = _UNSET,
+    target_price = _UNSET,
+    pnl_target   = _UNSET,
+) -> None:
+    cmd: dict = {'type': redis_keys.CMD_UPDATE_SLOT, 'slot_id': slot_id}
+    if stop_price   is not _UNSET: cmd['stop_price']   = stop_price
+    if target_price is not _UNSET: cmd['target_price'] = target_price
+    if pnl_target   is not _UNSET: cmd['pnl_target']   = pnl_target
+    await _push(redis, cmd)

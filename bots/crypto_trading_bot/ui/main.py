@@ -1,14 +1,21 @@
 from __future__ import annotations
+import json
 import logging
 import os
+import time
+import uuid as _uuid
 
 import redis.asyncio as aioredis
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response
 from nicegui import app, ui
 
 from ui.state import UIState
-from ui.components import top_bar, trade_ticket, alerts_panel
-from ui.components import positions_table, orders_table, history_table
-from ui.components import pnl_chart, tv_widget, activity_log
+from ui.components import (
+    top_bar, trade_ticket, alerts_panel,
+    positions_table, orders_table, history_table,
+    pnl_chart, tv_widget, activity_log,
+)
 from common import settings
 
 logging.basicConfig(
@@ -20,6 +27,16 @@ logging.basicConfig(
 _redis: aioredis.Redis | None = None
 _state: UIState | None        = None
 
+_TV_STORAGE_PREFIX = 'tv:storage'
+_CORS = {
+    'Access-Control-Allow-Origin':  '*',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age':       '86400',
+}
+
+
+# ── App lifecycle ─────────────────────────────────────────────────────────────
 
 @app.on_startup
 async def startup() -> None:
@@ -29,8 +46,8 @@ async def startup() -> None:
         decode_responses=True, max_connections=5,
     )
     _state = UIState(_redis)
-    # Restore persisted portfolio settings (balance + PnL offset)
     await _state.load_portfolio()
+    await _state.load_ui_prefs()   # ← load eagerly so index() can use saved symbol
 
 
 @app.on_shutdown
@@ -38,6 +55,88 @@ async def shutdown() -> None:
     if _redis:
         await _redis.aclose()
 
+
+# ── TradingView chart storage API ─────────────────────────────────────────────
+# Allows the TradingView widget to save/load drawings, indicators, and layouts.
+# Requests come from TradingView's iframe (origin: tradingview.com).
+
+@app.options('/tv_storage/{rest:path}')
+async def tv_storage_options(rest: str = '') -> Response:
+    return Response(status_code=204, headers=_CORS)
+
+
+@app.get('/tv_storage/{version}/{resource}')
+async def tv_storage_get(
+    version: str, resource: str,
+    client: str = '', user: str = '',
+    chart: str = '', template: str = '',
+) -> JSONResponse:
+    item_id    = chart or template
+    key_prefix = f"{_TV_STORAGE_PREFIX}:{resource}:{client}:{user}"
+
+    if item_id:
+        raw  = await _redis.get(f"{key_prefix}:{item_id}")
+        data = json.loads(raw) if raw else {}
+        return JSONResponse({'status': 'ok', 'data': data}, headers=_CORS)
+
+    # List all saved items for this client/user/resource
+    all_keys = await _redis.keys(f"{key_prefix}:*")
+    items    = []
+    for k in all_keys:
+        raw = await _redis.get(k)
+        if raw:
+            items.append(json.loads(raw))
+    return JSONResponse({'status': 'ok', 'data': items}, headers=_CORS)
+
+
+@app.post('/tv_storage/{version}/{resource}')
+async def tv_storage_post(
+    request: Request,
+    version: str, resource: str,
+    client: str = '', user: str = '',
+    chart: str = '', template: str = '',
+) -> JSONResponse:
+    body    = await request.json()
+    item_id = chart or template or str(_uuid.uuid4())
+    key     = f"{_TV_STORAGE_PREFIX}:{resource}:{client}:{user}:{item_id}"
+    await _redis.set(key, json.dumps({
+        'id':        item_id,
+        'name':      body.get('name', 'Chart'),
+        'timestamp': int(time.time()),
+        'content':   body.get('content', ''),
+        'symbol':    body.get('symbol', ''),
+    }))
+    return JSONResponse({'status': 'ok', 'id': item_id}, headers=_CORS)
+
+
+@app.delete('/tv_storage/{version}/{resource}')
+async def tv_storage_delete(
+    version: str, resource: str,
+    client: str = '', user: str = '',
+    chart: str = '', template: str = '',
+) -> JSONResponse:
+    item_id = chart or template
+    if item_id:
+        key = f"{_TV_STORAGE_PREFIX}:{resource}:{client}:{user}:{item_id}"
+        await _redis.delete(key)
+    return JSONResponse({'status': 'ok'}, headers=_CORS)
+
+
+# ── Market data helper ────────────────────────────────────────────────────────
+
+async def _subscribe_md(exchange: str, symbol: str) -> None:
+    """Tell the market data service to start streaming ticks for exchange+symbol."""
+    if _redis:
+        try:
+            await _redis.publish('market_data:control', json.dumps({
+                'cmd': 'subscribe', 'exchange': exchange,
+                'symbol': symbol, 'streams': ['ticker'],
+            }))
+        except Exception as e:
+            logging.getLogger('ui').warning("MD subscribe error: %s", e)
+
+
+# ── Page ──────────────────────────────────────────────────────────────────────
 
 @ui.page('/')
 async def index() -> None:
@@ -54,25 +153,30 @@ async def index() -> None:
           .q-table tbody tr:hover td { background:#1f2937 !important; }
         </style>
     """)
-
     ui.dark_mode(True)
 
-    # Use persisted balance; default exchange = first in SUPPORTED_EXCHANGES
+    # ── Restore saved exchange/symbol from ui_prefs ───────────────────────────
+    saved_exchange = _state.ui_prefs.get('watch_exchange', settings.SUPPORTED_EXCHANGES[0])
+    saved_symbol   = _state.ui_prefs.get('watch_symbol',   'BTC/USDT')
+
+    _state.watch_exchange = saved_exchange
+    _state.watch_symbol   = saved_symbol
+
     shared: dict = {
-        'exchange': settings.SUPPORTED_EXCHANGES[0],   # binance_futures
-        'symbol':   'BTC/USDT',
+        'exchange': saved_exchange,
+        'symbol':   saved_symbol,
         'risk_pct': settings.DEFAULT_RISK_PCT,
-        'balance':  _state.starting_balance,            # restored from Redis
+        'balance':  _state.starting_balance,
     }
 
-    _state.watch_exchange = shared['exchange']
-    _state.watch_symbol   = shared['symbol']
+    # Ensure ticks flow immediately for the current watch symbol
+    await _subscribe_md(saved_exchange, saved_symbol)
 
-    tb = top_bar.build(_state, _redis, shared)
+    tb   = top_bar.build(_state, _redis, shared)
 
     with ui.element('div').classes('w-full px-3 py-2'):
-        tv  = tv_widget.build(_state, shared)
-        pnl = pnl_chart.build(_state)
+        tv   = tv_widget.build(_state, shared)
+        pnl  = pnl_chart.build(_state)
 
         with ui.row().classes('w-full gap-3 mt-3 mb-3 items-start flex-nowrap'):
             with ui.element('div').classes('flex-1 min-w-0'):
@@ -82,7 +186,7 @@ async def index() -> None:
             with ui.element('div').classes('flex-1 min-w-0'):
                 long_upd = trade_ticket.build('long', _state, _redis, shared)
 
-        al  = activity_log.build(_state)
+        al = activity_log.build(_state)
 
         with ui.element('div').classes('w-full mt-2 flex flex-col gap-3'):
             pos = positions_table.build(_state, _redis)
@@ -101,7 +205,7 @@ async def index() -> None:
             try:
                 fn()
             except Exception as e:
-                logging.getLogger('ui').debug(f"Updater error: {e}")
+                logging.getLogger('ui').debug("Updater error: %s", e)
 
     ui.timer(settings.UI_REFRESH_INTERVAL, refresh)
 

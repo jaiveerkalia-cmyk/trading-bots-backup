@@ -1,7 +1,8 @@
 """
 Open Positions — card layout.
-In-place updates for: mark, PnL, dollar value, qty, fee, funding, max P&L.
-Stop/target/partial-close inputs are DOM-stable between ticks.
+- In-place updates: mark, PnL, $ value, qty, fee, funding, max P&L.
+- Plays ascending tone on position open, descending on close.
+- PnL target input: close position when unrealized PnL hits a set value.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING
@@ -13,19 +14,51 @@ from ui import commands
 if TYPE_CHECKING:
     from ui.state import UIState
 
+# ── Position sounds ───────────────────────────────────────────────────────────
+
+_OPEN_SOUND = """
+(function(){try{
+  var ctx=new(window.AudioContext||window.webkitAudioContext)();
+  var t=ctx.currentTime;
+  [523,659,784].forEach(function(f,i){
+    var o=ctx.createOscillator(),g=ctx.createGain();
+    o.connect(g);g.connect(ctx.destination);
+    o.type='sine';o.frequency.value=f;
+    g.gain.setValueAtTime(0.22,t+i*0.11);
+    g.gain.exponentialRampToValueAtTime(0.001,t+i*0.11+0.22);
+    o.start(t+i*0.11);o.stop(t+i*0.11+0.23);
+  });
+}catch(e){}}())
+"""
+
+_CLOSE_SOUND = """
+(function(){try{
+  var ctx=new(window.AudioContext||window.webkitAudioContext)();
+  var t=ctx.currentTime;
+  [784,659,523].forEach(function(f,i){
+    var o=ctx.createOscillator(),g=ctx.createGain();
+    o.connect(g);g.connect(ctx.destination);
+    o.type='sine';o.frequency.value=f;
+    g.gain.setValueAtTime(0.2,t+i*0.13);
+    g.gain.exponentialRampToValueAtTime(0.001,t+i*0.13+0.28);
+    o.start(t+i*0.13);o.stop(t+i*0.13+0.29);
+  });
+}catch(e){}}())
+"""
+
 
 def build(state: 'UIState', redis: aioredis.Redis) -> dict:
-    # In-place label refs keyed by slot_id
     mark_refs: dict[str, ui.label] = {}
     pnl_refs:  dict[str, ui.label] = {}
     dv_refs:   dict[str, ui.label] = {}
     qty_refs:  dict[str, ui.label] = {}
     fee_refs:  dict[str, ui.label] = {}
     fr_refs:   dict[str, ui.label] = {}
-    mp_refs:   dict[str, ui.label] = {}   # max profit
-    ml_refs:   dict[str, ui.label] = {}   # max loss
+    mp_refs:   dict[str, ui.label] = {}
+    ml_refs:   dict[str, ui.label] = {}
 
-    prev_ids  = {'v': ''}
+    prev_ids       = {'v': ''}
+    sound_state    = {'ids': set(), 'initialized': False}
 
     with ui.column().classes('w-full gap-0'):
         with ui.row().classes('w-full items-center justify-between px-1 mb-2'):
@@ -61,9 +94,10 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                 leverage = int(pos.get('leverage', 1) or 1)
                 fr_raw   = pos.get('funding_rate')
 
-                slot    = state.get_slot(sid)
-                cur_stp = float((slot or {}).get('stop_price')   or 0) or None
-                cur_tgt = float((slot or {}).get('target_price') or 0) or None
+                slot     = state.get_slot(sid)
+                cur_stp  = float((slot or {}).get('stop_price')   or 0) or None
+                cur_tgt  = float((slot or {}).get('target_price') or 0) or None
+                cur_pnlt = float((slot or {}).get('pnl_target')   or 0) or None
 
                 taker    = settings.EXCHANGE_FEES.get(exchange, {'taker': 0.001})['taker']
                 exit_fee = round(mark * qty * taker, 4)
@@ -77,8 +111,6 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                 exch_s   = (exchange.upper()
                             .replace('_FUTURES', '-F').replace('BINANCE', 'BNF'))
                 mode_s   = 'PAPER' if is_paper else 'LIVE'
-
-                # Max profit / loss at current stop & target
                 mp_str, ml_str = _max_pl(entry, cur_stp, cur_tgt, qty, taker, is_long)
 
                 with ui.card().classes(
@@ -101,7 +133,6 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                             f'px-2.5 py-0.5 rounded-md text-xs font-bold '
                             f'tracking-widest {side_bg}'
                         )
-
                         if leverage > 1:
                             ui.label(f'{leverage}x').classes(
                                 'px-1.5 py-0.5 rounded text-xs font-bold '
@@ -110,23 +141,20 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
 
                         ui.element('div').classes('flex-1')
 
-                        # Mark price
                         with ui.column().classes('items-end gap-0 leading-none'):
                             ui.label('Mark').classes('text-gray-500 text-[10px]')
-                            m = ui.label(
-                                f'{mark:,.6g}' if mark else '—'
-                            ).classes('text-yellow-300 font-mono text-sm font-semibold')
+                            m = ui.label(f'{mark:,.6g}' if mark else '—').classes(
+                                'text-yellow-300 font-mono text-sm font-semibold'
+                            )
                             mark_refs[sid] = m
 
-                        # Position $ size
                         with ui.column().classes('items-end gap-0 leading-none'):
                             ui.label('Size $').classes('text-gray-500 text-[10px]')
-                            dv_l = ui.label(
-                                f'${dv:,.2f}'
-                            ).classes('text-gray-200 font-mono text-sm')
+                            dv_l = ui.label(f'${dv:,.2f}').classes(
+                                'text-gray-200 font-mono text-sm'
+                            )
                             dv_refs[sid] = dv_l
 
-                        # uPnL
                         with ui.column().classes('items-end gap-0 leading-none'):
                             ui.label('uPnL').classes('text-gray-500 text-[10px]')
                             p = ui.label(
@@ -140,7 +168,6 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                         'border-t border-gray-700/50 flex-wrap'
                     ):
                         _stat('Entry', f'{entry:g}' if entry else '—')
-
                         with ui.row().classes('items-center gap-1'):
                             ui.label('Qty').classes('text-gray-500')
                             q_l = ui.label(f'{qty:g}').classes(
@@ -149,7 +176,8 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                             qty_refs[sid] = q_l
 
                         if is_fut:
-                            _stat('Liq', f'{liq:g}' if liq else '—', 'text-orange-400')
+                            _stat('Liq', f'{liq:g}' if liq else '—',
+                                  'text-orange-400')
                             with ui.row().classes('items-center gap-1'):
                                 ui.label('Fund').classes('text-gray-500')
                                 fr_l = ui.label(
@@ -172,16 +200,12 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                     ):
                         with ui.row().classes('items-center gap-1'):
                             ui.label('Max Loss').classes('text-gray-500')
-                            ml_l = ui.label(ml_str).classes(
-                                'font-mono text-red-400'
-                            )
+                            ml_l = ui.label(ml_str).classes('font-mono text-red-400')
                             ml_refs[sid] = ml_l
 
                         with ui.row().classes('items-center gap-1'):
                             ui.label('Max Profit').classes('text-gray-500')
-                            mp_l = ui.label(mp_str).classes(
-                                'font-mono text-green-400'
-                            )
+                            mp_l = ui.label(mp_str).classes('font-mono text-green-400')
                             mp_refs[sid] = mp_l
 
                     # ── Row 4: controls ───────────────────────────────────────
@@ -192,10 +216,8 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                         # Stop
                         stp_inp = (
                             ui.number(value=cur_stp, min=0, placeholder='Stop')
-                            .props('dense dark outlined')
-                            .classes('w-28')
+                            .props('dense dark outlined').classes('w-28')
                         )
-
                         async def _set_stop(_e=None, sid=sid, inp=stp_inp):
                             v = float(inp.value) if inp.value else None
                             await commands.update_slot(redis, sid, stop_price=v)
@@ -204,7 +226,6 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                                 type='positive' if v else 'info',
                                 position='bottom-right',
                             )
-
                         ui.button('S', on_click=_set_stop).props(
                             'dense unelevated size=xs'
                         ).classes('bg-orange-900/80 text-orange-300 px-2').tooltip('Set stop')
@@ -212,10 +233,8 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                         # Target
                         tgt_inp = (
                             ui.number(value=cur_tgt, min=0, placeholder='Target')
-                            .props('dense dark outlined')
-                            .classes('w-28')
+                            .props('dense dark outlined').classes('w-28')
                         )
-
                         async def _set_target(_e=None, sid=sid, inp=tgt_inp):
                             v = float(inp.value) if inp.value else None
                             await commands.update_slot(redis, sid, target_price=v)
@@ -224,28 +243,46 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                                 type='positive' if v else 'info',
                                 position='bottom-right',
                             )
-
                         ui.button('T', on_click=_set_target).props(
                             'dense unelevated size=xs'
                         ).classes('bg-blue-900/80 text-blue-300 px-2').tooltip('Set target')
 
+                        # PnL target
+                        pnlt_inp = (
+                            ui.number(
+                                value=cur_pnlt,
+                                placeholder='PnL close',
+                                format='%.4f',
+                            )
+                            .props('dense dark outlined').classes('w-28')
+                            .tooltip('Close position when uPnL reaches this value (can be negative)')
+                        )
+                        async def _set_pnl_target(_e=None, sid=sid, inp=pnlt_inp):
+                            v = float(inp.value) if inp.value is not None else None
+                            await commands.update_slot(redis, sid, pnl_target=v)
+                            ui.notify(
+                                f"PnL target {'cleared' if v is None else f'→ {v:+.4f}'}",
+                                type='positive' if v is not None else 'info',
+                                position='bottom-right',
+                            )
+                        ui.button('P', on_click=_set_pnl_target).props(
+                            'dense unelevated size=xs'
+                        ).classes('bg-teal-900/80 text-teal-300 px-2').tooltip('Set PnL close target')
+
                         ui.element('div').classes('flex-1')
 
-                        # Partial close — input is PERCENT (0–100)
+                        # Partial close (percentage)
                         pct_inp = (
-                            ui.number(
-                                value=None, min=0, max=100,
-                                placeholder='%',
-                            )
-                            .props('dense dark outlined')
-                            .classes('w-20')
+                            ui.number(value=None, min=0, max=100, placeholder='%')
+                            .props('dense dark outlined').classes('w-20')
                         )
 
                         async def _half(_e=None, sid=sid):
-                            await commands.partial_close_slot(redis, sid,
-                                _pct_qty(state, sid, 50.0))
-                            ui.notify('½ close (50%) queued', type='warning',
-                                      position='bottom-right')
+                            qty_ = _pct_qty(state, sid, 50.0)
+                            if qty_ > 0:
+                                await commands.partial_close_slot(redis, sid, qty_)
+                                ui.notify('½ (50%) queued', type='warning',
+                                          position='bottom-right')
 
                         ui.button('½', on_click=_half).props(
                             'dense unelevated size=xs'
@@ -257,12 +294,11 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                             except (ValueError, TypeError):
                                 pct = 0.0
                             if 0 < pct <= 100:
-                                qty = _pct_qty(state, sid, pct)
-                                if qty > 0:
-                                    await commands.partial_close_slot(redis, sid, qty)
+                                qty_ = _pct_qty(state, sid, pct)
+                                if qty_ > 0:
+                                    await commands.partial_close_slot(redis, sid, qty_)
                                     ui.notify(f'Close {pct:g}% queued',
-                                              type='warning',
-                                              position='bottom-right')
+                                              type='warning', position='bottom-right')
                             else:
                                 ui.notify('Enter 1–100%', type='info',
                                           position='bottom-right')
@@ -286,12 +322,26 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
         n = len(state.positions)
         count_lbl.set_text(f'{n} position{"s" if n != 1 else ""}')
 
-        new_ids = '|'.join(p.get('slot_id', '') for p in state.positions)
+        # ── Open / close sounds ───────────────────────────────────────────────
+        cur_ids = {p.get('slot_id', '') for p in state.positions}
+        if sound_state['initialized']:
+            opened = cur_ids - sound_state['ids']
+            closed = sound_state['ids'] - cur_ids
+            if opened:
+                ui.run_javascript(_OPEN_SOUND)
+            if closed:
+                ui.run_javascript(_CLOSE_SOUND)
+        sound_state['ids']         = cur_ids
+        sound_state['initialized'] = True
+
+        # ── DOM rebuild on structural change ──────────────────────────────────
+        new_ids = '|'.join(sorted(cur_ids))
         if new_ids != prev_ids['v']:
             prev_ids['v'] = new_ids
             rows.refresh()
             return
 
+        # ── In-place tick updates ─────────────────────────────────────────────
         for pos in state.positions:
             sid      = pos.get('slot_id', '')
             mark     = float(pos.get('current_price',  0) or 0)
@@ -318,22 +368,17 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
             if sid in fr_refs and fr_raw is not None:
                 fr_refs[sid].set_text(f'{float(fr_raw)*100:.4f}%')
 
-            # Max P&L — recalculate with current stop/target from slot
             slot    = state.get_slot(sid)
             entry   = float(pos.get('entry_price', 0) or 0)
             stp     = float((slot or {}).get('stop_price')   or 0) or None
             tgt     = float((slot or {}).get('target_price') or 0) or None
             is_long = pos.get('side') == 'long'
             mp_str, ml_str = _max_pl(entry, stp, tgt, qty, taker, is_long)
-            if sid in ml_refs:
-                ml_refs[sid].set_text(ml_str)
-            if sid in mp_refs:
-                mp_refs[sid].set_text(mp_str)
+            if sid in ml_refs: ml_refs[sid].set_text(ml_str)
+            if sid in mp_refs: mp_refs[sid].set_text(mp_str)
 
     return {'update': update}
 
-
-# ── Utilities ──────────────────────────────────────────────────────────────────
 
 def _stat(label: str, value: str, value_cls: str = 'text-gray-200') -> None:
     with ui.row().classes('items-center gap-1'):
@@ -341,37 +386,24 @@ def _stat(label: str, value: str, value_cls: str = 'text-gray-200') -> None:
         ui.label(value).classes(f'font-mono {value_cls}')
 
 
-def _max_pl(
-    entry: float,
-    stop:  float | None,
-    tgt:   float | None,
-    qty:   float,
-    taker: float,
-    is_long: bool,
-) -> tuple[str, str]:
-    mp_str = '—'
-    ml_str = '—'
-    if entry <= 0 or qty <= 0:
-        return mp_str, ml_str
-
-    if stop:
-        gross_loss = abs(entry - stop) * qty
-        exit_fee   = stop * qty * taker
-        ml = gross_loss + exit_fee
-        ml_str = f'-${ml:,.4f}'
-
-    if tgt:
-        gross_profit = abs(tgt - entry) * qty
-        exit_fee     = tgt * qty * taker
-        mp = gross_profit - exit_fee
-        mp_str = f'+${mp:,.4f}' if mp > 0 else f'${mp:,.4f}'
-
-    return mp_str, ml_str
-
 def _pct_qty(state, slot_id: str, pct: float) -> float:
-    """Convert a percentage to an absolute qty based on current position size."""
     for p in state.positions:
         if p.get('slot_id') == slot_id:
-            qty = float(p.get('qty', 0) or 0)
-            return round(qty * pct / 100.0, 8)
+            return round(float(p.get('qty', 0) or 0) * pct / 100.0, 8)
     return 0.0
+
+
+def _max_pl(
+    entry: float, stop: float | None, tgt: float | None,
+    qty: float, taker: float, is_long: bool,
+) -> tuple[str, str]:
+    mp_str = ml_str = '—'
+    if entry <= 0 or qty <= 0:
+        return mp_str, ml_str
+    if stop:
+        ml = abs(entry - stop) * qty + stop * qty * taker
+        ml_str = f'-${ml:,.4f}'
+    if tgt:
+        mp = abs(tgt - entry) * qty - tgt * qty * taker
+        mp_str = f'+${mp:,.4f}' if mp > 0 else f'${mp:,.4f}'
+    return mp_str, ml_str

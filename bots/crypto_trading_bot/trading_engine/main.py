@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import redis.asyncio as aioredis
 
@@ -27,9 +28,11 @@ from trading_engine.trigger_engine  import TriggerEngine
 
 logger = logging.getLogger('trading_engine')
 
+_MD_CONTROL = 'market_data:control'
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PnL helpers
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pnl(slot, exit_price: float) -> float:
@@ -41,16 +44,9 @@ def _pnl(slot, exit_price: float) -> float:
     exit_fee_rt  = fees['taker']
     entry        = slot.position.entry_price
     qty          = slot.position.qty
-    gross = (
-        (exit_price - entry) * qty if slot.side == 'long'
-        else (entry - exit_price) * qty
-    )
-    return round(
-        gross
-        - entry      * qty * entry_fee_rt
-        - exit_price * qty * exit_fee_rt,
-        6,
-    )
+    gross        = ((exit_price - entry) * qty if slot.side == 'long'
+                    else (entry - exit_price) * qty)
+    return round(gross - entry * qty * entry_fee_rt - exit_price * qty * exit_fee_rt, 6)
 
 
 def _partial_pnl(slot, exit_price: float, qty: float) -> float:
@@ -61,27 +57,61 @@ def _partial_pnl(slot, exit_price: float, qty: float) -> float:
     entry_fee_rt = fees['maker'] if entry_type == 'limit' else fees['taker']
     exit_fee_rt  = fees['taker']
     entry        = slot.position.entry_price
-    gross = (
-        (exit_price - entry) * qty if slot.side == 'long'
-        else (entry - exit_price) * qty
-    )
-    return round(
-        gross
-        - entry      * qty * entry_fee_rt
-        - exit_price * qty * exit_fee_rt,
-        6,
-    )
+    gross        = ((exit_price - entry) * qty if slot.side == 'long'
+                    else (entry - exit_price) * qty)
+    return round(gross - entry * qty * entry_fee_rt - exit_price * qty * exit_fee_rt, 6)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _ts(dt) -> str:
     if dt is None:
         return datetime.now(timezone.utc).isoformat()
     return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
 
+
+def _build_order(exchange: str, symbol: str, side: str, entry, slot_id: str) -> Order:
+    """Build an Order from an EntryLeg."""
+    if entry.order_type == 'stop_limit':
+        order_price, order_stop = None, entry.price
+    else:
+        order_price = entry.price if (entry.price and entry.price > 0) else None
+        order_stop  = None
+    return Order(
+        exchange        = exchange,
+        symbol          = symbol,
+        side            = 'buy' if side == 'long' else 'sell',
+        order_type      = entry.order_type,
+        qty             = entry.qty,
+        price           = order_price,
+        stop_price      = order_stop,
+        slot_id         = slot_id,
+        reference_price = entry.reference_price,
+    )
+
+
+def _find_existing_position(
+    slot_manager: SlotManager, exchange: str, symbol: str, side: str
+) -> Optional[TradeSlot]:
+    """Return the active slot that already holds an open position for this instrument."""
+    for s in slot_manager.get_active_slots():
+        if s.exchange == exchange and s.symbol == symbol and s.side == side and s.position:
+            return s
+    return None
+
+
+async def _sub_market_data(redis: aioredis.Redis, exchange: str, symbol: str) -> None:
+    """Ensure ticks flow for this exchange+symbol (idempotent)."""
+    try:
+        await redis.publish(_MD_CONTROL, json.dumps({
+            'cmd': 'subscribe', 'exchange': exchange,
+            'symbol': symbol, 'streams': ['ticker'],
+        }))
+    except Exception as e:
+        logger.warning("Market data subscribe error: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def _csv_open(csv_writer, slot_manager, slot, order) -> None:
     cumulative = sum(s.realized_pnl for s in slot_manager.get_all_slots())
@@ -143,63 +173,81 @@ async def _handle(
 ) -> None:
     action = cmd.get('type')
 
-    # ── Open slot ─────────────────────────────────────────────────────────────
+    # ── Open slot / add to position ───────────────────────────────────────────
     if action == redis_keys.CMD_OPEN_SLOT:
         raw_slot = cmd.get('slot', {})
         try:
-            slot = (
-                TradeSlot.model_validate(raw_slot)
-                if isinstance(raw_slot, dict)
-                else raw_slot
-            )
+            new_slot = (TradeSlot.model_validate(raw_slot)
+                        if isinstance(raw_slot, dict) else raw_slot)
         except Exception as exc:
             logger.error("CMD_OPEN_SLOT: invalid slot data: %s", exc)
             return
 
-        slot  = await slot_manager.create_slot(slot)
-        entry = slot.entries[0] if slot.entries else None
+        entry = new_slot.entries[0] if new_slot.entries else None
         if not entry:
             logger.error("CMD_OPEN_SLOT: slot has no entry leg")
             return
 
-        # For stop-market orders: entry.price is the trigger level, not a limit price
-        if entry.order_type == 'stop_limit':
-            order_price      = None
-            order_stop_price = entry.price          # trigger level
-        else:
-            order_price      = entry.price if (entry.price and entry.price > 0) else None
-            order_stop_price = None
-
-        order = Order(
-            exchange        = slot.exchange,
-            symbol          = slot.symbol,
-            side            = 'buy' if slot.side == 'long' else 'sell',
-            order_type      = entry.order_type,
-            qty             = entry.qty,
-            price           = order_price,
-            stop_price      = order_stop_price,
-            slot_id         = slot.id,
-            reference_price = entry.reference_price,
+        # ── Check for existing open position on same side → add to it ────────
+        existing = _find_existing_position(
+            slot_manager, new_slot.exchange, new_slot.symbol, new_slot.side
         )
+
+        if existing:
+            # Place order in the context of the existing slot
+            order = _build_order(
+                existing.exchange, existing.symbol, existing.side,
+                entry, existing.id,
+            )
+            order = await order_manager.place_order(order, existing)
+            existing.orders.append(order)
+
+            if order.status == 'filled':
+                if order.is_paper:
+                    existing.position = await paper_engine.add_to_position(existing.id, order)
+                await slot_manager.update_slot(existing)
+                await _csv_open(csv_writer, slot_manager, existing, order)
+                state_publisher.log(
+                    f"Added to {existing.side} position "
+                    f"{existing.symbol} qty={order.filled_qty:g} "
+                    f"avg_entry={existing.position.entry_price:.6g}",
+                    exchange=existing.exchange, symbol=existing.symbol,
+                )
+            elif order.status in ('open', 'pending', 'working'):
+                # Limit not filled yet — create a temporary tracking slot
+                # (merged into existing position when it fills)
+                new_slot.status = 'working'
+                new_slot = await slot_manager.create_slot(new_slot)
+                order.slot_id   = new_slot.id
+                new_slot.orders.append(order)
+                await slot_manager.update_slot(new_slot)
+                state_publisher.log(
+                    f"Scale-in limit working {new_slot.symbol} @ {entry.price}",
+                    exchange=new_slot.exchange, symbol=new_slot.symbol,
+                )
+            return
+
+        # ── New position ──────────────────────────────────────────────────────
+        slot  = await slot_manager.create_slot(new_slot)
+        order = _build_order(slot.exchange, slot.symbol, slot.side, entry, slot.id)
         order = await order_manager.place_order(order, slot)
         slot.orders.append(order)
 
         if order.status == 'filled':
             slot.status = 'active'
             if order.is_paper:
-                slot.position = await paper_engine.open_position(slot.id, order, slot.side)
-                slot.position.leverage = slot.leverage   # propagate leverage
+                slot.position          = await paper_engine.open_position(slot.id, order, slot.side)
+                slot.position.leverage = slot.leverage
             await _csv_open(csv_writer, slot_manager, slot, order)
         elif order.status in ('open', 'pending', 'working'):
             slot.status = 'working'
 
         await slot_manager.update_slot(slot)
-        
         state_publisher.log(
             f"Open order placed {slot.symbol} ({entry.order_type})",
             exchange=slot.exchange, symbol=slot.symbol,
         )
-        
+
     # ── Full close ────────────────────────────────────────────────────────────
     elif action == redis_keys.CMD_CLOSE_SLOT:
         slot = slot_manager.get_slot(cmd.get('slot_id', ''))
@@ -208,12 +256,9 @@ async def _handle(
         if slot.position:
             entry_price = slot.position.entry_price
             order = Order(
-                exchange   = slot.exchange,
-                symbol     = slot.symbol,
-                side       = 'sell' if slot.side == 'long' else 'buy',
-                order_type = 'market',
-                qty        = slot.position.qty,
-                slot_id    = slot.id,
+                exchange=slot.exchange, symbol=slot.symbol,
+                side='sell' if slot.side == 'long' else 'buy',
+                order_type='market', qty=slot.position.qty, slot_id=slot.id,
             )
             order = await order_manager.place_order(order, slot)
             slot.orders.append(order)
@@ -242,16 +287,12 @@ async def _handle(
         slot = slot_manager.get_slot(cmd.get('slot_id', ''))
         if not slot or not slot.position or qty <= 0:
             return
-
         actual_qty  = min(qty, slot.position.qty)
         entry_price = slot.position.entry_price
         order = Order(
-            exchange   = slot.exchange,
-            symbol     = slot.symbol,
-            side       = 'sell' if slot.side == 'long' else 'buy',
-            order_type = 'market',
-            qty        = actual_qty,
-            slot_id    = slot.id,
+            exchange=slot.exchange, symbol=slot.symbol,
+            side='sell' if slot.side == 'long' else 'buy',
+            order_type='market', qty=actual_qty, slot_id=slot.id,
         )
         order = await order_manager.place_order(order, slot)
         slot.orders.append(order)
@@ -294,12 +335,9 @@ async def _handle(
                 continue
             entry_price = slot.position.entry_price
             order = Order(
-                exchange   = slot.exchange,
-                symbol     = slot.symbol,
-                side       = 'sell' if slot.side == 'long' else 'buy',
-                order_type = 'market',
-                qty        = slot.position.qty,
-                slot_id    = slot.id,
+                exchange=slot.exchange, symbol=slot.symbol,
+                side='sell' if slot.side == 'long' else 'buy',
+                order_type='market', qty=slot.position.qty, slot_id=slot.id,
             )
             order = await order_manager.place_order(order, slot)
             slot.orders.append(order)
@@ -313,15 +351,14 @@ async def _handle(
                 exchange=slot.exchange, symbol=slot.symbol,
             )
 
-    # ── Update slot (stop / target) ───────────────────────────────────────────
+    # ── Update slot ───────────────────────────────────────────────────────────
     elif action == redis_keys.CMD_UPDATE_SLOT:
         slot = slot_manager.get_slot(cmd.get('slot_id', ''))
         if not slot:
             return
-        if 'stop_price' in cmd:
-            slot.stop_price = cmd['stop_price']
-        if 'target_price' in cmd:
-            slot.target_price = cmd['target_price']
+        if 'stop_price'   in cmd: slot.stop_price   = cmd['stop_price']
+        if 'target_price' in cmd: slot.target_price = cmd['target_price']
+        if 'pnl_target'   in cmd: slot.pnl_target   = cmd['pnl_target']
         await slot_manager.update_slot(slot)
         state_publisher.log(
             f"Slot updated {slot.symbol}",
@@ -356,12 +393,11 @@ async def _handle(
     elif action == redis_keys.CMD_SET_ALERT:
         raw_alert = cmd.get('alert', {})
         try:
-            alert = (
-                Alert.model_validate(raw_alert)
-                if isinstance(raw_alert, dict)
-                else raw_alert
-            )
+            alert = (Alert.model_validate(raw_alert)
+                     if isinstance(raw_alert, dict) else raw_alert)
             slot_manager.add_alert(alert)
+            # Subscribe to ticks so LTP checks in TriggerEngine have data
+            await _sub_market_data(redis, alert.exchange, alert.symbol)
             state_publisher.log(
                 f"Alert set {alert.exchange} {alert.symbol}",
                 exchange=alert.exchange, symbol=alert.symbol,
@@ -372,7 +408,11 @@ async def _handle(
     elif action == redis_keys.CMD_DELETE_ALERT:
         slot_manager.delete_alert(cmd.get('alert_id', ''))
 
-    # ── Live mode toggle ──────────────────────────────────────────────────────
+    elif action == redis_keys.CMD_RESET_ALERTS:
+        slot_manager.clear_triggered_alerts()
+        state_publisher.log("Alerts reset")
+
+    # ── Live mode ─────────────────────────────────────────────────────────────
     elif action == redis_keys.CMD_SET_LIVE_MODE:
         live = bool(cmd.get('live', False))
         order_manager.set_live_mode(live)
@@ -381,9 +421,6 @@ async def _handle(
             level='warning' if live else 'info',
         )
 
-    elif action == redis_keys.CMD_RESET_ALERTS:
-        slot_manager.clear_triggered_alerts()
-        state_publisher.log("Alerts reset")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trigger-exit callback
@@ -403,12 +440,9 @@ async def _on_trigger_exit(
         return
     entry_price = slot.position.entry_price
     order = Order(
-        exchange   = slot.exchange,
-        symbol     = slot.symbol,
-        side       = 'sell' if slot.side == 'long' else 'buy',
-        order_type = 'market',
-        qty        = slot.position.qty,
-        slot_id    = slot.id,
+        exchange=slot.exchange, symbol=slot.symbol,
+        side='sell' if slot.side == 'long' else 'buy',
+        order_type='market', qty=slot.position.qty, slot_id=slot.id,
     )
     order = await order_manager.place_order(order, slot)
     slot.orders.append(order)
@@ -446,22 +480,44 @@ async def _paper_fill_checker(
                 price = await paper_engine._last_tick(exchange, symbol)
                 if price <= 0:
                     continue
-                filled_orders = await paper_engine.check_pending_fills(
-                    exchange, symbol, price
-                )
+                filled_orders = await paper_engine.check_pending_fills(exchange, symbol, price)
                 for order in filled_orders:
                     slot = slot_manager.get_slot(order.slot_id)
                     if not slot or slot.status != 'working':
                         continue
-                    slot.status   = 'active'
-                    slot.position = await paper_engine.open_position(slot.id, order, slot.side)  # ← assign
-                    slot.position.leverage = slot.leverage
-                    await slot_manager.update_slot(slot)
-                    await _csv_open(csv_writer, slot_manager, slot, order)
-                    state_publisher.log(
-                        f"Paper limit filled {slot.symbol} @ {order.avg_fill_price}",
-                        exchange=slot.exchange, symbol=slot.symbol,
+
+                    # Check if there's already an active position → merge (scale-in case)
+                    existing = _find_existing_position(
+                        slot_manager, slot.exchange, slot.symbol, slot.side
                     )
+
+                    if existing:
+                        if order.is_paper:
+                            existing.position = await paper_engine.add_to_position(
+                                existing.id, order
+                            )
+                        existing.orders.append(order)
+                        await slot_manager.update_slot(existing)
+                        # Close the tracking slot (it had no position)
+                        await slot_manager.close_slot(slot.id, 0.0)
+                        await _csv_open(csv_writer, slot_manager, existing, order)
+                        state_publisher.log(
+                            f"Scale-in limit filled {existing.symbol} "
+                            f"@ {order.avg_fill_price} "
+                            f"avg_entry={existing.position.entry_price:.6g}",
+                            exchange=existing.exchange, symbol=existing.symbol,
+                        )
+                    else:
+                        slot.status            = 'active'
+                        slot.position          = await paper_engine.open_position(slot.id, order, slot.side)
+                        slot.position.leverage = slot.leverage
+                        await slot_manager.update_slot(slot)
+                        await _csv_open(csv_writer, slot_manager, slot, order)
+                        state_publisher.log(
+                            f"Paper limit filled {slot.symbol} @ {order.avg_fill_price}",
+                            exchange=slot.exchange, symbol=slot.symbol,
+                        )
+
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -470,7 +526,7 @@ async def _paper_fill_checker(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Command loop  ← uses BRPOP on COMMAND_QUEUE (not pub/sub)
+# Command loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _command_loop(
@@ -486,13 +542,11 @@ async def _command_loop(
         try:
             result = await redis.brpop(redis_keys.COMMAND_QUEUE, timeout=1)
             if result is None:
-                continue                  # timeout — loop again
+                continue
             _, raw = result
             cmd = json.loads(raw)
-            await _handle(
-                cmd, slot_manager, order_manager,
-                state_publisher, paper_engine, redis, csv_writer,
-            )
+            await _handle(cmd, slot_manager, order_manager,
+                          state_publisher, paper_engine, redis, csv_writer)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -508,24 +562,20 @@ async def main() -> None:
         level=logging.INFO,
         format='%(asctime)s  %(name)-24s  %(levelname)s  %(message)s',
     )
-
     redis = aioredis.from_url(
         f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}",
-        decode_responses=True,
-        max_connections=20,
+        decode_responses=True, max_connections=20,
     )
-
-    live_mode = os.getenv('LIVE_MODE', 'false').lower() == 'true'
-
-    keys     = load_keys()
+    live_mode     = os.getenv('LIVE_MODE', 'false').lower() == 'true'
+    keys          = load_keys()
     adapters: dict[str, BaseExchangeAdapter] = {}
     for exchange in settings.SUPPORTED_EXCHANGES:
         ex_keys = keys.get(exchange, {})
         try:
             adapters[exchange] = get_adapter(
-                exchange   = exchange,
-                api_key    = ex_keys.get('api_key',    ''),
-                api_secret = ex_keys.get('api_secret', ''),
+                exchange=exchange,
+                api_key=ex_keys.get('api_key', ''),
+                api_secret=ex_keys.get('api_secret', ''),
             )
         except Exception as exc:
             logger.warning("Adapter init skipped [%s]: %s", exchange, exc)
@@ -536,51 +586,39 @@ async def main() -> None:
     state_pub     = StatePublisher(redis, slot_manager)
     notifier      = Notifier()
     order_manager = OrderManager(
-        adapters        = adapters,
-        paper_engine    = paper_engine,
-        csv_writer      = csv_writer,
-        state_publisher = state_pub,
-        live_mode       = live_mode,
+        adapters=adapters, paper_engine=paper_engine,
+        csv_writer=csv_writer, state_publisher=state_pub, live_mode=live_mode,
     )
 
     await csv_writer.start()
     await slot_manager.load()
-
-    # Reconcile only in live mode — adapters are not connected in paper mode
     if live_mode:
         await reconcile(adapters, slot_manager, state_pub)
     else:
         state_pub.log("Paper mode — reconciliation skipped", level='info')
 
     on_exit = lambda slot_id, reason: _on_trigger_exit(
-        slot_id, reason,
-        slot_manager, order_manager, state_pub, csv_writer, notifier,
+        slot_id, reason, slot_manager, order_manager, state_pub, csv_writer, notifier,
     )
-    
-    # Define before TriggerEngine so it closes over state_pub and notifier
+
     async def _on_alert_fired(alert) -> None:
-        price = alert.upper if alert.upper is not None else alert.lower
+        price     = alert.upper if alert.upper is not None else alert.lower
         direction = '▲' if alert.upper is not None else '▼'
         price_str = f"{price:g}" if price is not None else '—'
-        msg = f"[ALERT] {alert.symbol} {direction}{price_str} triggered"
-        state_pub.log(msg, level='warning',
-                      exchange=alert.exchange, symbol=alert.symbol)
+        msg       = f"[ALERT] {alert.symbol} {direction}{price_str} triggered"
+        state_pub.log(msg, level='warning', exchange=alert.exchange, symbol=alert.symbol)
         await notifier.send(msg)
 
     trigger = TriggerEngine(
-        redis_client = redis,
-        slot_manager = slot_manager,
-        on_exit      = on_exit,
-        on_alert     = _on_alert_fired,   # ← was a lambda that never logged
-        paper_engine = paper_engine,
+        redis_client=redis, slot_manager=slot_manager,
+        on_exit=on_exit, on_alert=_on_alert_fired,
+        paper_engine=paper_engine,
     )
-
     await trigger.start()
     await state_pub.start()
 
     asyncio.create_task(_command_loop(
-        redis, slot_manager, order_manager,
-        state_pub, paper_engine, csv_writer,
+        redis, slot_manager, order_manager, state_pub, paper_engine, csv_writer,
     ))
     asyncio.create_task(_paper_fill_checker(
         slot_manager, order_manager, state_pub, csv_writer, paper_engine,
