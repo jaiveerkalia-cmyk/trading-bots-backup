@@ -56,3 +56,4 @@ CMD_CLOSE_ALL      = "close_all"
 CMD_SET_LIVE_MODE  = "set_live_mode"
 CMD_PARTIAL_CLOSE_SLOT = 'partial_close_slot'
 CMD_RESET_ALERTS = 'reset_alerts'
+CMD_CLEAR_ALL_ALERTS = 'clear_all_alerts'

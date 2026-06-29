@@ -94,7 +94,7 @@ class Position(BaseModel):
     is_paper:          bool            = False
     slot_id:           Optional[str]   = None
     opened_at:         datetime        = Field(default_factory=datetime.utcnow)
-
+    funding_pnl:  float = 0.0   # accumulated funding charges (negative = paid out)
 
 # ── Trade slots ────────────────────────────────────────────────────────────────
 

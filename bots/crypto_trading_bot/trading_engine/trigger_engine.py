@@ -75,7 +75,10 @@ class TriggerEngine:
 
             sym_key = f"{slot.exchange}:{slot.symbol}"
             if slot.position.is_paper and sym_key not in updated:
-                await self._paper.update_mark_prices(slot.exchange, slot.symbol, mark)
+                funding = await self._funding_rate(slot.exchange, slot.symbol)
+                await self._paper.update_mark_prices(
+                    slot.exchange, slot.symbol, mark, funding
+                )
                 updated.add(sym_key)
 
             # ── Stop: MARK PRICE ──────────────────────────────────────────
@@ -152,5 +155,15 @@ class TriggerEngine:
                 redis_keys.latest_tick_key(exchange, symbol)
             )
             return float(json.loads(raw).get('p', 0)) if raw else 0.0
+        except Exception:
+            return 0.0
+
+    async def _funding_rate(self, exchange: str, symbol: str) -> float:
+        """Read latest funding rate from tick data."""
+        try:
+            raw = await self._redis.get(
+                redis_keys.latest_tick_key(exchange, symbol)
+            )
+            return float(json.loads(raw).get('fr', 0) or 0) if raw else 0.0
         except Exception:
             return 0.0

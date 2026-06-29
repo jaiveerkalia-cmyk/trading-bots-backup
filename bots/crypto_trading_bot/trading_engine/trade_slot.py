@@ -137,7 +137,10 @@ class SlotManager:
     def delete_alert(self, aid: str)      -> None: self._alerts = [a for a in self._alerts if a.id != aid]
     def get_alerts(self)                  -> list[Alert]: return self._alerts
     def clear_triggered_alerts(self)      -> None: self._alerts = [a for a in self._alerts if not a.triggered]
-
+    def clear_all_alerts(self) -> None:
+        """Remove all alerts (both active and triggered)."""
+        self._alerts.clear()
+        
     async def _pub_market_data(self, slot: TradeSlot, subscribe: bool) -> None:
         cmd = {
             'cmd':      'subscribe' if subscribe else 'unsubscribe',

@@ -23,13 +23,14 @@ def _is_futures(exchange: str) -> bool:
 
 
 class PaperEngine:
-    __slots__ = ('_redis', '_positions', '_pending_limits', '_lock')
+    __slots__ = ('_redis', '_positions', '_pending_limits', '_lock', '_last_funding_dt')
 
     def __init__(self, redis_client: aioredis.Redis):
         self._redis          = redis_client
         self._positions:      dict[str, Position] = {}
         self._pending_limits: list[dict]          = []
         self._lock           = asyncio.Lock()
+        self._last_funding_dt: dict[str, datetime] = {}
 
     async def fill_order(self, order: Order) -> Order:
         if order.order_type == 'market':
@@ -304,45 +305,61 @@ class PaperEngine:
         return self._positions.get(slot_id)
 
     async def update_mark_prices(
-        self, exchange: str, symbol: str, price: float
+        self,
+        exchange:     str,
+        symbol:       str,
+        price:        float,
+        funding_rate: float = 0.0,
     ) -> None:
         """
-        price = mark price for futures (from trigger_engine._price which reads mark_price_key)
-              = last trade price for spot
+        Called every tick. Updates current_price, applies 8-hourly funding charges
+        (Binance Futures rules: longs pay positive funding, shorts receive it),
+        and recalculates unrealized PnL.
         """
-        taker_fee = settings.EXCHANGE_FEES.get(
-            exchange, {'taker': 0.001}
-        )['taker']
-
-        # Also try to get funding rate from tick data
-        funding_rate: Optional[float] = None
-        try:
-            raw = await self._redis.get(
-                redis_keys.latest_tick_key(exchange, symbol)
-            )
-            if raw:
-                d = json.loads(raw)
-                if 'fr' in d:
-                    funding_rate = float(d['fr'])
-        except Exception:
-            pass
-
         async with self._lock:
-            for pos in self._positions.values():
-                if pos.exchange == exchange and pos.symbol == symbol:
-                    pos.current_price = price
-                    exit_fee          = price * pos.qty * taker_fee
-                    gross             = (
-                        (price - pos.entry_price) * pos.qty
-                        if pos.side == 'long'
-                        else (pos.entry_price - price) * pos.qty
+            now          = datetime.now(timezone.utc)
+            # Current 8-hour funding window: 00:00, 08:00, or 16:00 UTC
+            funding_hour = (now.hour // 8) * 8
+            cur_window   = now.replace(
+                hour=funding_hour, minute=0, second=0, microsecond=0
+            )
+            for slot_id, pos in self._positions.items():
+                if pos.exchange != exchange or pos.symbol != symbol:
+                    continue
+                pos.current_price = price
+                # ── Apply funding when entering a new 8-hour window ───────
+                fund_key  = f"{exchange}:{symbol}:{slot_id}"
+                last_fund = self._last_funding_dt.get(fund_key)
+                if (funding_rate != 0 and price > 0 and pos.qty > 0 and
+                        (last_fund is None or cur_window > last_fund)):
+                    notional = pos.qty * price
+                    fee      = notional * abs(funding_rate)
+                    # Binance rule:
+                    # +ve funding_rate → longs pay, shorts receive
+                    # -ve funding_rate → longs receive, shorts pay
+                    if (pos.side == 'long'  and funding_rate > 0) or \
+                       (pos.side == 'short' and funding_rate < 0):
+                        pos.funding_pnl -= round(fee, 8)
+                    else:
+                        pos.funding_pnl += round(fee, 8)
+                    self._last_funding_dt[fund_key] = cur_window
+                    logger.debug(
+                        "Funding [%s %s] side=%s rate=%.4f%% fee=%.4f",
+                        symbol[:8], slot_id[:6], pos.side,
+                        funding_rate * 100, fee,
                     )
-                    # Use stored entry_fee_paid — no recalculation error
-                    pos.unrealized_pnl = round(
-                        gross - pos.entry_fee_paid - exit_fee, 6
-                    )
-                    if funding_rate is not None:
-                        pos.funding_rate = funding_rate
+                # ── Recalculate unrealised PnL ────────────────────────────
+                taker_fee = settings.EXCHANGE_FEES.get(
+                    exchange, {'taker': 0.001}
+                )['taker']
+                exit_fee = price * pos.qty * taker_fee
+                gross = (
+                    (price - pos.entry_price) * pos.qty if pos.side == 'long'
+                    else (pos.entry_price - price) * pos.qty
+                )
+                pos.unrealized_pnl = round(
+                    gross - pos.entry_fee_paid - exit_fee + pos.funding_pnl, 6
+                )
 
     async def _fetch_book(
         self, exchange: str, symbol: str

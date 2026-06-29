@@ -45,6 +45,9 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
     ):
         ui.label(title).classes(f'text-{accent}-400 font-bold text-sm mb-1')
 
+        # Current instrument being traded
+        ctx_lbl = ui.label('').classes('text-gray-500 text-xs font-mono mb-1')
+
         price_lbl = ui.label('—').classes('text-yellow-300 text-xs font-mono mb-2')
         refs['price_lbl'] = price_lbl
 
@@ -141,6 +144,10 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         _recalc(f, shared, refs, state)
 
     def update() -> None:
+        ctx_lbl.set_text(
+            f"{shared.get('exchange','').upper().replace('_FUTURES','-F').replace('BINANCE','BNF')}"
+            f"  ·  {shared.get('symbol','')}"
+        )
         ltp  = state.get_last_price()
         max_val = state.get_mark_price() # Keep original logic naming structure via assignment
         mark = max_val

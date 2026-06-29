@@ -54,3 +54,6 @@ async def update_slot(
     if target_price is not _UNSET: cmd['target_price'] = target_price
     if pnl_target   is not _UNSET: cmd['pnl_target']   = pnl_target
     await _push(redis, cmd)
+
+async def clear_all_alerts(redis) -> None:
+    await _push(redis, {'type': redis_keys.CMD_CLEAR_ALL_ALERTS})
