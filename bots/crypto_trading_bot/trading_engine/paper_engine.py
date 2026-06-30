@@ -36,16 +36,19 @@ class PaperEngine:
         if order.order_type == 'market':
             price = await self._market_fill_price(order)
             return self._do_fill(order, price)
+
         current = await self._reference_price(order.exchange, order.symbol)
-        # was: return self._do_fill(order, order.price or current)
+
         if self._is_fillable(order, current):
-            fill_price = (
-                current                   # stop-market: fill at current price
-                if order.order_type == 'stop_limit'
-                else (order.price or current)   # limit: fill at limit price
-            )
-            return self._do_fill(order, fill_price)
-        # Working limit order
+            # Aggressive / immediately-fillable orders:
+            # Fill at CURRENT market price (not the limit price).
+            # Matches real-exchange behaviour: you get price improvement
+            # when market is already better than your limit.
+            #   BUY  LIMIT 105, market 100 → fills at 100 (not 105)
+            #   SELL LIMIT  95, market 100 → fills at 100 (not  95)
+            return self._do_fill(order, current)
+
+        # Passive limit / stop — place as working order
         order.exchange_order_id = f"PAPER-{order.id[:8]}"
         order.status            = 'working'
         order.updated_at        = datetime.now(timezone.utc)
@@ -55,10 +58,8 @@ class PaperEngine:
                 'exchange': order.exchange,
                 'symbol':   order.symbol,
             })
-        logger.info(
-            f"[PAPER] Limit working: {order.side} {order.qty} "
-            f"{order.symbol} @ {order.price}"
-        )
+        logger.info("[PAPER] Limit working: %s %s %s @ %s",
+                    order.side, order.qty, order.symbol, order.price)
         return order
 
     async def _market_fill_price(self, order: Order) -> float:

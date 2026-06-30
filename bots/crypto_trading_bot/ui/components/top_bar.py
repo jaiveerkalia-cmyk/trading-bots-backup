@@ -128,47 +128,51 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
 
         # ── Watchlist bar ─────────────────────────────────────────────────────
         with ui.row().classes(
-            'w-full px-4 py-1.5 bg-gray-800/60 border-b border-gray-700/40 '
+            'w-full px-4 py-2 bg-gray-800/80 border-b border-gray-700/40 '
             'items-center gap-2 flex-wrap'
         ):
-            ui.label('⭐').classes('text-yellow-500 text-xs')
+            ui.label('⭐').classes('text-yellow-400 text-sm')
             wl_inner = ui.row().classes('flex-1 gap-2 flex-wrap items-center')
 
             async def add_to_watchlist() -> None:
                 wl    = list(state.ui_prefs.get('watchlist', []))
-                entry = {'exchange': shared['exchange'],
-                         'symbol':   shared['symbol']}
+                entry = {'exchange': shared['exchange'], 'symbol': shared['symbol']}
                 if entry not in wl:
                     wl.append(entry)
                     await state.save_ui_prefs({'watchlist': wl})
-                    ui.notify(
-                        f"Added {entry['symbol']}", type='positive',
-                        position='bottom-right',
-                    )
+                    ui.notify(f"★ {entry['symbol']} added",
+                              type='positive', position='bottom-right')
                 else:
                     ui.notify('Already in watchlist', type='info',
                               position='bottom-right')
 
-            ui.button(icon='add', on_click=add_to_watchlist).props(
-                'flat dense size=xs'
-            ).classes('text-yellow-400').tooltip('Add current symbol to watchlist')
+            ui.button(icon='add_circle_outline', on_click=add_to_watchlist).props(
+                'flat dense size=sm'
+            ).classes('text-yellow-400').tooltip('Add current symbol')
 
     def _render_watchlist() -> None:
         wl_inner.clear()
         with wl_inner:
-            for item in state.ui_prefs.get('watchlist', []):
+            wl = state.ui_prefs.get('watchlist', [])
+            if not wl:
+                ui.label('Add symbols with ⭐').classes('text-gray-600 text-xs italic')
+                return
+            
+            for item in wl:
                 exch = item.get('exchange', '')
                 sym  = item.get('symbol', '')
-                exch_s = exch.upper().replace('_FUTURES', '-F').replace('BINANCE', 'BNF')
-                label  = f"{exch_s}:{sym.replace('/', '')}"
-
+                exch_s = (exch.upper()
+                          .replace('_FUTURES', '-F').replace('BINANCE', 'BNF'))
+                label  = f"{exch_s}  {sym.replace('/','')}"
+                
                 is_active = (exch == shared.get('exchange') and
                              sym  == shared.get('symbol'))
-                chip_cls = (
-                    'bg-yellow-800/80 text-yellow-200' if is_active
-                    else 'bg-gray-700/60 text-gray-300 hover:bg-gray-600/60'
-                )
-
+                
+                # Show price if available
+                pk   = f"{exch}:{sym}"
+                price = state.mark_prices.get(pk) or state.last_prices.get(pk, 0)
+                price_str = f"${price:,.2f}" if price else ''
+                
                 async def _switch(e=exch, s=sym) -> None:
                     shared['exchange']   = e
                     shared['symbol']     = s
@@ -178,21 +182,40 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                         state.save_ui_prefs({'watch_exchange': e, 'watch_symbol': s})
                     )
                     asyncio.ensure_future(_subscribe_md(redis, e, s))
+                    
+                async def _remove(e=exch, s=sym) -> None:
+                    new_wl = [x for x in state.ui_prefs.get('watchlist', [])
+                              if not (x.get('exchange') == e and x.get('symbol') == s)]
+                    await state.save_ui_prefs({'watchlist': new_wl})
 
-                with ui.row().classes('items-center gap-0'):
-                    ui.button(label, on_click=_switch).props(
-                        'dense flat size=xs'
-                    ).classes(f'text-xs font-mono px-2 rounded {chip_cls}')
+                # Card-style chip
+                if is_active:
+                    card_cls = ('bg-yellow-400 shadow-md '
+                                'border-2 border-yellow-300')
+                    label_cls = 'text-gray-900 font-bold text-sm'
+                    price_cls = 'text-gray-700 text-xs font-mono'
+                    close_cls = 'text-gray-600'
+                else:
+                    card_cls  = ('bg-white/10 border border-gray-500 '
+                                 'hover:bg-white/20 cursor-pointer')
+                    label_cls = 'text-white font-semibold text-sm'
+                    price_cls = 'text-gray-300 text-xs font-mono'
+                    close_cls = 'text-gray-500'
 
-                    async def _remove(e=exch, s=sym) -> None:
-                        new_wl = [x for x in state.ui_prefs.get('watchlist', [])
-                                  if not (x.get('exchange') == e and
-                                          x.get('symbol') == s)]
-                        await state.save_ui_prefs({'watchlist': new_wl})
-
+                with ui.row().classes(
+                    f'items-center gap-1 rounded-lg px-3 py-1.5 '
+                    f'{card_cls} transition-all'
+                ):
+                    with ui.column().classes('gap-0 leading-none cursor-pointer',
+                                            ).on('click', _switch):
+                        ui.label(label).classes(label_cls)
+                        if price_str:
+                            ui.label(price_str).classes(price_cls)
+                            
                     ui.button(icon='close', on_click=_remove).props(
                         'flat round dense size=xs'
-                    ).classes('text-gray-600 w-4 h-4')
+                    ).classes(f'{close_cls} w-5 h-5 ml-1')
+
 
     def update() -> None:
         u, r = state.get_display_pnl()

@@ -55,58 +55,67 @@ class UIState:
     # ── Portfolio persistence ─────────────────────────────────────────────────
 
     async def load_portfolio(self) -> None:
-        try:
-            raw = await self._redis.get(_PORTFOLIO_KEY)
-            if raw:
-                d = json.loads(raw)
-                self.starting_balance = float(d.get('starting_balance', 10000.0))
-                self.pnl_offset       = float(d.get('pnl_offset',       0.0))
-                logger.info(
-                    "Portfolio loaded: balance=%s offset=%s",
-                    self.starting_balance, self.pnl_offset,
-                )
-        except Exception as e:
-            logger.error("Portfolio load error: %s", e)
+        _backup = settings.STATE_DIR / 'ui_portfolio.json'
+        raw = await self._redis.get('ui:portfolio')
+        if not raw and _backup.exists():
+            try:
+                raw = _backup.read_text(encoding='utf-8')
+                if raw:
+                    await self._redis.set('ui:portfolio', raw)
+            except Exception as e:
+                logger.error("Portfolio file restore: %s", e)
+        if raw:
+            d = json.loads(raw)
+            self.starting_balance = float(d.get('starting_balance', 10000.0))
+            self.pnl_offset       = float(d.get('pnl_offset', 0.0))
 
     async def save_portfolio(self) -> None:
+        data    = json.dumps({'starting_balance': self.starting_balance,
+                              'pnl_offset': self.pnl_offset})
+        _backup = settings.STATE_DIR / 'ui_portfolio.json'
         try:
-            await self._redis.set(_PORTFOLIO_KEY, json.dumps({
-                'starting_balance': self.starting_balance,
-                'pnl_offset':       self.pnl_offset,
-            }))
+            await self._redis.set('ui:portfolio', data)
         except Exception as e:
-            logger.error("Portfolio save error: %s", e)
+            logger.error("Portfolio Redis save: %s", e)
+        try:
+            _backup.write_text(data, encoding='utf-8')
+        except Exception as e:
+            logger.error("Portfolio file save: %s", e)
 
     # ── UI preferences persistence ────────────────────────────────────────────
 
     async def load_ui_prefs(self) -> None:
         if self._ui_prefs_loaded:
-            return   # prevent double load (called both from startup and lazy in refresh)
-        try:
-            raw = await self._redis.get(redis_keys.UI_PREFS_KEY)
-            if raw:
-                self.ui_prefs = json.loads(raw)
-                if 'chart_interval' in self.ui_prefs:
-                    self.watch_interval = self.ui_prefs['chart_interval']
-                if 'watch_exchange' in self.ui_prefs:
-                    self.watch_exchange = self.ui_prefs['watch_exchange']
-                if 'watch_symbol' in self.ui_prefs:
-                    self.watch_symbol = self.ui_prefs['watch_symbol']
-                logger.info("UI prefs loaded: %s", self.ui_prefs)
-        except Exception as e:
-            logger.error("UI prefs load error: %s", e)
+            return
+        _backup = settings.STATE_DIR / 'ui_prefs.json'
+        raw = await self._redis.get(redis_keys.UI_PREFS_KEY)
+        if not raw and _backup.exists():
+            try:
+                raw = _backup.read_text(encoding='utf-8')
+                if raw:
+                    await self._redis.set(redis_keys.UI_PREFS_KEY, raw)
+                    logger.info("UI prefs restored from file backup")
+            except Exception as e:
+                logger.error("UI prefs file restore: %s", e)
+        if raw:
+            self.ui_prefs = json.loads(raw)
+            if 'chart_interval'  in self.ui_prefs: self.watch_interval  = self.ui_prefs['chart_interval']
+            if 'watch_exchange'  in self.ui_prefs: self.watch_exchange  = self.ui_prefs['watch_exchange']
+            if 'watch_symbol'    in self.ui_prefs: self.watch_symbol    = self.ui_prefs['watch_symbol']
         self._ui_prefs_loaded = True
 
     async def save_ui_prefs(self, prefs: dict) -> None:
-        """Merge new keys into UI prefs and persist to Redis."""
         self.ui_prefs.update(prefs)
+        data    = json.dumps(self.ui_prefs)
+        _backup = settings.STATE_DIR / 'ui_prefs.json'
         try:
-            await self._redis.set(
-                redis_keys.UI_PREFS_KEY,
-                json.dumps(self.ui_prefs),
-            )
+            await self._redis.set(redis_keys.UI_PREFS_KEY, data)
         except Exception as e:
-            logger.error("UI prefs save error: %s", e)
+            logger.error("UI prefs Redis save: %s", e)
+        try:
+            _backup.write_text(data, encoding='utf-8')
+        except Exception as e:
+            logger.error("UI prefs file save: %s", e)
 
     # ── Refresh ───────────────────────────────────────────────────────────────
 

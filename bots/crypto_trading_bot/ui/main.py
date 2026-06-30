@@ -35,6 +35,14 @@ _CORS = {
     'Access-Control-Max-Age':       '86400',
 }
 
+_TV_LAYOUT_PREFIX = 'tv:layout'
+_TV_LAYOUT_DIR     = settings.STATE_DIR / 'tv_layouts'
+_TV_LAYOUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def _layout_file(exchange: str, symbol: str):
+    safe = f"{exchange}__{symbol.replace('/', '_')}.json"
+    return _TV_LAYOUT_DIR / safe
+
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 
@@ -120,6 +128,54 @@ async def tv_storage_delete(
         key = f"{_TV_STORAGE_PREFIX}:{resource}:{client}:{user}:{item_id}"
         await _redis.delete(key)
     return JSONResponse({'status': 'ok'}, headers=_CORS)
+
+
+@app.get('/tv_layout')
+async def tv_layout_get(exchange: str = '', symbol: str = '') -> JSONResponse:
+    """Returns the saved chart layout (drawings/indicators/settings) for exchange+symbol."""
+    if not exchange or not symbol:
+        return JSONResponse({'content': None}, status_code=400)
+        
+    key = f"{_TV_LAYOUT_PREFIX}:{exchange}:{symbol}"
+    raw = await _redis.get(key)
+    
+    if not raw:
+        path = _layout_file(exchange, symbol)
+        if path.exists():
+            try:
+                raw = path.read_text(encoding='utf-8')
+                if raw:
+                    await _redis.set(key, raw)
+            except Exception as e:
+                logging.getLogger('ui').error("TV layout file restore: %s", e)
+                
+    if not raw:
+        return JSONResponse({'content': None})
+        
+    return JSONResponse({'content': json.loads(raw)})
+
+
+@app.post('/tv_layout')
+async def tv_layout_post(request: Request, exchange: str = '', symbol: str = '') -> JSONResponse:
+    """Saves the chart layout state (full widget.save() output) for exchange+symbol."""
+    if not exchange or not symbol:
+        return JSONResponse({'status': 'error'}, status_code=400)
+        
+    body = await request.json()
+    key  = f"{_TV_LAYOUT_PREFIX}:{exchange}:{symbol}"
+    data = json.dumps(body)
+    
+    try:
+        await _redis.set(key, data)
+    except Exception as e:
+        logging.getLogger('ui').error("TV layout Redis save: %s", e)
+        
+    try:
+        _layout_file(exchange, symbol).write_text(data, encoding='utf-8')
+    except Exception as e:
+        logging.getLogger('ui').error("TV layout file save: %s", e)
+        
+    return JSONResponse({'status': 'ok'})
 
 
 # ── Market data helper ────────────────────────────────────────────────────────

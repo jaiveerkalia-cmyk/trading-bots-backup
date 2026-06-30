@@ -79,6 +79,7 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
         'duration': float(state.ui_prefs.get('alert_dur', 3.0)),
     }
     prev_triggered: set[str] = set()
+    period_ref = {'v': 'current'}   # shared between upper and lower set functions
 
     def _save_sound() -> None:
         asyncio.ensure_future(state.save_ui_prefs({
@@ -87,108 +88,96 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
             'alert_dur':     sound_cfg['duration'],
         }))
 
-    with ui.card().classes(
-        'w-full p-3 bg-gray-900 border border-yellow-900/50 rounded-lg'
-    ):
+    with ui.card().classes('w-full p-3 bg-gray-900 border border-yellow-900/50 rounded-lg'):
         ui.label('Alerts').classes('text-yellow-400 font-bold text-sm mb-2')
 
-        # ── Upper alert (independent) ─────────────────────────────────────────
+        # Period selector (shared for both upper and lower)
+        with ui.row().classes('w-full mb-2'):
+            ui.select(
+                {'current': 'Live Price', '1m': '1m Candle Close', '5m': '5m Candle Close'},
+                value='current', label='Fire on',
+                on_change=lambda e: period_ref.update({'v': e.value}),
+            ).props('dense dark outlined').classes('w-full')
+
+        # Upper alert
         with ui.row().classes('w-full gap-2 items-end mb-2'):
-            upper_inp = (
-                ui.number(label='Upper ▲', value=None, min=0, format='%.4f')
-                .props('dense dark outlined').classes('flex-1')
-            )
+            upper_inp = (ui.number(label='Upper ▲', value=None, min=0, format='%.4f')
+                         .props('dense dark outlined').classes('flex-1'))
 
             async def set_upper() -> None:
                 v = float(upper_inp.value) if upper_inp.value else None
                 if not v:
-                    ui.notify('Enter upper price', type='warning',
-                              position='bottom-right')
+                    ui.notify('Enter upper price', type='warning', position='bottom-right')
                     return
                 await commands.set_alert(redis, {
                     'exchange': shared.get('exchange', 'binance_futures'),
                     'symbol':   shared.get('symbol',   'BTC/USDT'),
-                    'upper':    v,
-                    'lower':    None,
-                    'period':   'current',
+                    'upper': v, 'lower': None,
+                    'period': period_ref['v'],
                 })
                 upper_inp.set_value(None)
-                ui.notify(f'Upper ▲{v:g} set', type='positive',
-                          position='bottom-right')
+                ui.notify(f"Upper ▲{v:g} ({period_ref['v']}) set",
+                          type='positive', position='bottom-right')
 
-            ui.button('Set ▲', on_click=set_upper).props(
-                'dense unelevated'
-            ).classes('bg-green-800 text-white text-xs px-3')
-
-        # ── Lower alert (independent) ─────────────────────────────────────────
-        with ui.row().classes('w-full gap-2 items-end mb-3'):
-            lower_inp = (
-                ui.number(label='Lower ▼', value=None, min=0, format='%.4f')
-                .props('dense dark outlined').classes('flex-1')
+            ui.button('Set ▲', on_click=set_upper).props('dense unelevated').classes(
+                'bg-green-800 text-white text-xs px-3'
             )
+
+        # Lower alert
+        with ui.row().classes('w-full gap-2 items-end mb-3'):
+            lower_inp = (ui.number(label='Lower ▼', value=None, min=0, format='%.4f')
+                         .props('dense dark outlined').classes('flex-1'))
 
             async def set_lower() -> None:
                 v = float(lower_inp.value) if lower_inp.value else None
                 if not v:
-                    ui.notify('Enter lower price', type='warning',
-                              position='bottom-right')
+                    ui.notify('Enter lower price', type='warning', position='bottom-right')
                     return
                 await commands.set_alert(redis, {
                     'exchange': shared.get('exchange', 'binance_futures'),
                     'symbol':   shared.get('symbol',   'BTC/USDT'),
-                    'upper':    None,
-                    'lower':    v,
-                    'period':   'current',
+                    'upper': None, 'lower': v,
+                    'period': period_ref['v'],
                 })
                 lower_inp.set_value(None)
-                ui.notify(f'Lower ▼{v:g} set', type='positive',
-                          position='bottom-right')
+                ui.notify(f"Lower ▼{v:g} ({period_ref['v']}) set",
+                          type='positive', position='bottom-right')
 
-            ui.button('Set ▼', on_click=set_lower).props(
-                'dense unelevated'
-            ).classes('bg-red-800 text-white text-xs px-3')
+            ui.button('Set ▼', on_click=set_lower).props('dense unelevated').classes(
+                'bg-red-800 text-white text-xs px-3'
+            )
 
-        # ── Sound settings ────────────────────────────────────────────────────
+        # Sound settings
         with ui.row().classes('w-full items-center gap-2 mb-1 flex-wrap'):
             ui.switch('Sound', value=sound_cfg['enabled'],
-                      on_change=lambda e: (
-                          sound_cfg.update({'enabled': e.value}), _save_sound()
-                      )).props('dense dark').classes('text-xs text-gray-400')
-
-            ui.select(list(_SOUND_BODIES.keys()), value=sound_cfg['name'],
-                      label='Sound',
-                      on_change=lambda e: (
-                          sound_cfg.update({'name': e.value}), _save_sound()
-                      )).props('dense dark outlined').classes('w-24 text-xs')
-
-            ui.number(label='Dur(s)', value=sound_cfg['duration'],
-                      min=0.5, max=30, step=0.5,
-                      on_change=lambda e: (
-                          sound_cfg.update({'duration': float(e.value or 3)}),
-                          _save_sound()
-                      )).props('dense dark outlined').classes('w-20 text-xs')
-
+                      on_change=lambda e: (sound_cfg.update({'enabled': e.value}), _save_sound())
+                      ).props('dense dark').classes('text-xs text-gray-400')
+            ui.select(list(_SOUND_BODIES.keys()), value=sound_cfg['name'], label='Sound',
+                      on_change=lambda e: (sound_cfg.update({'name': e.value}), _save_sound())
+                      ).props('dense dark outlined').classes('w-24 text-xs')
+            ui.number(label='Dur(s)', value=sound_cfg['duration'], min=0.5, max=30, step=0.5,
+                      on_change=lambda e: (sound_cfg.update({'duration': float(e.value or 3)}), _save_sound())
+                      ).props('dense dark outlined').classes('w-20 text-xs')
             ui.button(icon='volume_up',
-                      on_click=lambda: _play(sound_cfg['name'],
-                                             sound_cfg['duration'])
+                      on_click=lambda: _play(sound_cfg['name'], sound_cfg['duration'])
                       ).props('flat round dense size=xs').classes('text-yellow-400')
 
         ui.separator().classes('bg-gray-700 mb-2')
 
-        # ── Active alerts list ────────────────────────────────────────────────
         with ui.row().classes('w-full items-center justify-between mb-1'):
-            ui.label('Active').classes(
-                'text-gray-500 text-xs uppercase tracking-wider'
-            )
+            ui.label('Active').classes('text-gray-500 text-xs uppercase tracking-wider')
 
             async def reset_all() -> None:
-                # Clear ALL alerts and reset input fields
+                # Pre-populate prev_triggered with ALL existing alert IDs
+                # (both triggered and active) BEFORE clearing, so no sound plays
+                for alert in state.alerts:
+                    aid = alert.get('id', '')
+                    if aid:
+                        prev_triggered.add(aid)
                 await commands.clear_all_alerts(redis)
-                prev_triggered.clear()
                 upper_inp.set_value(None)
                 lower_inp.set_value(None)
-                ui.notify('All alerts cleared', type='info',
-                          position='bottom-right')
+                ui.notify('All alerts cleared', type='info', position='bottom-right')
 
             ui.button('Clear All', on_click=reset_all).props(
                 'flat dense size=xs unelevated'
@@ -197,6 +186,10 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
         alerts_container = ui.column().classes('w-full gap-1')
 
     def update() -> None:
+        # Keep prev_triggered in sync — remove IDs no longer in state
+        current_ids = {a.get('id', '') for a in state.alerts}
+        prev_triggered.intersection_update(current_ids)
+
         if sound_cfg['enabled']:
             for alert in state.alerts:
                 aid = alert.get('id', '')
@@ -211,25 +204,23 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                 ui.label('No active alerts').classes('text-gray-600 text-xs')
                 return
             for alert in active:
-                with ui.row().classes(
-                    'w-full items-center justify-between py-0.5'
-                ):
-                    sym = alert.get('symbol', '')
-                    exch = alert.get('exchange', '').upper() \
-                               .replace('_FUTURES', '-F').replace('BINANCE', 'BNF')
+                with ui.row().classes('w-full items-center justify-between py-0.5'):
+                    sym  = alert.get('symbol', '')
+                    exch = (alert.get('exchange', '').upper()
+                            .replace('_FUTURES', '-F').replace('BINANCE', 'BNF'))
+                    per  = alert.get('period', 'current')
                     u, l = alert.get('upper'), alert.get('lower')
                     parts = [f"{exch}:{sym}"]
                     if u: parts.append(f'▲{u:g}')
                     if l: parts.append(f'▼{l:g}')
-                    ui.label('  '.join(parts)).classes(
-                        'text-xs text-yellow-300 font-mono'
-                    )
+                    if per != 'current': parts.append(f'[{per}]')
+                    ui.label('  '.join(parts)).classes('text-xs text-yellow-300 font-mono')
 
                     async def del_alert(aid=alert.get('id', '')) -> None:
+                        prev_triggered.discard(aid)
                         await commands.delete_alert(redis, aid)
 
                     ui.button(icon='close', on_click=del_alert).props(
-                        'flat round dense size=xs'
-                    ).classes('text-gray-500')
+                        'flat round dense size=xs').classes('text-gray-500')
 
     return {'update': update}

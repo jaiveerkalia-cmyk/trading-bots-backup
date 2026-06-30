@@ -7,16 +7,15 @@ load_dotenv()
 
 IST = ZoneInfo('Asia/Kolkata')
 
-BASE_DIR            = Path(__file__).resolve().parent.parent   # ← was dropped by edit
-DATA_DIR            = BASE_DIR / 'data'
-TRADES_DIR          = DATA_DIR / 'trades'        # kept for backward compat
-DAILY_PNL_DIR       = DATA_DIR / 'daily_pnl'    # kept for backward compat
-PORTFOLIO_DIR       = DATA_DIR / 'portfolio'     # unified daily CSV
-STATE_SNAPSHOTS_DIR = DATA_DIR / 'state_snapshots'
-CONFIG_DIR          = BASE_DIR / 'config'
-KEYS_FILE           = CONFIG_DIR / 'exchange_keys.enc'
+BASE_DIR      = Path(__file__).resolve().parent.parent
+DATA_DIR      = BASE_DIR / 'data'
+TRADES_DIR    = DATA_DIR / 'trades'       # single trades.csv
+PORTFOLIO_DIR = DATA_DIR / 'portfolio'    # single portfolio.csv
+STATE_DIR     = DATA_DIR / 'state'        # file-based backup (survives Redis wipe)
+CONFIG_DIR    = BASE_DIR / 'config'
+KEYS_FILE     = CONFIG_DIR / 'exchange_keys.enc'
 
-for _d in (TRADES_DIR, DAILY_PNL_DIR, PORTFOLIO_DIR, STATE_SNAPSHOTS_DIR):
+for _d in (TRADES_DIR, PORTFOLIO_DIR, STATE_DIR, CONFIG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -38,13 +37,12 @@ CANDLE_INTERVALS        = ['1m', '5m', '15m', '1h', '4h', '1d']
 CHART_INTERVALS         = ['1m', '5m', '15m', '1h']
 DEFAULT_ORDERBOOK_DEPTH = 20
 
-MARKET_DATA_QUEUE_SIZE = 10   # was 100 — only ticker subscribed now
+MARKET_DATA_QUEUE_SIZE = 50
 COMMAND_QUEUE_SIZE     = 50
 
 PNL_CHART_POINTS   = 1440
 PNL_CHART_INTERVAL = 60
 
-# binance_futures first so it is the default selection
 SUPPORTED_EXCHANGES = ['binance_futures', 'binance', 'delta']
 
 EXCHANGE_FEES = {

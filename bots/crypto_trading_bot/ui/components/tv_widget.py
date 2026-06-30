@@ -1,17 +1,17 @@
 """
 TradingView chart widget.
 
-Drawings & indicator persistence:
-  - The free TradingView embed widget saves drawings to the user's TradingView
-    account when logged in, or to browser localStorage when not logged in.
-  - We never destroy the widget once created — setSymbol() is used for symbol
-    switches, so drawings always survive in-session.
-  - A 3-second creation guard prevents double-init (NiceGUI reconnect races).
-  - Height and interval are persisted to Redis via state.ui_prefs.
+Layout persistence (no login required):
+  The free embeddable widget exposes widget.save(callback)/widget.load(state)
+  as plain JS instance methods — these work without any TradingView account
+  or chartsStorageUrl backend. We capture the state object on save() and POST
+  it to our own /tv_layout endpoint (Redis + file backup), keyed by
+  exchange+symbol. On chart ready and on every symbol switch we fetch and
+  load the matching saved layout, and we save the OLD symbol's layout right
+  before switching away from it.
 
-Favorites:
-  - Stored in state.ui_prefs['favorites'] → Redis.
-  - Quick-switch chips shown below the header.
+Height/interval/favorites/watchlist persist via state.ui_prefs (separate
+mechanism, unrelated to chart drawings).
 """
 from __future__ import annotations
 import asyncio
@@ -40,39 +40,98 @@ def _tv_symbol(exchange: str, symbol: str) -> str:
     return sym
 
 
-def _init_js(tv_symbol: str, interval: str) -> str:
+# ── JS: save/load helpers (installed once on window) ────────────────────────
+
+_JS_HELPERS = """
+window._tvSaveLayout = function(exchange, symbol, silent) {
+    if (!window._tvWidget || !window._tvWidgetReady) return;
+    try {
+        window._tvWidget.save(function(state) {
+            fetch('/tv_layout?exchange=' + encodeURIComponent(exchange) +
+                  '&symbol=' + encodeURIComponent(symbol), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(state)
+            }).catch(function(e){ console.warn('[TV] save POST failed', e); });
+        });
+    } catch(e) { console.warn('[TV] save() failed', e); }
+};
+
+window._tvLoadLayout = function(exchange, symbol) {
+    if (!window._tvWidget || !window._tvWidgetReady) return;
+    fetch('/tv_layout?exchange=' + encodeURIComponent(exchange) +
+          '&symbol=' + encodeURIComponent(symbol))
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(data){
+            if (data && data.content) {
+                try { window._tvWidget.load(data.content); }
+                catch(e){ console.warn('[TV] load() failed', e); }
+            }
+        })
+        .catch(function(e){ console.warn('[TV] load GET failed', e); });
+};
+
+// Periodic autosave — runs once per page session
+if (!window._tvAutosaveTimer) {
+    window._tvAutosaveEnabled = window._tvAutosaveEnabled || false;
+    window._tvAutosaveTimer = setInterval(function() {
+        if (window._tvAutosaveEnabled && window._tvCurrentKey) {
+            window._tvSaveLayout(
+                window._tvCurrentKey.exchange,
+                window._tvCurrentKey.symbol,
+                true
+            );
+        }
+    }, 20000);
+}
+"""
+
+
+def _init_js(tv_symbol: str, interval: str, exchange: str, symbol: str) -> str:
     iv  = _INTERVAL_MAP.get(interval, '1')
     cfg = json.dumps({
-        'autosize':                  True,
-        'symbol':                    tv_symbol,
-        'interval':                  iv,
-        'timezone':                  'Asia/Kolkata',
-        'theme':                     'dark',
-        'style':                     '1',
-        'locale':                    'en',
-        'toolbar_bg':                '#1f2937',
-        'backgroundColor':           '#111827',
-        'gridColor':                 'rgba(55,65,81,0.5)',
-        'enable_publishing':         False,
-        'save_image':                True,
-        'hide_top_toolbar':          False,
-        'hide_side_toolbar':         False,
-        'withdateranges':            True,
-        'chartsStorageApiVersion':   '1.1',
-        'client_id':                 'crypto_bot',
-        'user_id':                   'default',
-        'load_last_chart':           True,
-        'container_id':              _CONTAINER_ID,
+        'autosize':          True,
+        'symbol':            tv_symbol,
+        'interval':          iv,
+        'timezone':          'Asia/Kolkata',
+        'theme':             'dark',
+        'style':             '1',
+        'locale':            'en',
+        'toolbar_bg':        '#1f2937',
+        'backgroundColor':   '#111827',
+        'gridColor':         'rgba(55,65,81,0.5)',
+        'enable_publishing': False,
+        'save_image':        True,
+        'hide_top_toolbar':  False,
+        'hide_side_toolbar': False,
+        'withdateranges':    True,
+        'container_id':      _CONTAINER_ID,
     })
+    exch_esc = exchange.replace("'", "")
+    sym_esc  = symbol.replace("'", "")
     return f"""
+{_JS_HELPERS}
+
 (function tryInit() {{
     if (typeof TradingView === 'undefined') {{ setTimeout(tryInit, 400); return; }}
     var el = document.getElementById('{_CONTAINER_ID}');
     if (!el) {{ setTimeout(tryInit, 400); return; }}
 
+    // ── Soft update: symbol switch on an already-created widget ────────────
     if (window._tvWidget && window._tvWidgetReady) {{
         try {{
-            window._tvWidget.setSymbol('{tv_symbol}', '{iv}', function() {{}});
+            // Save the OLD symbol's layout before switching away from it
+            if (window._tvCurrentKey) {{
+                window._tvSaveLayout(
+                    window._tvCurrentKey.exchange,
+                    window._tvCurrentKey.symbol,
+                    true
+                );
+            }}
+            window._tvWidget.setSymbol('{tv_symbol}', '{iv}', function() {{
+                window._tvCurrentKey = {{exchange: '{exch_esc}', symbol: '{sym_esc}'}};
+                window._tvLoadLayout('{exch_esc}', '{sym_esc}');
+            }});
             return;
         }} catch (e) {{
             console.warn('[TV] setSymbol failed, reinitialising:', e);
@@ -85,19 +144,17 @@ def _init_js(tv_symbol: str, interval: str) -> str:
 
     el.innerHTML = '';
     window._tvWidgetReady = false;
-
-    // Build config and inject dynamic storageUrl (must use window.location at runtime)
-    var cfg = {cfg};
-    cfg.chartsStorageUrl = window.location.protocol + '//' + window.location.host + '/tv_storage';
-
-    window._tvWidget = new TradingView.widget(cfg);
+    window._tvWidget = new TradingView.widget({cfg});
     if (window._tvWidget && window._tvWidget.onChartReady) {{
         window._tvWidget.onChartReady(function() {{
             window._tvWidgetReady = true;
+            window._tvCurrentKey  = {{exchange: '{exch_esc}', symbol: '{sym_esc}'}};
+            window._tvLoadLayout('{exch_esc}', '{sym_esc}');
         }});
     }}
 }})();
 """
+
 
 def _set_resolution_js(iv_tv: str) -> str:
     return f"""
@@ -112,6 +169,7 @@ def _set_resolution_js(iv_tv: str) -> str:
 def build(state: 'UIState', shared: dict) -> dict:
     saved_height   = state.ui_prefs.get('chart_height',   440)
     saved_interval = state.ui_prefs.get('chart_interval', '15m')
+    saved_autosave = state.ui_prefs.get('tv_autosave', True)
     if saved_interval and saved_interval != state.watch_interval:
         state.watch_interval = saved_interval
 
@@ -120,6 +178,7 @@ def build(state: 'UIState', shared: dict) -> dict:
         'interval':    None,
         'initialized': False,
         'height':      saved_height,
+        'exchange':    None,
     }
 
     prev_favs_hash = {'v': ''}
@@ -147,6 +206,33 @@ def build(state: 'UIState', shared: dict) -> dict:
 
             ui.element('div').classes('flex-1')
 
+            # ── Save Layout button ───────────────────────────────────────────
+            def save_layout_now() -> None:
+                exch = shared.get('exchange', '')
+                sym  = shared.get('symbol', '')
+                ui.run_javascript(
+                    f"window._tvSaveLayout('{exch}', '{sym}', false);"
+                )
+                ui.notify('Chart layout saved', type='positive',
+                          position='bottom-right')
+
+            ui.button('Save Layout', on_click=save_layout_now).props(
+                'flat dense size=xs'
+            ).classes('text-green-400 text-xs').tooltip(
+                'Save drawings, indicators and settings for this symbol'
+            )
+
+            # ── Autosave toggle ───────────────────────────────────────────────
+            def _on_autosave(e) -> None:
+                ui.run_javascript(
+                    f"window._tvAutosaveEnabled = {str(bool(e.value)).lower()};"
+                )
+                asyncio.ensure_future(state.save_ui_prefs({'tv_autosave': e.value}))
+
+            ui.switch('Autosave', value=saved_autosave, on_change=_on_autosave).props(
+                'dense dark size=xs'
+            ).classes('text-xs text-gray-400')
+
             # Add-to-favorites button
             async def add_fav() -> None:
                 favs  = list(state.ui_prefs.get('favorites', []))
@@ -170,7 +256,7 @@ def build(state: 'UIState', shared: dict) -> dict:
             h_lbl = ui.label(f'{saved_height}px').classes('text-gray-500 text-xs w-12')
 
         # ── Favorites bar ─────────────────────────────────────────────────────
-        favs_row = ui.row().classes(
+        favs_row  = ui.row().classes(
             'w-full px-3 py-1 bg-gray-800/40 gap-1.5 items-center flex-wrap '
             'border-b border-gray-700/40'
         )
@@ -214,9 +300,8 @@ def build(state: 'UIState', shared: dict) -> dict:
                             'flat round dense size=xs'
                         ).classes('text-gray-600 w-4 h-4')
 
-        favs_row.add_slot('default', '')   # will be populated by _render_favs
         with favs_row:
-            fav_inner   # attach the inner row
+            fav_inner
 
         # ── Chart container ───────────────────────────────────────────────────
         chart_wrap = ui.element('div').style(
@@ -237,7 +322,7 @@ def build(state: 'UIState', shared: dict) -> dict:
             tgt_lbl   = ui.label('').classes('text-xs font-mono')
         levels_bar.set_visibility(False)
 
-    # ── Height slider — placed OUTSIDE card so chart_wrap is already defined ─
+    # ── Height slider ─────────────────────────────────────────────────────────
     ui.slider(
         min=280, max=820, step=40, value=saved_height,
         on_change=lambda e: _on_height(int(e.value)),
@@ -266,37 +351,42 @@ def build(state: 'UIState', shared: dict) -> dict:
         )
         asyncio.ensure_future(state.save_ui_prefs({'chart_height': h}))
 
-    # Initial favorites render
     _render_favs()
 
     # ── Tick update ───────────────────────────────────────────────────────────
     def update() -> None:
-        # Sync height from prefs if they loaded after build
         if not last['initialized']:
             nh = state.ui_prefs.get('chart_height', 440)
             if nh != last['height']:
                 _on_height(nh)
+            # Sync autosave flag into JS once chart has had a chance to init
+            ui.run_javascript(
+                f"window._tvAutosaveEnabled = "
+                f"{str(bool(state.ui_prefs.get('tv_autosave', True))).lower()};"
+            )
 
-        tv_sym = _tv_symbol(
-            shared.get('exchange', 'binance'),
-            shared.get('symbol', 'BTC/USDT'),
-        )
-        iv = getattr(state, 'watch_interval', '15m')
+        exch   = shared.get('exchange', 'binance')
+        sym    = shared.get('symbol',   'BTC/USDT')
+        tv_sym = _tv_symbol(exch, sym)
+        iv     = getattr(state, 'watch_interval', '15m')
 
-        if not last['initialized'] or tv_sym != last['symbol']:
-            last.update({'symbol': tv_sym, 'interval': iv, 'initialized': True})
-            ui.run_javascript(_init_js(tv_sym, iv))
+        symbol_changed = (tv_sym != last['symbol'])
+
+        if not last['initialized'] or symbol_changed:
+            last.update({
+                'symbol': tv_sym, 'interval': iv,
+                'initialized': True, 'exchange': exch,
+            })
+            ui.run_javascript(_init_js(tv_sym, iv, exch, sym))
         elif iv != last['interval']:
             last['interval'] = iv
             ui.run_javascript(_set_resolution_js(_INTERVAL_MAP.get(iv, '1')))
 
-        # Favorites re-render if prefs changed
         cur_fav_hash = str(state.ui_prefs.get('favorites', []))
         if cur_fav_hash != prev_favs_hash['v']:
             prev_favs_hash['v'] = cur_fav_hash
             _render_favs()
 
-        # Position levels bar
         pos = None
         for p in state.positions:
             if (p.get('exchange') == shared.get('exchange') and
