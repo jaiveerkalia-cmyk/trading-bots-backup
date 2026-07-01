@@ -249,8 +249,11 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
             prev_title['v'] = title
             ui.run_javascript(f"document.title = '{title}';")
 
-        # Watchlist
-        wl_hash = str(state.ui_prefs.get('watchlist', []))
+        # Watchlist — re-render when the list changes OR the active pair changes
+        wl_hash = (
+            str(state.ui_prefs.get('watchlist', []))
+            + f"|{shared.get('exchange','')}:{shared.get('symbol','')}"
+        )
         if wl_hash != prev_wl['v']:
             prev_wl['v'] = wl_hash
             _render_watchlist()

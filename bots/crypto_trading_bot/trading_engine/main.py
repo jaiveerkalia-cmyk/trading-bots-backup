@@ -67,9 +67,55 @@ def _partial_pnl(slot, exit_price: float, qty: float) -> float:
 
 
 def _ts(dt) -> str:
+    """Format a datetime as an IST ISO-8601 string for CSV logging."""
     if dt is None:
-        return datetime.now(timezone.utc).isoformat()
-    return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
+        dt = datetime.now(timezone.utc)
+    elif isinstance(dt, str):
+        return dt
+    if not hasattr(dt, 'isoformat'):
+        return str(dt)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(settings.IST).isoformat()
+
+
+def _trigger_px(order: Order):
+    """Trigger/limit price recorded against an order-fill row."""
+    if order.order_type == 'limit' and order.price:
+        return order.price
+    if order.order_type == 'stop_limit' and order.stop_price:
+        return order.stop_price
+    return ''
+
+
+def _fees_paid(slot, entry_price: float, exit_price: float, qty: float) -> float:
+    """Entry + exit fee total for closing `qty` units — mirrors _pnl/_partial_pnl fee math."""
+    if qty <= 0:
+        return 0.0
+    fees = settings.EXCHANGE_FEES.get(slot.exchange, {'maker': 0.001, 'taker': 0.001})
+    entry_fee_rt = fees['maker'] if (slot.entries and slot.entries[0].order_type == 'limit') else fees['taker']
+    entry_fee = (entry_price or 0) * qty * entry_fee_rt
+    exit_fee  = (exit_price  or 0) * qty * fees['taker']
+    return round(entry_fee + exit_fee, 6)
+
+
+async def _portfolio_value(redis, sm, cumulative_realized: float) -> float:
+    """
+    Mirrors UIState.get_current_balance(): starting_balance + (realized - offset) + unrealized.
+    Reads the same 'ui:portfolio' key the UI persists starting_balance/pnl_offset to.
+    """
+    starting_balance, pnl_offset = 10000.0, 0.0
+    if redis is not None:
+        try:
+            raw = await redis.get('ui:portfolio')
+            if raw:
+                d = json.loads(raw)
+                starting_balance = float(d.get('starting_balance', 10000.0))
+                pnl_offset       = float(d.get('pnl_offset', 0.0))
+        except Exception as e:
+            logger.warning("Portfolio value lookup failed: %s", e)
+    unrealized = sum(p.unrealized_pnl for p in sm.get_all_positions())
+    return starting_balance + (cumulative_realized - pnl_offset) + unrealized
 
 
 def _build_order(exchange, symbol, side, entry, slot_id) -> Order:
@@ -109,25 +155,8 @@ async def _sub_md(redis: aioredis.Redis, exchange: str, symbol: str,
 # CSV helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _csv_open(cw, sm, slot, order) -> None:
-    cumulative = sum(s.realized_pnl for s in sm.get_all_slots())
-    await cw.enqueue_event({
-        'timestamp':      _ts(order.updated_at),
-        'event_type':     'open',
-        'exchange':       order.exchange,
-        'symbol':         order.symbol,
-        'side':           slot.side,
-        'qty':            order.filled_qty,
-        'leverage':       getattr(slot, 'leverage', 1),
-        'entry_price':    order.avg_fill_price or '',
-        'exit_price':     '',
-        'trade_pnl':      '',
-        'funding_pnl':    '',
-        'cumulative_pnl': round(cumulative, 6),
-        'close_reason':   '',
-        'is_paper':       order.is_paper,
-        'slot_id':        slot.id,
-    })
+async def _csv_open(cw, slot, order) -> None:
+    """Order-fill record only — portfolio.csv gets a single row at close time."""
     await cw.enqueue_order_fill({
         'timestamp':       _ts(order.updated_at),
         'exchange':        order.exchange,
@@ -135,6 +164,7 @@ async def _csv_open(cw, sm, slot, order) -> None:
         'side':            order.side,
         'order_type':      order.order_type,
         'filled_qty':      order.filled_qty,
+        'trigger_price':   _trigger_px(order),
         'avg_fill_price':  order.avg_fill_price or '',
         'is_paper':        order.is_paper,
         'slot_id':         slot.id,
@@ -143,25 +173,34 @@ async def _csv_open(cw, sm, slot, order) -> None:
 
 
 async def _csv_close(cw, sm, slot, order, pnl, entry_price=0.0,
-                     event_type='close', close_reason='manual') -> None:
+                     close_reason='manual', entry_time=None,
+                     funding_pnl=0.0, redis=None) -> None:
+    """Single merged portfolio.csv row (entry+exit) plus the exit order-fill row."""
     cumulative = sum(s.realized_pnl for s in sm.get_all_slots())
-    fp = getattr(slot.position, 'funding_pnl', 0.0) if slot.position else 0.0
+    qty        = order.filled_qty or 0.0
+    exit_price = order.avg_fill_price or 0.0
+    fees_paid  = _fees_paid(slot, entry_price, exit_price, qty)
+    pv_after   = await _portfolio_value(redis, sm, cumulative)
     await cw.enqueue_event({
-        'timestamp':      _ts(order.updated_at),
-        'event_type':     event_type,
-        'exchange':       order.exchange,
-        'symbol':         order.symbol,
-        'side':           slot.side,
-        'qty':            order.filled_qty,
-        'leverage':       getattr(slot, 'leverage', 1),
-        'entry_price':    entry_price or '',
-        'exit_price':     order.avg_fill_price or '',
-        'trade_pnl':      round(pnl, 6),
-        'funding_pnl':    round(fp, 8),
-        'cumulative_pnl': round(cumulative, 6),
-        'close_reason':   close_reason,
-        'is_paper':       order.is_paper,
-        'slot_id':        slot.id,
+        'timestamp':             _ts(order.updated_at),
+        'entry_time':            _ts(entry_time),
+        'exit_time':             _ts(order.updated_at),
+        'exchange':              order.exchange,
+        'symbol':                order.symbol,
+        'side':                  slot.side,
+        'qty':                   qty,
+        'leverage':              getattr(slot, 'leverage', 1),
+        'entry_price':           entry_price or '',
+        'exit_price':            exit_price or '',
+        'position_size_usd':     round((entry_price or 0) * qty, 6),
+        'trade_pnl':             round(pnl, 6),
+        'funding_pnl':           round(funding_pnl, 8),
+        'total_fees_paid':       fees_paid,
+        'cumulative_pnl':        round(cumulative, 6),
+        'portfolio_value_after': round(pv_after, 6),
+        'close_reason':          close_reason,
+        'is_paper':              order.is_paper,
+        'slot_id':               slot.id,
     })
     await cw.enqueue_order_fill({
         'timestamp':      _ts(order.updated_at),
@@ -170,6 +209,7 @@ async def _csv_close(cw, sm, slot, order, pnl, entry_price=0.0,
         'side':           order.side,
         'order_type':     order.order_type,
         'filled_qty':     order.filled_qty,
+        'trigger_price':  _trigger_px(order),
         'avg_fill_price': order.avg_fill_price or '',
         'is_paper':       order.is_paper,
         'slot_id':        slot.id,
@@ -188,7 +228,7 @@ async def _open_new(order, slot, sm, pe, cw, sp) -> None:
         slot.position.leverage = slot.leverage
     slot.orders.append(order)
     await sm.update_slot(slot)
-    await _csv_open(cw, sm, slot, order)
+    await _csv_open(cw, slot, order)
     sp.log(f"Opened {slot.side} {slot.symbol} qty={order.filled_qty:g} "
            f"@ {order.avg_fill_price}",
            exchange=slot.exchange, symbol=slot.symbol)
@@ -210,13 +250,13 @@ async def _scale_in(order, new_slot, existing, sm, pe, cw, sp) -> None:
     await sm.update_slot(existing)
     if new_slot.id != existing.id:
         await sm.close_slot(new_slot.id, 0.0)
-    await _csv_open(cw, sm, existing, order)
+    await _csv_open(cw, existing, order)
     sp.log(f"Scale-in {existing.symbol} "
            f"avg={existing.position.entry_price:.6g}",
            exchange=existing.exchange, symbol=existing.symbol)
 
 
-async def _reduce_or_flip(order, new_slot, opp_slot, sm, pe, cw, sp) -> None:
+async def _reduce_or_flip(order, new_slot, opp_slot, sm, pe, cw, sp, redis) -> None:
     fill_price  = order.avg_fill_price or 0.0
     order_qty   = order.filled_qty
     opp_qty     = opp_slot.position.qty
@@ -226,21 +266,25 @@ async def _reduce_or_flip(order, new_slot, opp_slot, sm, pe, cw, sp) -> None:
     is_full     = close_qty >= opp_qty - 1e-10
 
     if is_full:
+        entry_time  = opp_slot.position.opened_at
+        funding_pnl = getattr(opp_slot.position, 'funding_pnl', 0.0)
         if order.is_paper:
             await pe.close_position(opp_slot.id)
         await sm.close_slot(opp_slot.id, pnl)
-        await _csv_close(cw, sm, opp_slot, order, pnl, entry_price,
-                         'close', 'opposite_order')
+        await _csv_close(cw, sm, opp_slot, order, pnl, entry_price, 'opposite_order',
+                         entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
         sp.log(f"Closed {opp_slot.side} {opp_slot.symbol} pnl={pnl:+.4f}",
                exchange=opp_slot.exchange, symbol=opp_slot.symbol)
     else:
+        entry_time = opp_slot.position.opened_at
         if order.is_paper:
             upd, _ = await pe.partial_close_position(opp_slot.id, close_qty)
             opp_slot.position = upd
+        funding_pnl = getattr(opp_slot.position, 'funding_pnl', 0.0)
         opp_slot.realized_pnl = round(getattr(opp_slot, 'realized_pnl', 0.0) + pnl, 6)
         await sm.update_slot(opp_slot)
-        await _csv_close(cw, sm, opp_slot, order, pnl, entry_price,
-                         'partial_close', 'opposite_order')
+        await _csv_close(cw, sm, opp_slot, order, pnl, entry_price, 'opposite_order',
+                         entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
         sp.log(f"Reduced {opp_slot.side} {opp_slot.symbol} "
                f"by {close_qty:g} pnl={pnl:+.4f}",
                exchange=opp_slot.exchange, symbol=opp_slot.symbol)
@@ -257,13 +301,13 @@ async def _reduce_or_flip(order, new_slot, opp_slot, sm, pe, cw, sp) -> None:
             await sm.close_slot(new_slot.id, 0.0)
 
 
-async def _process_filled_entry(order, slot, sm, pe, cw, sp) -> None:
+async def _process_filled_entry(order, slot, sm, pe, cw, sp, redis) -> None:
     exch, sym = slot.exchange, slot.symbol
     existing_same = _find_existing_position(sm, exch, sym, slot.side)
     existing_opp  = _find_existing_position(sm, exch, sym,
                                             'short' if slot.side == 'long' else 'long')
     if existing_opp:
-        await _reduce_or_flip(order, slot, existing_opp, sm, pe, cw, sp)
+        await _reduce_or_flip(order, slot, existing_opp, sm, pe, cw, sp, redis)
     elif existing_same:
         await _scale_in(order, slot, existing_same, sm, pe, cw, sp)
     else:
@@ -292,7 +336,7 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         order = await om.place_order(order, slot)
         slot.orders.append(order)
         if order.status == 'filled':
-            await _process_filled_entry(order, slot, sm, pe, cw, sp)
+            await _process_filled_entry(order, slot, sm, pe, cw, sp, redis)
         elif order.status in ('open', 'pending', 'working'):
             slot.status = 'working'
             await sm.update_slot(slot)
@@ -305,6 +349,8 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
             return
         if slot.position:
             entry_price = slot.position.entry_price
+            entry_time  = slot.position.opened_at
+            funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
             order = Order(exchange=slot.exchange, symbol=slot.symbol,
                           side='sell' if slot.side == 'long' else 'buy',
                           order_type='market', qty=slot.position.qty, slot_id=slot.id)
@@ -314,7 +360,8 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
                 await pe.close_position(slot.id)
             pnl = _pnl(slot, order.avg_fill_price or 0.0)
             await sm.close_slot(slot.id, pnl)
-            await _csv_close(cw, sm, slot, order, pnl, entry_price, 'close', 'manual')
+            await _csv_close(cw, sm, slot, order, pnl, entry_price, 'manual',
+                             entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
             sp.log(f"Closed {slot.symbol} pnl={pnl:+.4f}",
                    exchange=slot.exchange, symbol=slot.symbol)
         else:
@@ -329,8 +376,10 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         slot = sm.get_slot(cmd.get('slot_id', ''))
         if not slot or not slot.position or qty <= 0:
             return
-        actual     = min(qty, slot.position.qty)
-        ep         = slot.position.entry_price
+        actual      = min(qty, slot.position.qty)
+        ep          = slot.position.entry_price
+        entry_time  = slot.position.opened_at
+        funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
         order      = Order(exchange=slot.exchange, symbol=slot.symbol,
                            side='sell' if slot.side == 'long' else 'buy',
                            order_type='market', qty=actual, slot_id=slot.id)
@@ -341,22 +390,26 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
             upd, _ = await pe.partial_close_position(slot.id, actual)
             if upd is None:
                 await sm.close_slot(slot.id, pnl)
-                await _csv_close(cw, sm, slot, order, pnl, ep, 'close', 'partial')
+                await _csv_close(cw, sm, slot, order, pnl, ep, 'partial',
+                                 entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
             else:
                 slot.position = upd
                 slot.realized_pnl = round(getattr(slot, 'realized_pnl', 0.0) + pnl, 6)
                 await sm.update_slot(slot)
-                await _csv_close(cw, sm, slot, order, pnl, ep, 'partial_close', 'partial')
+                await _csv_close(cw, sm, slot, order, pnl, ep, 'partial',
+                                 entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
         else:
             slot.position.qty = round(slot.position.qty - actual, 8)
             if slot.position.qty <= 1e-10:
                 slot.position = None
                 await sm.close_slot(slot.id, pnl)
-                await _csv_close(cw, sm, slot, order, pnl, ep, 'close', 'partial')
+                await _csv_close(cw, sm, slot, order, pnl, ep, 'partial',
+                                 entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
             else:
                 slot.realized_pnl = round(getattr(slot, 'realized_pnl', 0.0) + pnl, 6)
                 await sm.update_slot(slot)
-                await _csv_close(cw, sm, slot, order, pnl, ep, 'partial_close', 'partial')
+                await _csv_close(cw, sm, slot, order, pnl, ep, 'partial',
+                                 entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
         sp.log(f"Partial close {actual:g} {slot.symbol} pnl={pnl:+.4f}",
                exchange=slot.exchange, symbol=slot.symbol)
 
@@ -364,7 +417,9 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         for slot in sm.get_active_slots():
             if not slot.position:
                 continue
-            ep    = slot.position.entry_price
+            ep          = slot.position.entry_price
+            entry_time  = slot.position.opened_at
+            funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
             order = Order(exchange=slot.exchange, symbol=slot.symbol,
                           side='sell' if slot.side == 'long' else 'buy',
                           order_type='market', qty=slot.position.qty, slot_id=slot.id)
@@ -374,7 +429,8 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
                 await pe.close_position(slot.id)
             pnl = _pnl(slot, order.avg_fill_price or 0.0)
             await sm.close_slot(slot.id, pnl)
-            await _csv_close(cw, sm, slot, order, pnl, ep, 'close', 'close_all')
+            await _csv_close(cw, sm, slot, order, pnl, ep, 'close_all',
+                             entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
 
     elif action == redis_keys.CMD_UPDATE_SLOT:
         slot = sm.get_slot(cmd.get('slot_id', ''))
@@ -470,11 +526,13 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
 # Trigger-exit callback
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _on_trigger_exit(slot_id, reason, sm, om, sp, cw, notifier) -> None:
+async def _on_trigger_exit(slot_id, reason, sm, om, sp, cw, notifier, redis) -> None:
     slot = sm.get_slot(slot_id)
     if not slot or not slot.position:
         return
-    ep    = slot.position.entry_price
+    ep          = slot.position.entry_price
+    entry_time  = slot.position.opened_at
+    funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
     order = Order(exchange=slot.exchange, symbol=slot.symbol,
                   side='sell' if slot.side == 'long' else 'buy',
                   order_type='market', qty=slot.position.qty, slot_id=slot.id)
@@ -484,7 +542,8 @@ async def _on_trigger_exit(slot_id, reason, sm, om, sp, cw, notifier) -> None:
         await om.paper.close_position(slot_id)
     pnl = _pnl(slot, order.avg_fill_price or 0.0)
     await sm.close_slot(slot_id, pnl)
-    await _csv_close(cw, sm, slot, order, pnl, ep, 'close', reason)
+    await _csv_close(cw, sm, slot, order, pnl, ep, reason,
+                     entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
     sp.log(f"[{reason}] {slot.symbol} pnl={pnl:+.4f}",
            exchange=slot.exchange, symbol=slot.symbol)
     await notifier.send(f"[{reason.upper()}] {slot.symbol} | PnL {pnl:+.4f}")
@@ -494,7 +553,7 @@ async def _on_trigger_exit(slot_id, reason, sm, om, sp, cw, notifier) -> None:
 # Paper fill checker
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _paper_fill_checker(sm, om, sp, cw, pe) -> None:
+async def _paper_fill_checker(sm, om, sp, cw, pe, redis) -> None:
     while True:
         try:
             pairs = {(s.exchange, s.symbol) for s in sm.get_all_slots()
@@ -507,7 +566,7 @@ async def _paper_fill_checker(sm, om, sp, cw, pe) -> None:
                     slot = sm.get_slot(order.slot_id)
                     if not slot or slot.status != 'working':
                         continue
-                    await _process_filled_entry(order, slot, sm, pe, cw, sp)
+                    await _process_filled_entry(order, slot, sm, pe, cw, sp, redis)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -591,7 +650,7 @@ async def main() -> None:
         state_pub.log("Paper mode — reconciliation skipped")
 
     on_exit = lambda sid, reason: _on_trigger_exit(
-        sid, reason, slot_manager, order_manager, state_pub, csv_writer, notifier,
+        sid, reason, slot_manager, order_manager, state_pub, csv_writer, notifier, redis,
     )
 
     async def _on_alert_fired(alert) -> None:
@@ -615,7 +674,7 @@ async def main() -> None:
         redis, slot_manager, order_manager, state_pub, paper_engine, csv_writer,
     ))
     asyncio.create_task(_paper_fill_checker(
-        slot_manager, order_manager, state_pub, csv_writer, paper_engine,
+        slot_manager, order_manager, state_pub, csv_writer, paper_engine, redis,
     ))
 
     logger.info("Trading engine ready  live=%s", live_mode)

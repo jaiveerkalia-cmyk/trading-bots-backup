@@ -1,7 +1,8 @@
 """
 Two single append-only CSV files — never date-partitioned:
-  data/portfolio/portfolio.csv  — position lifecycle with full details
+  data/portfolio/portfolio.csv  — one row per closed/partially-closed position
   data/trades/trades.csv        — every individual order fill
+All timestamps are recorded in IST (Asia/Kolkata).
 """
 from __future__ import annotations
 
@@ -18,19 +19,22 @@ logger = logging.getLogger('csv_writer')
 # ── Column definitions ────────────────────────────────────────────────────────
 
 PORTFOLIO_COLS = [
-    'timestamp', 'event_type',            # open | close | partial_close
+    'timestamp',                  # = exit_time (kept for sort/back-compat)
+    'entry_time', 'exit_time',
     'exchange', 'symbol', 'side',
     'qty', 'leverage',
     'entry_price', 'exit_price',
-    'trade_pnl', 'funding_pnl', 'cumulative_pnl',
-    'close_reason',                        # manual | stop_hit | target_hit | pnl_target_hit
+    'position_size_usd',
+    'trade_pnl', 'funding_pnl', 'total_fees_paid', 'cumulative_pnl',
+    'portfolio_value_after',
+    'close_reason',                # manual | stop_hit | target_hit | pnl_target_hit | opposite_order | partial | close_all
     'is_paper', 'slot_id',
 ]
 
 TRADE_COLS = [
     'timestamp',
     'exchange', 'symbol', 'side', 'order_type',
-    'filled_qty', 'avg_fill_price',
+    'filled_qty', 'trigger_price', 'avg_fill_price',
     'is_paper', 'slot_id', 'order_id',
 ]
 
@@ -44,7 +48,8 @@ def _trades_path() -> Path:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """Current time, IST, ISO-8601."""
+    return datetime.now(timezone.utc).astimezone(settings.IST).isoformat()
 
 
 def _ensure(path: Path, cols: list[str]) -> None:
@@ -84,7 +89,7 @@ class CSVWriter:
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def enqueue_event(self, row: dict) -> None:
-        """Position lifecycle event (open / close / partial_close)."""
+        """Position close/partial-close event — one merged row per call."""
         row.setdefault('timestamp', _now())
         await self._put(('portfolio', row))
 
@@ -96,24 +101,6 @@ class CSVWriter:
         """Individual order fill record."""
         row.setdefault('timestamp', _now())
         await self._put(('trade', row))
-
-    # Legacy shims
-    async def enqueue_trade(self, row: dict) -> None:
-        mapped = {
-            'timestamp':       row.get('timestamp', _now()),
-            'event_type':      'close' if row.get('exit_price') else 'open',
-            'exchange':        row.get('exchange', ''),
-            'symbol':          row.get('symbol', ''),
-            'side':            row.get('side', ''),
-            'qty':             row.get('qty', ''),
-            'entry_price':     row.get('entry_price', ''),
-            'exit_price':      row.get('exit_price', ''),
-            'trade_pnl':       row.get('pnl', row.get('trade_pnl', '')),
-            'cumulative_pnl':  row.get('realized_pnl', ''),
-            'is_paper':        row.get('is_paper', ''),
-            'slot_id':         row.get('slot_id', ''),
-        }
-        await self._put(('portfolio', mapped))
 
     async def enqueue_pnl(self, _row: dict) -> None:
         pass   # daily PnL tracking removed

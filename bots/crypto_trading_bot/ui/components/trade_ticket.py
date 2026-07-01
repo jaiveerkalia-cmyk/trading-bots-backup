@@ -266,6 +266,22 @@ def _clear(f: dict, refs: dict) -> None:
             refs[k].set_text('')
 
 
+async def _confirm(message: str, yes_label: str = 'Place Anyway',
+                   no_label: str = 'Cancel') -> bool:
+    """Awaitable Yes/No confirmation dialog. Returns True only if yes_label is clicked."""
+    with ui.dialog() as dialog, ui.card().classes('bg-gray-800 p-4 max-w-sm'):
+        ui.label(message).classes('text-sm text-gray-200 mb-3')
+        with ui.row().classes('w-full justify-end gap-2'):
+            ui.button(no_label, on_click=lambda: dialog.submit(False)).props(
+                'flat dense'
+            ).classes('text-gray-400')
+            ui.button(yes_label, on_click=lambda: dialog.submit(True)).props(
+                'dense unelevated'
+            ).classes('bg-yellow-700 text-white')
+    result = await dialog
+    return bool(result)
+
+
 async def _place(side: str, f: dict, shared: dict,
                  redis: aioredis.Redis, state, refs: dict) -> None:
     order_type = f.get('order_type', 'limit')
@@ -299,6 +315,42 @@ async def _place(side: str, f: dict, shared: dict,
     if stop <= 0 and f.get('qty_mode') == 'risk':
         ui.notify('Stop price is required', type='negative')
         return
+
+    ltp = state.get_last_price()
+
+    # ── Limit price crosses LTP → would fill immediately ──────────────────────
+    if order_type == 'limit' and ltp > 0:
+        crosses = (
+            (side == 'long'  and entry > ltp) or
+            (side == 'short' and entry < ltp)
+        )
+        if crosses:
+            rel = 'above' if side == 'long' else 'below'
+            proceed = await _confirm(
+                f'Limit price {entry:g} is {rel} the current LTP ({ltp:g}). '
+                f'This will likely fill immediately. Place anyway?'
+            )
+            if not proceed:
+                ui.notify('Order not placed', type='info')
+                return
+
+    # ── Stop trigger already met → would fire instantly ───────────────────────
+    if order_type == 'stop_limit' and ltp > 0:
+        instant = (
+            (side == 'long'  and ltp >= entry) or
+            (side == 'short' and ltp <= entry)
+        )
+        if instant:
+            rel = 'at or below' if side == 'long' else 'at or above'
+            use_limit = await _confirm(
+                f'Stop trigger {entry:g} is {rel} the current LTP ({ltp:g}) '
+                f'and will trigger instantly. Place as a Limit order instead?',
+                yes_label='Place Limit', no_label='Cancel',
+            )
+            if not use_limit:
+                ui.notify('Order not placed', type='info')
+                return
+            order_type = 'limit'
 
     exchange = shared.get('exchange', 'binance_futures')
     balance  = max(shared.get('balance', 0), 1)

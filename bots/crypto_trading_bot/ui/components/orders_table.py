@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING
 from nicegui import ui
 import redis.asyncio as aioredis
 from ui import commands
+from common import settings
 
 if TYPE_CHECKING:
     from ui.state import UIState
 
 
-def build(state: 'UIState', redis: aioredis.Redis) -> dict:
+def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
     # Tracks which order is being modified: {order_id: True}
     modifying: dict[str, bool] = {}
 
@@ -34,7 +35,7 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                 for lbl, cls in [
                     ('Exch', 'w-20'), ('Symbol', 'w-24'), ('Side', 'w-12'),
                     ('Type', 'w-20'), ('Price', 'w-24 text-right'),
-                    ('Stop', 'w-24 text-right'), ('Qty', 'w-20 text-right'),
+                    ('Stop', 'w-24 text-right'), ('Target', 'w-24 text-right'), ('Qty', 'w-20 text-right'),
                     ('Status', 'w-16 text-center'), ('', 'flex-1'),
                 ]:
                     ui.label(lbl).classes(cls)
@@ -49,7 +50,23 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                 sid        = o.get('slot_id', '')
                 sym        = o.get('symbol', '')
                 price      = float(o.get('price') or 0)
-                stop_px    = float(o.get('stop_price') or 0)
+
+                # Stop/target live on the slot, not the Order model —
+                # look them up so they display correctly on real working-order rows.
+                slot_data   = state.get_slot(sid)
+                slot_stop   = float(slot_data.get('stop_price')   or 0) if slot_data else 0.0
+                slot_target = float(slot_data.get('target_price') or 0) if slot_data else 0.0
+
+                # What to show in Stop / Target columns per row type
+                if is_vstop:
+                    display_stop   = price        # virtual order price IS the stop trigger
+                    display_target = slot_target
+                elif is_vtgt:
+                    display_stop   = slot_stop
+                    display_target = price        # virtual order price IS the target
+                else:
+                    display_stop   = slot_stop    # real order → from slot
+                    display_target = slot_target  # real order → from slot
 
                 # Main order row
                 with ui.row().classes(
@@ -64,8 +81,16 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                     type_color = ('text-orange-400' if is_vstop else
                                   'text-blue-400' if is_vtgt else 'text-gray-300')
                     ui.label(type_label).classes(f'w-20 {type_color}')
-                    ui.label(f"{price:g}" if price else '—').classes('w-24 text-right font-mono')
-                    ui.label(f"{stop_px:g}" if stop_px else '—').classes('w-24 text-right font-mono text-orange-400')
+                    # Price column: limit price for real orders; '—' for virtual rows
+                    ui.label(
+                        f"{price:g}" if (price and not is_virtual) else '—'
+                    ).classes('w-24 text-right font-mono')
+                    ui.label(
+                        f"{display_stop:g}" if display_stop else '—'
+                    ).classes('w-24 text-right font-mono text-orange-400')
+                    ui.label(
+                        f"{display_target:g}" if display_target else '—'
+                    ).classes('w-24 text-right font-mono text-blue-400')
                     ui.label(f"{float(o.get('qty', 0)):g}").classes('w-20 text-right font-mono')
                     ui.badge(o.get('status', ''), color='blue').classes('w-16')
 
@@ -92,60 +117,245 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                         lbl = 'Remove' if is_virtual else 'Cancel'
                         ui.button(lbl, on_click=do_cancel).props('dense flat size=xs').classes('text-red-400')
 
-                # Modify inline form — shown when this order is being modified
+                # Inline modify form — shown when this order is being modified
                 if modifying.get(oid):
-                    with ui.row().classes(
-                        'w-full px-4 py-2 bg-gray-800 border-t border-gray-700 '
-                        'items-center gap-2 text-xs'
-                    ):
-                        ui.label('New price:').classes('text-gray-500')
-                        new_price_inp = ui.number(
-                            value=price or stop_px, min=0, format='%g',
-                        ).props('dense dark outlined').classes('w-32')
-
-                        if not is_virtual:
-                            ui.label('New qty:').classes('text-gray-500 ml-2')
-                            new_qty_inp = ui.number(
-                                value=float(o.get('qty', 0)), min=0, format='%g',
-                            ).props('dense dark outlined').classes('w-28')
-                        else:
-                            new_qty_inp = None
-
-                        async def confirm_modify(
-                            order_id=oid, slot_id=sid, symbol=sym,
-                            inp=new_price_inp, qinp=new_qty_inp,
-                            vstop=is_vstop, vtgt=is_vtgt,
-                        ):
-                            np = float(inp.value or 0)
-                            nq = float(qinp.value or 0) if qinp else 0
-                            if vstop:
-                                await commands.update_slot(redis, slot_id, stop_price=np or None)
-                                ui.notify(f'Stop updated → {np:g}', type='positive')
-                            elif vtgt:
-                                await commands.update_slot(redis, slot_id, target_price=np or None)
-                                ui.notify(f'Target updated → {np:g}', type='positive')
-                            else:
-                                await commands.modify_order(redis, slot_id, order_id, new_price=np, new_qty=nq)
-                                ui.notify(f'Modify sent for {symbol}', type='positive')
-                            modifying.pop(order_id, None)
-                            rows.refresh()
-
-                        ui.button('Confirm', on_click=confirm_modify,
-                        ).props('dense unelevated').classes('bg-blue-700 text-white ml-2')
-                        ui.button('Cancel', on_click=lambda oid=oid: (
-                            modifying.pop(oid, None), rows.refresh()
-                        )).props('dense flat').classes('text-gray-500')
+                    _render_modify_form(
+                        o           = o,
+                        oid         = oid,
+                        sid         = sid,
+                        sym         = sym,
+                        price       = price,
+                        slot_stop   = slot_stop,
+                        slot_target = slot_target,
+                        is_vstop    = is_vstop,
+                        is_vtgt     = is_vtgt,
+                        modifying   = modifying,
+                        refresh     = rows.refresh,
+                        redis       = redis,
+                        shared      = shared,
+                    )
 
         rows()
 
     prev_hash = {'v': ''}
 
-    def update():
-        h = str([(o.get('id', ''), o.get('status', ''), float(o.get('price') or 0))
-                 for o in state.open_orders])
+    def update() -> None:
+        # Include slot stop/target in hash so table refreshes when they change
+        orders_h = str([
+            (o.get('id', ''), o.get('status', ''), float(o.get('price') or 0))
+            for o in state.open_orders
+        ])
+        slots_h = str([
+            (s.get('id'), s.get('stop_price'), s.get('target_price'))
+            for s in state.slots
+            if s.get('status') in ('working', 'active')
+        ])
+        h = orders_h + slots_h
         if h != prev_hash['v']:
             prev_hash['v'] = h
             modifying.clear()
             rows.refresh()
 
     return {'update': update}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modify form (module-level so rows() stays readable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_modify_form(
+    o: dict,
+    oid: str,
+    sid: str,
+    sym: str,
+    price: float,
+    slot_stop: float,
+    slot_target: float,
+    is_vstop: bool,
+    is_vtgt: bool,
+    modifying: dict,
+    refresh,           # rows.refresh callable
+    redis,
+    shared: dict,
+) -> None:
+    """Render the inline modify form below an order row."""
+
+    # Mutable form state — updated by on_change callbacks
+    mf: dict = {
+        'entry':  price,
+        'stop':   slot_stop,
+        'target': slot_target,
+        'qty':    float(o.get('qty', 0)),
+        'auto':   False,
+    }
+    # Mutable ref so _recalc_auto can update the qty label after creation
+    qty_lbl_ref: list = [None]
+
+    def _recalc_auto() -> None:
+        """Recompute qty from risk% whenever entry or stop changes (auto mode only)."""
+        if not mf['auto']:
+            return
+        ep = mf['entry']
+        sp = mf['stop']
+        if ep > 0 and sp > 0 and abs(ep - sp) > 1e-10:
+            exchange  = o.get('exchange', 'binance_futures')
+            balance   = max(shared.get('balance', 1), 1)
+            risk_pct  = shared.get('risk_pct', settings.DEFAULT_RISK_PCT)
+            fees      = settings.EXCHANGE_FEES.get(
+                exchange, {'maker': 0.001, 'taker': 0.001}
+            )
+            fee_unit  = ep * fees['maker'] + sp * fees['taker']
+            mf['qty'] = round(
+                (balance * (risk_pct / 100)) / (abs(ep - sp) + fee_unit), 8
+            )
+        if qty_lbl_ref[0]:
+            qty_lbl_ref[0].set_text(
+                f'Auto: {mf["qty"]:g}' if (mf['auto'] and mf['qty'] > 0) else ''
+            )
+
+    def _cancel_modify() -> None:
+        modifying.pop(oid, None)
+        refresh()
+
+    with ui.row().classes(
+        'w-full px-4 py-2 bg-gray-800 border-t border-gray-700 '
+        'flex-wrap items-center gap-2 text-xs'
+    ):
+        if is_vstop:
+            # ── Virtual stop: update stop price only ──────────────────────────
+            ui.label('Stop price:').classes('text-gray-500')
+            stop_inp = ui.number(
+                value=slot_stop or price, min=0, format='%g',
+                on_change=lambda e: mf.update({'stop': float(e.value or 0)}),
+            ).props('dense dark outlined').classes('w-32')
+
+            async def confirm_vstop(slot_id=sid, inp=stop_inp) -> None:
+                np = float(inp.value or 0)
+                await commands.update_slot(redis, slot_id, stop_price=np or None)
+                ui.notify(f'Stop updated \u2192 {np:g}', type='positive')
+                modifying.pop(oid, None)
+                refresh()
+
+            ui.button('Confirm', on_click=confirm_vstop).props(
+                'dense unelevated'
+            ).classes('bg-blue-700 text-white ml-2')
+
+        elif is_vtgt:
+            # ── Virtual target: update target price only ──────────────────────
+            ui.label('Target price:').classes('text-gray-500')
+            tgt_inp = ui.number(
+                value=slot_target or price, min=0, format='%g',
+                on_change=lambda e: mf.update({'target': float(e.value or 0)}),
+            ).props('dense dark outlined').classes('w-32')
+
+            async def confirm_vtgt(slot_id=sid, inp=tgt_inp) -> None:
+                np = float(inp.value or 0)
+                await commands.update_slot(redis, slot_id, target_price=np or None)
+                ui.notify(f'Target updated \u2192 {np:g}', type='positive')
+                modifying.pop(oid, None)
+                refresh()
+
+            ui.button('Confirm', on_click=confirm_vtgt).props(
+                'dense unelevated'
+            ).classes('bg-blue-700 text-white ml-2')
+
+        else:
+            # ── Real working order: entry + stop + target + qty + auto toggle ─
+            ui.label('Entry:').classes('text-gray-500')
+            entry_inp = ui.number(
+                value=price, min=0, format='%g',
+                on_change=lambda e: (
+                    mf.update({'entry': float(e.value or 0)}),
+                    _recalc_auto(),
+                ),
+            ).props('dense dark outlined').classes('w-28')
+
+            ui.label('Stop:').classes('text-gray-500 ml-2')
+            stop_inp = ui.number(
+                value=slot_stop, min=0, format='%g',
+                on_change=lambda e: (
+                    mf.update({'stop': float(e.value or 0)}),
+                    _recalc_auto(),
+                ),
+            ).props('dense dark outlined').classes('w-28')
+
+            ui.label('Target:').classes('text-gray-500 ml-2')
+            tgt_inp = ui.number(
+                value=slot_target, min=0, format='%g',
+                on_change=lambda e: mf.update({'target': float(e.value or 0)}),
+            ).props('dense dark outlined').classes('w-28')
+
+            ui.label('Qty:').classes('text-gray-500 ml-2')
+            qty_inp = ui.number(
+                value=float(o.get('qty', 0)), min=0, format='%g',
+                on_change=lambda e: mf.update({'qty': float(e.value or 0)}),
+            ).props('dense dark outlined').classes('w-24')
+
+            ui.toggle(
+                {'auto': 'Auto Qty', 'manual': 'Manual'}, value='manual',
+                on_change=lambda e: (
+                    mf.update({'auto': e.value == 'auto'}),
+                    _recalc_auto(),
+                ),
+            ).props('dense').classes('text-xs ml-2')
+
+            qty_auto_lbl = ui.label('').classes(
+                'text-xs text-yellow-400 ml-1 self-center'
+            )
+            qty_lbl_ref[0] = qty_auto_lbl
+
+            async def confirm_real(
+                order_id=oid, slot_id=sid,
+                einp=entry_inp, sinp=stop_inp, tinp=tgt_inp, qinp=qty_inp,
+            ) -> None:
+                new_entry  = float(einp.value or 0)
+                new_stop   = float(sinp.value or 0) or None
+                new_target = float(tinp.value or 0) or None
+                new_qty    = mf['qty'] if mf['auto'] else float(qinp.value or 0)
+
+                entry_changed = bool(new_entry and new_entry != price)
+                qty_changed   = bool(new_qty   and new_qty   != float(o.get('qty', 0)))
+
+                # Entry / qty change \u2192 cancel+replace via modify_order
+                if entry_changed or qty_changed:
+                    await commands.modify_order(
+                        redis, slot_id, order_id,
+                        new_price=new_entry or None,
+                        new_qty=new_qty or None,
+                    )
+                    parts = []
+                    if entry_changed: parts.append(f'entry \u2192 {new_entry:g}')
+                    if qty_changed:   parts.append(f'qty \u2192 {new_qty:g}')
+                    ui.notify(', '.join(parts).capitalize(), type='positive')
+
+                # Stop / target \u2192 update slot in-place
+                stop_changed   = new_stop   != (slot_stop   or None)
+                target_changed = new_target != (slot_target or None)
+                if stop_changed or target_changed:
+                    await commands.update_slot(
+                        redis, slot_id,
+                        stop_price=new_stop,
+                        target_price=new_target,
+                    )
+                    parts = []
+                    if stop_changed:
+                        parts.append(f'stop \u2192 {new_stop:g}' if new_stop else 'stop cleared')
+                    if target_changed:
+                        parts.append(f'target \u2192 {new_target:g}' if new_target else 'target cleared')
+                    if parts:
+                        ui.notify(', '.join(parts).capitalize(), type='positive')
+
+                if not any([entry_changed, qty_changed, stop_changed, target_changed]):
+                    ui.notify('No changes detected', type='info')
+
+                modifying.pop(order_id, None)
+                refresh()
+
+            ui.button('Confirm', on_click=confirm_real).props(
+                'dense unelevated'
+            ).classes('bg-blue-700 text-white ml-2')
+
+        # Common Cancel button
+        ui.button('Cancel', on_click=_cancel_modify).props(
+            'dense flat'
+        ).classes('text-gray-500')

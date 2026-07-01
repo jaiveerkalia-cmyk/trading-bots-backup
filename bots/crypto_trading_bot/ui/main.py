@@ -246,7 +246,7 @@ async def index() -> None:
 
         with ui.element('div').classes('w-full mt-2 flex flex-col gap-3'):
             pos = positions_table.build(_state, _redis)
-            oo  = orders_table.build(_state, _redis)
+            oo  = orders_table.build(_state, _redis, shared)
             oh  = history_table.build(_state)
 
     updaters = [

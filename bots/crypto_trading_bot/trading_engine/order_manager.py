@@ -61,9 +61,6 @@ class OrderManager:
                 return order
             order = await adapter.place_order(order)
 
-        if order.status == 'filled':
-            await self._record_fill(order, slot)
-
         mode = 'LIVE' if self._live_mode else 'PAPER'
         lvl  = 'info' if order.status in ('filled', 'working') else 'error'
         self._state.log(
@@ -127,18 +124,3 @@ class OrderManager:
                 slot.orders.append(tp)
                 self._state.log(f"Native TP @ {slot.target_price}",
                                 exchange=slot.exchange, symbol=slot.symbol)
-
-    async def _record_fill(self, order: Order, slot: TradeSlot) -> None:
-        await self._csv.enqueue_trade({
-            'timestamp':   datetime.now(timezone.utc).isoformat(),
-            'exchange':    order.exchange,
-            'symbol':      order.symbol,
-            'side':        order.side,
-            'order_type':  order.order_type,
-            'qty':         order.filled_qty,
-            'entry_price': order.avg_fill_price,
-            'exit_price':  '',
-            'pnl':         '',
-            'is_paper':    order.is_paper,
-            'slot_id':     slot.id,
-        })
