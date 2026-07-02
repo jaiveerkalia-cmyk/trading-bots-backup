@@ -150,3 +150,16 @@ class BaseExchangeAdapter(ABC):
         Called on startup and periodically by instrument_sync.
         """
         ...
+
+    # ── Market data: historical OHLCV ────────────────────────────────────────
+
+    async def fetch_ohlcv(
+        self, symbol: str, interval: str, limit: int = 3
+    ) -> list[list]:
+        """
+        Fetch historical OHLCV candles via REST.
+        Returns a list of [timestamp_ms, open, high, low, close, volume] rows,
+        sorted oldest-first.  The last row may be the current unclosed candle.
+        Subclasses should override; default returns [] (triggers Redis fallback).
+        """
+        return []

@@ -85,6 +85,10 @@ def _trigger_px(order: Order):
         return order.price
     if order.order_type == 'stop_limit' and order.stop_price:
         return order.stop_price
+    # Market exit orders annotated with the price that caused the exit
+    # (stop_hit → slot.stop_price, target_hit → slot.target_price)
+    if order.stop_price:
+        return order.stop_price
     return ''
 
 
@@ -533,11 +537,19 @@ async def _on_trigger_exit(slot_id, reason, sm, om, sp, cw, notifier, redis) -> 
     ep          = slot.position.entry_price
     entry_time  = slot.position.opened_at
     funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
+    # Capture stop/target BEFORE place_order (slot state may change after)
+    stop_price_at_exit   = slot.stop_price
+    target_price_at_exit = slot.target_price
     order = Order(exchange=slot.exchange, symbol=slot.symbol,
                   side='sell' if slot.side == 'long' else 'buy',
                   order_type='market', qty=slot.position.qty, slot_id=slot.id)
     order = await om.place_order(order, slot)
     slot.orders.append(order)
+    # Annotate the trigger price on the order so _trigger_px / CSV pick it up
+    if reason == 'stop_hit' and stop_price_at_exit:
+        order.stop_price = stop_price_at_exit
+    elif reason == 'target_hit' and target_price_at_exit:
+        order.stop_price = target_price_at_exit   # reuse stop_price field as carrier
     if order.is_paper:
         await om.paper.close_position(slot_id)
     pnl = _pnl(slot, order.avg_fill_price or 0.0)
@@ -666,6 +678,7 @@ async def main() -> None:
         redis_client=redis, slot_manager=slot_manager,
         on_exit=on_exit, on_alert=_on_alert_fired,
         paper_engine=paper_engine,
+        adapters=adapters,
     )
     await trigger.start()
     await state_pub.start()

@@ -287,6 +287,18 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             logger.error("BinanceFutures get_tradable_symbols error: %s", e)
             return []
 
+    async def fetch_ohlcv(
+        self, symbol: str, interval: str, limit: int = 3
+    ) -> list[list]:
+        """Fetch historical OHLCV via Binance Futures REST (ccxt).
+        Returns [[ts_ms, o, h, l, c, v], ...] sorted oldest-first.
+        """
+        try:
+            return await self._ex.fetch_ohlcv(symbol, interval, limit=limit)
+        except Exception as e:
+            logger.error("BinanceFutures fetch_ohlcv [%s %s]: %s", symbol, interval, e)
+            return []
+
     def _parse_order(self, r: dict) -> Order:
         return Order(
             exchange_order_id=str(r.get('id', '')),

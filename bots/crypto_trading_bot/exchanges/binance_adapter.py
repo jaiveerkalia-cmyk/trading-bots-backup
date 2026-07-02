@@ -329,6 +329,18 @@ class BinanceAdapter(BaseExchangeAdapter):
             logger.error(f"Binance get_tradable_symbols error: {e}")
             return []
 
+    async def fetch_ohlcv(
+        self, symbol: str, interval: str, limit: int = 3
+    ) -> list[list]:
+        """Fetch historical OHLCV via Binance REST (ccxt), routing to spot or futures.
+        Returns [[ts_ms, o, h, l, c, v], ...] sorted oldest-first.
+        """
+        try:
+            return await self._get_ex(symbol).fetch_ohlcv(symbol, interval, limit=limit)
+        except Exception as e:
+            logger.error(f"Binance fetch_ohlcv [{symbol} {interval}]: {e}")
+            return []
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_ex(self, symbol: str):

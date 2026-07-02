@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Awaitable, TYPE_CHECKING
 
 import redis.asyncio as aioredis
@@ -25,7 +26,7 @@ logger = logging.getLogger('trigger_engine')
 
 class TriggerEngine:
     __slots__ = ('_redis', '_slots', '_paper', '_on_exit', '_on_alert',
-                 '_task', '_candle_last')
+                 '_task', '_clock_task', '_adapters')
 
     def __init__(
         self,
@@ -34,24 +35,27 @@ class TriggerEngine:
         on_exit:      Callable[[str, str], Awaitable[None]],
         on_alert:     Callable[[Alert],    Awaitable[None]],
         paper_engine: 'PaperEngine',
+        adapters:     dict | None = None,
     ) -> None:
         self._redis       = redis_client
         self._slots       = slot_manager
         self._paper       = paper_engine
         self._on_exit     = on_exit
         self._on_alert    = on_alert
-        self._task: asyncio.Task | None = None
-        # Tracks last seen candle per "exchange:symbol:interval"
-        # so we detect when a candle CLOSES (new candle timestamp appears)
-        self._candle_last: dict[str, dict] = {}
+        self._adapters    = adapters or {}
+        self._task:        asyncio.Task | None = None
+        self._clock_task:  asyncio.Task | None = None
 
     async def start(self) -> None:
-        self._task = asyncio.create_task(self._loop())
+        self._task       = asyncio.create_task(self._loop())
+        self._clock_task = asyncio.create_task(self._candle_clock_task())
         logger.info("TriggerEngine started")
 
     async def stop(self) -> None:
         if self._task:
             self._task.cancel()
+        if self._clock_task:
+            self._clock_task.cancel()
 
     async def _loop(self) -> None:
         while True:
@@ -109,64 +113,131 @@ class TriggerEngine:
                                 slot.symbol, curr_pnl, slot.pnl_target)
                     await self._on_exit(slot.id, 'pnl_target_hit')
 
-        # ── Alerts ────────────────────────────────────────────────────────────
+        # ── Alerts (LTP/current only — candle-close alerts run in _candle_clock_task) ──
         for alert in self._slots.get_alerts():
             if alert.triggered:
                 continue
             period = getattr(alert, 'period', 'current')
             if period in ('1m', '5m'):
-                triggered = await self._check_candle_alert(alert, period)
-            else:
-                ltp = await self._ltp(alert.exchange, alert.symbol)
-                if ltp <= 0:
-                    continue
-                triggered = (
-                    (alert.upper is not None and ltp >= alert.upper) or
-                    (alert.lower is not None and ltp <= alert.lower)
-                )
+                continue   # handled by _candle_clock_task
+            ltp = await self._ltp(alert.exchange, alert.symbol)
+            if ltp <= 0:
+                continue
+            triggered = (
+                (alert.upper is not None and ltp >= alert.upper) or
+                (alert.lower is not None and ltp <= alert.lower)
+            )
             if triggered:
                 alert.triggered = True
                 logger.info("Alert triggered [%s] period=%s", alert.symbol, period)
                 await self._on_alert(alert)
 
-    # ── Candle-close alert ────────────────────────────────────────────────────
+    # ── Candle-close alert (clock-based) ─────────────────────────────────────
 
-    async def _check_candle_alert(self, alert: Alert, interval: str) -> bool:
+    async def _candle_clock_task(self) -> None:
         """
-        Returns True when a new candle has started (= previous candle closed)
-        and the CLOSE price of that previous candle crosses the alert level.
-        Fires AT MOST ONCE per completed candle.
+        Runs independently of the main trigger loop.
+        Sleeps precisely until each 1-minute wall-clock boundary + 1 s
+        (the extra second lets the exchange REST endpoint reflect the
+        just-closed candle before we query it).
+
+        At each 1 m boundary  → evaluates all 1 m candle-close alerts.
+        At each 5 m boundary  → also evaluates all 5 m candle-close alerts.
+
+        Fetches official OHLC via the exchange REST API (fetch_ohlcv) so the
+        close price is the exchange-confirmed final value — not a live tick.
+        Falls back to the latest_candle Redis key if the adapter is unavailable.
         """
+        while True:
+            try:
+                # Sleep until next 1 m boundary + 1 s
+                now      = datetime.now(timezone.utc)
+                next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                sleep_s  = (next_min - now).total_seconds() + 1.0
+                await asyncio.sleep(max(sleep_s, 0.1))
+
+                now   = datetime.now(timezone.utc)
+                is_5m = (now.minute % 5 == 0)
+
+                # Build {(exchange, symbol, interval): [alerts]} mapping
+                needed: dict[tuple, list] = {}
+                for alert in self._slots.get_alerts():
+                    if alert.triggered:
+                        continue
+                    period = getattr(alert, 'period', 'current')
+                    if period == '1m':
+                        k = (alert.exchange, alert.symbol, '1m')
+                        needed.setdefault(k, []).append(alert)
+                    elif period == '5m' and is_5m:
+                        k = (alert.exchange, alert.symbol, '5m')
+                        needed.setdefault(k, []).append(alert)
+
+                for (exchange, symbol, interval), alerts in needed.items():
+                    close = await self._fetch_closed_candle_close(
+                        exchange, symbol, interval
+                    )
+                    if not close or close <= 0:
+                        logger.debug(
+                            "No closed candle data for %s %s %s",
+                            exchange, symbol, interval,
+                        )
+                        continue
+
+                    for alert in alerts:
+                        if alert.triggered:
+                            continue
+                        triggered = (
+                            (alert.upper is not None and close >= alert.upper) or
+                            (alert.lower is not None and close <= alert.lower)
+                        )
+                        if triggered:
+                            alert.triggered = True
+                            logger.info(
+                                "Candle-close alert [%s] %s close=%.6g",
+                                alert.symbol, interval, close,
+                            )
+                            await self._on_alert(alert)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Candle clock task error: %s", exc)
+
+    async def _fetch_closed_candle_close(
+        self, exchange: str, symbol: str, interval: str
+    ) -> float:
+        """
+        Returns the close price of the most recently COMPLETED candle.
+
+        1. Tries the exchange REST API (fetch_ohlcv limit=3).
+           ccxt returns rows sorted oldest-first; the last row may be the
+           current open (unclosed) candle, so we take [-2].
+        2. Falls back to the latest_candle Redis key if the adapter is
+           unavailable or the call fails.
+        """
+        adapter = self._adapters.get(exchange)
+        if adapter:
+            try:
+                ohlcvs = await adapter.fetch_ohlcv(symbol, interval, limit=3)
+                if len(ohlcvs) >= 2:
+                    _ts, _o, _h, _l, close, _v = ohlcvs[-2]
+                    return float(close)
+            except Exception as exc:
+                logger.warning(
+                    "fetch_ohlcv REST [%s %s %s]: %s",
+                    exchange, symbol, interval, exc,
+                )
+
+        # Fallback — read from Redis (populated by market-data service)
         try:
             raw = await self._redis.get(
-                redis_keys.latest_candle_key(alert.exchange, alert.symbol, interval)
+                redis_keys.latest_candle_key(exchange, symbol, interval)
             )
-            if not raw:
-                return False
-            candle    = json.loads(raw)
-            cur_ts    = candle.get('ts', '')
-            cur_close = float(candle.get('c', 0))
-
-            key = f"{alert.exchange}:{alert.symbol}:{interval}:{alert.id}"
-            last = self._candle_last.get(key)
-
-            if last is None:
-                # First time — just record, don't fire
-                self._candle_last[key] = {'ts': cur_ts, 'close': cur_close}
-                return False
-
-            if cur_ts == last['ts']:
-                return False   # same candle still in progress
-
-            # New candle started → previous candle is closed
-            prev_close = last['close']
-            self._candle_last[key] = {'ts': cur_ts, 'close': cur_close}
-            return (
-                (alert.upper is not None and prev_close >= alert.upper) or
-                (alert.lower is not None and prev_close <= alert.lower)
-            )
+            if raw:
+                return float(json.loads(raw).get('c', 0))
         except Exception:
-            return False
+            pass
+        return 0.0
 
     # ── Price helpers ─────────────────────────────────────────────────────────
 

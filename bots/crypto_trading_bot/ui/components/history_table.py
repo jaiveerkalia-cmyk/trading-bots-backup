@@ -38,6 +38,8 @@ def _trigger_px(o: dict) -> str:
     stop  = float(o.get('stop_price') or 0)
     if ot == 'limit'      and price > 0: return f'{price:g}'
     if ot == 'stop_limit' and stop  > 0: return f'{stop:g}'
+    # Market exit orders: stop_price is annotated with the stop/target price that fired
+    if stop > 0: return f'{stop:g}'
     return '—'
 
 

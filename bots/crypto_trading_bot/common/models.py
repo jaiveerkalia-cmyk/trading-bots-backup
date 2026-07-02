@@ -145,6 +145,14 @@ class Alert(BaseModel):
     period:     Literal['current', '1m', '5m'] = 'current'
     triggered:  bool            = False
     created_at: datetime        = Field(default_factory=datetime.utcnow)
+    # Optional: when set, this alert also places an entry order when triggered
+    order_side:        Optional[Literal['long', 'short']]                 = None
+    order_type:        Optional[Literal['market', 'limit', 'stop_limit']] = None
+    order_entry_price: Optional[float] = None   # 0/None → use LTP at fire time
+    order_stop:        Optional[float] = None
+    order_target:      Optional[float] = None
+    order_qty:         Optional[float] = None   # 0/None → auto from risk %
+    order_risk_pct:    Optional[float] = None
 
 
 class LogEntry(BaseModel):
