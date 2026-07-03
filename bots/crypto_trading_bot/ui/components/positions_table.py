@@ -271,24 +271,60 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
 
                         ui.element('div').classes('flex-1')
 
+                        # ── Partial close order type ─────────────────────────────
+                        pc_ot       = {'v': 'market'}
+                        pc_px       = {'v': None}
+                        lmt_row_ref = [None]
+
+                        ui.toggle(
+                            {'market': 'Mkt', 'limit': 'Lmt'}, value='market',
+                            on_change=lambda e, ot=pc_ot, lr=lmt_row_ref: [
+                                ot.update({'v': e.value}),
+                                lr[0].set_visibility(e.value == 'limit')
+                                if lr[0] else None,
+                            ],
+                        ).props('dense').classes('text-xs')
+
+                        with ui.row().classes('items-center gap-1') as lmt_row:
+                            lmt_row.set_visibility(False)
+                            ui.number(
+                                value=None, min=0, placeholder='Lmt px',
+                                on_change=lambda e, pp=pc_px:
+                                    pp.update({'v': float(e.value or 0) or None}),
+                            ).props('dense dark outlined').classes('w-24')
+                        lmt_row_ref[0] = lmt_row
+
                         # Partial close (percentage)
                         pct_inp = (
                             ui.number(value=None, min=0, max=100, placeholder='%')
                             .props('dense dark outlined').classes('w-20')
                         )
 
-                        async def _half(_e=None, sid=sid):
+                        async def _half(
+                            _e=None, sid=sid,
+                            ot=pc_ot, pp=pc_px,
+                        ):
                             qty_ = _pct_qty(state, sid, 50.0)
                             if qty_ > 0:
-                                await commands.partial_close_slot(redis, sid, qty_)
-                                ui.notify('½ (50%) queued', type='warning',
+                                lmt = pp['v'] if ot['v'] == 'limit' else None
+                                if ot['v'] == 'limit' and not lmt:
+                                    ui.notify('Enter limit price', type='warning',
+                                              position='bottom-right')
+                                    return
+                                await commands.partial_close_slot(
+                                    redis, sid, qty_, ot['v'], lmt
+                                )
+                                ui.notify('50% close queued', type='warning',
                                           position='bottom-right')
 
-                        ui.button('½', on_click=_half).props(
+                        ui.button('50%', on_click=_half).props(
                             'dense unelevated size=xs'
                         ).classes('bg-yellow-900/80 text-yellow-300 px-2').tooltip('Close 50%')
 
-                        async def _partial(_e=None, sid=sid, inp=pct_inp):
+                        async def _partial(
+                            _e=None, sid=sid, inp=pct_inp,
+                            ot=pc_ot, pp=pc_px,
+                        ):
                             try:
                                 pct = float(inp.value or 0)
                             except (ValueError, TypeError):
@@ -296,11 +332,18 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                             if 0 < pct <= 100:
                                 qty_ = _pct_qty(state, sid, pct)
                                 if qty_ > 0:
-                                    await commands.partial_close_slot(redis, sid, qty_)
+                                    lmt = pp['v'] if ot['v'] == 'limit' else None
+                                    if ot['v'] == 'limit' and not lmt:
+                                        ui.notify('Enter limit price', type='warning',
+                                                  position='bottom-right')
+                                        return
+                                    await commands.partial_close_slot(
+                                        redis, sid, qty_, ot['v'], lmt
+                                    )
                                     ui.notify(f'Close {pct:g}% queued',
                                               type='warning', position='bottom-right')
                             else:
-                                ui.notify('Enter 1–100%', type='info',
+                                ui.notify('Enter 1-100%', type='info',
                                           position='bottom-right')
 
                         ui.button('Close %', on_click=_partial).props(

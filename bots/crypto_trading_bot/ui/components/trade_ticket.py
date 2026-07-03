@@ -28,6 +28,7 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
     btn_col = 'positive'    if is_long else 'negative'
 
     f = {
+        'side':         side,
         'order_type':   'limit',
         'entry_price':  0.0,
         'stop_price':   0.0,
@@ -215,6 +216,29 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
         fee_per_unit = entry * entry_fee_rate + stop * taker_fee
         qty = round(risk_amt / (abs(entry - stop) + fee_per_unit), 8)
         f['qty'] = qty
+
+        # Auto-calculate fee-aware R:R target
+        rr   = float(shared.get('rr_ratio', 2.0) or 2.0)
+        side = f.get('side', 'long')
+        if rr > 0 and qty > 0:
+            if side == 'long':
+                denom = qty * (1.0 - taker_fee)
+                auto_tgt = round(
+                    (rr * risk_amt + entry * qty * (1.0 + entry_fee_rate)) / denom, 6
+                ) if denom > 0 else 0.0
+            else:
+                denom = qty * (1.0 + taker_fee)
+                auto_tgt = round(
+                    (entry * qty * (1.0 - entry_fee_rate) - rr * risk_amt) / denom, 6
+                ) if denom > 0 else 0.0
+            if auto_tgt > 0:
+                f['target_price'] = auto_tgt
+                tgt_ref = refs.get('tgt_inp')
+                if tgt_ref:
+                    try:
+                        tgt_ref.set_value(auto_tgt)
+                    except Exception:
+                        pass
     elif f.get('qty_mode') == 'risk':
         f['qty'] = 0.0
 
@@ -351,6 +375,40 @@ async def _place(side: str, f: dict, shared: dict,
                 ui.notify('Order not placed', type='info')
                 return
             order_type = 'limit'
+
+    # ── Wrong stop direction → warn ────────────────────────────────────────
+    if entry > 0 and stop > 0:
+        wrong_stop = (
+            (side == 'long'  and stop >= entry) or
+            (side == 'short' and stop <= entry)
+        )
+        if wrong_stop:
+            correct = 'below' if side == 'long' else 'above'
+            proceed = await _confirm(
+                f'Stop {stop:g} is on the wrong side of entry {entry:g} '
+                f'for a {side} position — stop should be {correct} entry. '
+                f'Place anyway?'
+            )
+            if not proceed:
+                ui.notify('Order not placed', type='info')
+                return
+
+    # ── Wrong target direction → warn ──────────────────────────────────────
+    if entry > 0 and target > 0:
+        wrong_tgt = (
+            (side == 'long'  and target <= entry) or
+            (side == 'short' and target >= entry)
+        )
+        if wrong_tgt:
+            correct = 'above' if side == 'long' else 'below'
+            proceed = await _confirm(
+                f'Target {target:g} is on the wrong side of entry {entry:g} '
+                f'for a {side} position — target should be {correct} entry. '
+                f'Place anyway?'
+            )
+            if not proceed:
+                ui.notify('Order not placed', type='info')
+                return
 
     exchange = shared.get('exchange', 'binance_futures')
     balance  = max(shared.get('balance', 0), 1)

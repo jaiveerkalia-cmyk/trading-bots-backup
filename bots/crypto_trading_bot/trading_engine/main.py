@@ -376,19 +376,53 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
             await sm.close_slot(slot.id, 0.0)
 
     elif action == redis_keys.CMD_PARTIAL_CLOSE_SLOT:
-        qty  = float(cmd.get('qty', 0))
-        slot = sm.get_slot(cmd.get('slot_id', ''))
+        qty         = float(cmd.get('qty', 0))
+        order_type  = cmd.get('order_type', 'market')
+        limit_price = float(cmd.get('price') or 0) or None
+        slot        = sm.get_slot(cmd.get('slot_id', ''))
         if not slot or not slot.position or qty <= 0:
             return
         actual      = min(qty, slot.position.qty)
         ep          = slot.position.entry_price
         entry_time  = slot.position.opened_at
         funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
-        order      = Order(exchange=slot.exchange, symbol=slot.symbol,
+
+        if order_type == 'limit' and limit_price:
+            if slot.is_paper:
+                # Paper: simulate immediate fill at the specified limit price
+                order = Order(
+                    exchange=slot.exchange, symbol=slot.symbol,
+                    side='sell' if slot.side == 'long' else 'buy',
+                    order_type='limit', price=limit_price,
+                    qty=actual, slot_id=slot.id,
+                    status='filled', filled_qty=actual,
+                    avg_fill_price=limit_price, is_paper=True,
+                )
+                order.updated_at = datetime.now(timezone.utc)
+                slot.orders.append(order)
+            else:
+                # Live: submit limit exit to exchange
+                order = Order(
+                    exchange=slot.exchange, symbol=slot.symbol,
+                    side='sell' if slot.side == 'long' else 'buy',
+                    order_type='limit', price=limit_price,
+                    qty=actual, slot_id=slot.id,
+                )
+                order = await om.place_order(order, slot)
+                slot.orders.append(order)
+                if order.status != 'filled':
+                    await sm.update_slot(slot)
+                    sp.log(
+                        f"Limit exit placed {actual:g} {slot.symbol} @ {limit_price:g}",
+                        exchange=slot.exchange, symbol=slot.symbol,
+                    )
+                    return
+        else:
+            order = Order(exchange=slot.exchange, symbol=slot.symbol,
                            side='sell' if slot.side == 'long' else 'buy',
                            order_type='market', qty=actual, slot_id=slot.id)
-        order      = await om.place_order(order, slot)
-        slot.orders.append(order)
+            order = await om.place_order(order, slot)
+            slot.orders.append(order)
         pnl        = _partial_pnl(slot, order.avg_fill_price or 0.0, actual)
         if order.is_paper:
             upd, _ = await pe.partial_close_position(slot.id, actual)
@@ -669,10 +703,101 @@ async def main() -> None:
         price     = alert.upper if alert.upper is not None else alert.lower
         direction = '▲' if alert.upper is not None else '▼'
         period    = getattr(alert, 'period', 'current')
-        msg       = (f"[ALERT {period.upper()}] {alert.symbol} "
-                     f"{direction}{f'{price:g}' if price else '—'}")
-        state_pub.log(msg, level='warning', exchange=alert.exchange, symbol=alert.symbol)
+
+        # Fetch LTP at the time the alert fires
+        ltp_str = ''
+        try:
+            raw_tick = await redis.get(
+                redis_keys.latest_tick_key(alert.exchange, alert.symbol)
+            )
+            if raw_tick:
+                ltp = float(json.loads(raw_tick).get('p', 0))
+                if ltp > 0:
+                    ltp_str = f' | LTP {ltp:g}'
+        except Exception:
+            pass
+
+        msg = (
+            f"[ALERT {period.upper()}] {alert.symbol} "
+            f"{direction}{f'{price:g}' if price else '—'}{ltp_str}"
+        )
+        state_pub.log(msg, level='warning',
+                      exchange=alert.exchange, symbol=alert.symbol)
         await notifier.send(msg)
+
+        # If this alert carries order parameters, queue an entry order
+        order_side     = getattr(alert, 'order_side',    None)
+        order_type_str = getattr(alert, 'order_type',    None)
+        if order_side and order_type_str:
+            entry_price  = getattr(alert, 'order_entry_price', None) or 0.0
+            stop_price   = getattr(alert, 'order_stop',        None)
+            target_price = getattr(alert, 'order_target',      None)
+            order_qty    = getattr(alert, 'order_qty',         None) or 0.0
+            risk_pct_co  = getattr(alert, 'order_risk_pct',    None) or settings.DEFAULT_RISK_PCT
+
+            # Auto-qty when explicit qty is not set
+            if order_qty <= 0 and stop_price:
+                eff_entry = entry_price
+                if not eff_entry:
+                    try:
+                        rt = await redis.get(
+                            redis_keys.latest_tick_key(alert.exchange, alert.symbol)
+                        )
+                        eff_entry = float(json.loads(rt).get('p', 0)) if rt else 0.0
+                    except Exception:
+                        eff_entry = 0.0
+                if eff_entry and abs(eff_entry - stop_price) > 0:
+                    try:
+                        raw_pf = await redis.get('ui:portfolio')
+                        balance = float(
+                            json.loads(raw_pf).get('starting_balance', 10000)
+                        ) if raw_pf else 10000.0
+                    except Exception:
+                        balance = 10000.0
+                    fees_cfg = settings.EXCHANGE_FEES.get(
+                        alert.exchange, {'maker': 0.001, 'taker': 0.001}
+                    )
+                    fee_unit = (eff_entry * fees_cfg['maker']
+                                + stop_price * fees_cfg['taker'])
+                    risk_amt  = balance * (risk_pct_co / 100)
+                    order_qty = round(
+                        risk_amt / (abs(eff_entry - stop_price) + fee_unit), 8
+                    )
+
+            if order_qty > 0:
+                instr = ('futures'
+                         if 'futures' in alert.exchange or alert.exchange == 'delta'
+                         else 'spot')
+                slot_cmd = {
+                    'type': redis_keys.CMD_OPEN_SLOT,
+                    'slot': {
+                        'exchange':        alert.exchange,
+                        'symbol':          alert.symbol,
+                        'side':            order_side,
+                        'instrument_type': instr,
+                        'entries': [{
+                            'price':           entry_price or 0.0,
+                            'qty':             order_qty,
+                            'order_type':      order_type_str,
+                            'reference_price': 0.0,
+                        }],
+                        'stop_price':   stop_price,
+                        'target_price': target_price,
+                        'leverage':     1,
+                        'margin_mode':  'cross',
+                        'qty_mode':     'base',
+                        'risk_pct':     risk_pct_co,
+                    },
+                }
+                await redis.rpush(
+                    redis_keys.COMMAND_QUEUE,
+                    json.dumps(slot_cmd, separators=(',', ':'), default=str),
+                )
+                state_pub.log(
+                    f"[COND ORDER] {order_side.upper()} {alert.symbol} "
+                    f"{order_type_str} qty={order_qty:g}",
+                    exchange=alert.exchange, symbol=alert.symbol,
+                )
 
     trigger = TriggerEngine(
         redis_client=redis, slot_manager=slot_manager,

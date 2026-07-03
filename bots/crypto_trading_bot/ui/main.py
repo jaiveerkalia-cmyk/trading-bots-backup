@@ -223,6 +223,7 @@ async def index() -> None:
         'symbol':   saved_symbol,
         'risk_pct': settings.DEFAULT_RISK_PCT,
         'balance':  _state.starting_balance,
+        'rr_ratio': 2.0,
     }
 
     # Ensure ticks flow immediately for the current watch symbol

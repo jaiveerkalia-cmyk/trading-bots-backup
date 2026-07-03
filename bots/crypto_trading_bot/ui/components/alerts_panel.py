@@ -1,8 +1,10 @@
 """
 Alerts panel.
 - Upper and lower alerts are independent (separate buttons, separate inputs).
+- Edit button on each active alert allows in-place modification.
+- Conditional order section: set an alert that also places a limit/stop-market
+  entry order when the candle closes or LTP crosses a level.
 - Reset clears ALL alerts and the input fields.
-- No 'Close All Positions' button.
 """
 from __future__ import annotations
 import asyncio
@@ -30,7 +32,7 @@ _SOUND_BODIES: dict[str, str] = {
             var o=ctx.createOscillator(),g=ctx.createGain();
             o.connect(g);g.connect(ctx.destination);o.type='sine';o.frequency.value=f;
             g.gain.setValueAtTime(0.22,s);g.gain.exponentialRampToValueAtTime(0.001,s+noteDur);
-            o.start(s);o.stop(s+noteDur+0.02);});}
+            o.start(s);o.stop(s+noteDur+0.02);}); }
     """,
     'Alarm': """
         var period=0.22,reps=Math.max(1,Math.floor(dur/period));
@@ -79,7 +81,9 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
         'duration': float(state.ui_prefs.get('alert_dur', 3.0)),
     }
     prev_triggered: set[str] = set()
-    period_ref = {'v': 'current'}   # shared between upper and lower set functions
+    period_ref  = {'v': 'current'}   # shared between upper and lower set functions
+    co_period   = {'v': '1m'}        # conditional order period
+    editing: dict[str, dict] = {}    # alert_id -> {upper, lower, period} being edited
 
     def _save_sound() -> None:
         asyncio.ensure_future(state.save_ui_prefs({
@@ -101,7 +105,7 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
 
         # Upper alert
         with ui.row().classes('w-full gap-2 items-end mb-2'):
-            upper_inp = (ui.number(label='Upper ▲', value=None, min=0, format='%.4f')
+            upper_inp = (ui.number(label='Upper', value=None, min=0, format='%.4f')
                          .props('dense dark outlined').classes('flex-1'))
 
             async def set_upper() -> None:
@@ -116,16 +120,16 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     'period': period_ref['v'],
                 })
                 upper_inp.set_value(None)
-                ui.notify(f"Upper ▲{v:g} ({period_ref['v']}) set",
+                ui.notify(f"Upper {v:g} ({period_ref['v']}) set",
                           type='positive', position='bottom-right')
 
-            ui.button('Set ▲', on_click=set_upper).props('dense unelevated').classes(
+            ui.button('Set', on_click=set_upper).props('dense unelevated').classes(
                 'bg-green-800 text-white text-xs px-3'
             )
 
         # Lower alert
-        with ui.row().classes('w-full gap-2 items-end mb-3'):
-            lower_inp = (ui.number(label='Lower ▼', value=None, min=0, format='%.4f')
+        with ui.row().classes('w-full gap-2 items-end mb-2'):
+            lower_inp = (ui.number(label='Lower', value=None, min=0, format='%.4f')
                          .props('dense dark outlined').classes('flex-1'))
 
             async def set_lower() -> None:
@@ -140,12 +144,112 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     'period': period_ref['v'],
                 })
                 lower_inp.set_value(None)
-                ui.notify(f"Lower ▼{v:g} ({period_ref['v']}) set",
+                ui.notify(f"Lower {v:g} ({period_ref['v']}) set",
                           type='positive', position='bottom-right')
 
-            ui.button('Set ▼', on_click=set_lower).props('dense unelevated').classes(
+            ui.button('Set', on_click=set_lower).props('dense unelevated').classes(
                 'bg-red-800 text-white text-xs px-3'
             )
+
+        ui.separator().classes('bg-gray-700 my-2')
+
+        # ── Conditional Entry Order section ──────────────────────────────────────────
+        with ui.expansion('Conditional Entry Order', icon='bolt').classes(
+            'w-full text-xs text-yellow-300 bg-gray-800/50 rounded mb-2'
+        ):
+            co = {
+                'period':      '1m',
+                'direction':   'upper',
+                'trigger_px':  0.0,
+                'side':        'long',
+                'order_type':  'limit',
+                'entry_price': 0.0,
+                'stop':        0.0,
+                'target':      0.0,
+                'risk_pct':    shared.get('risk_pct', 0.5),
+            }
+
+            with ui.row().classes('w-full gap-2 mt-1'):
+                ui.select(
+                    {'current': 'Live', '1m': '1m Close', '5m': '5m Close'},
+                    value='1m', label='Fire on',
+                    on_change=lambda e: co.update({'period': e.value}),
+                ).props('dense dark outlined').classes('flex-1')
+
+                ui.select(
+                    {'upper': 'Above', 'lower': 'Below'},
+                    value='upper', label='Direction',
+                    on_change=lambda e: co.update({'direction': e.value}),
+                ).props('dense dark outlined').classes('flex-1')
+
+            with ui.row().classes('w-full gap-2 mt-1'):
+                ui.number(
+                    label='Trigger price', value=None, min=0, format='%g',
+                    on_change=lambda e: co.update({'trigger_px': float(e.value or 0)}),
+                ).props('dense dark outlined').classes('flex-1')
+
+            with ui.row().classes('w-full gap-2 mt-1'):
+                ui.toggle(
+                    {'long': 'Long', 'short': 'Short'}, value='long',
+                    on_change=lambda e: co.update({'side': e.value}),
+                ).props('dense').classes('text-xs')
+
+                ui.toggle(
+                    {'limit': 'Limit', 'stop_limit': 'Stop Mkt'}, value='limit',
+                    on_change=lambda e: co.update({'order_type': e.value}),
+                ).props('dense').classes('text-xs')
+
+            with ui.row().classes('w-full gap-2 mt-1'):
+                ui.number(
+                    label='Entry price', value=None, min=0, format='%g',
+                    on_change=lambda e: co.update({'entry_price': float(e.value or 0)}),
+                ).props('dense dark outlined').classes('flex-1')
+                ui.number(
+                    label='Stop', value=None, min=0, format='%g',
+                    on_change=lambda e: co.update({'stop': float(e.value or 0)}),
+                ).props('dense dark outlined').classes('flex-1')
+                ui.number(
+                    label='Target', value=None, min=0, format='%g',
+                    on_change=lambda e: co.update({'target': float(e.value or 0)}),
+                ).props('dense dark outlined').classes('flex-1')
+
+            with ui.row().classes('w-full gap-2 mt-1 items-end'):
+                ui.number(
+                    label='Risk %', value=shared.get('risk_pct', 0.5), min=0.01,
+                    max=10, step=0.1, format='%g',
+                    on_change=lambda e: co.update({'risk_pct': float(e.value or 0.5)}),
+                ).props('dense dark outlined').classes('w-24')
+                ui.label('(0 entry price = market at fire time)'
+                          ).classes('text-gray-500 text-[10px] flex-1')
+
+            async def set_co() -> None:
+                if not co['trigger_px']:
+                    ui.notify('Set trigger price', type='warning', position='bottom-right')
+                    return
+                direction_key = 'upper' if co['direction'] == 'upper' else 'lower'
+                alert_data = {
+                    'exchange':        shared.get('exchange', 'binance_futures'),
+                    'symbol':          shared.get('symbol',   'BTC/USDT'),
+                    'upper':           co['trigger_px'] if direction_key == 'upper' else None,
+                    'lower':           co['trigger_px'] if direction_key == 'lower' else None,
+                    'period':          co['period'],
+                    'order_side':      co['side'],
+                    'order_type':      co['order_type'],
+                    'order_entry_price': co['entry_price'] or None,
+                    'order_stop':      co['stop'] or None,
+                    'order_target':    co['target'] or None,
+                    'order_risk_pct':  co['risk_pct'],
+                }
+                await commands.set_alert(redis, alert_data)
+                ui.notify(
+                    f"Cond. order set: {co['side'].upper()} {co['order_type']} "
+                    f"when {direction_key} {co['trigger_px']:g} ({co['period']})",
+                    type='positive', position='bottom-right',
+                )
+
+            ui.button('Set Conditional Order', on_click=set_co).props(
+                'dense unelevated'
+            ).classes('bg-yellow-700 text-white text-xs px-3 mt-2 w-full')
 
         # Sound settings
         with ui.row().classes('w-full items-center gap-2 mb-1 flex-wrap'):
@@ -168,8 +272,6 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
             ui.label('Active').classes('text-gray-500 text-xs uppercase tracking-wider')
 
             async def reset_all() -> None:
-                # Pre-populate prev_triggered with ALL existing alert IDs
-                # (both triggered and active) BEFORE clearing, so no sound plays
                 for alert in state.alerts:
                     aid = alert.get('id', '')
                     if aid:
@@ -185,11 +287,131 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
 
         alerts_container = ui.column().classes('w-full gap-1')
 
+    # ── Active alert list renderer ──────────────────────────────────────────────────────
+
+    def _redraw() -> None:
+        alerts_container.clear()
+        with alerts_container:
+            active = [a for a in state.alerts if not a.get('triggered')]
+            if not active:
+                ui.label('No active alerts').classes('text-gray-600 text-xs')
+                return
+
+            for alert in active:
+                aid  = alert.get('id', '')
+                sym  = alert.get('symbol', '')
+                exch = (alert.get('exchange', '').upper()
+                        .replace('_FUTURES', '-F').replace('BINANCE', 'BNF'))
+                per  = alert.get('period', 'current')
+                u, l = alert.get('upper'), alert.get('lower')
+                has_order = bool(alert.get('order_side'))
+
+                # Label
+                parts = [f"{exch}:{sym}"]
+                if u: parts.append(f'Above {u:g}')
+                if l: parts.append(f'Below {l:g}')
+                if per != 'current': parts.append(f'[{per}]')
+                if has_order:
+                    ep = alert.get('order_entry_price')
+                    parts.append(
+                        f"-> {alert.get('order_side','').upper()} "
+                        f"{alert.get('order_type','')}"
+                        f"{f' @{ep:g}' if ep else ''}"
+                    )
+
+                with ui.row().classes('w-full items-start gap-1 py-0.5 flex-wrap'):
+                    ui.label('  '.join(parts)).classes(
+                        'text-xs font-mono flex-1 '
+                        + ('text-blue-300' if has_order else 'text-yellow-300')
+                    )
+
+                    # ── Edit inline form ───────────────────────────────────
+                    if editing.get(aid):
+                        ef = editing[aid]
+
+                        def _close_edit(a=aid) -> None:
+                            editing.pop(a, None)
+                            _redraw()
+
+                        with ui.column().classes('w-full gap-1 mt-1 pl-2 border-l border-gray-600'):
+                            with ui.row().classes('gap-2 items-end flex-wrap'):
+                                if ef.get('upper') is not None:
+                                    eu = ui.number(
+                                        label='Upper', value=ef['upper'],
+                                        min=0, format='%g',
+                                        on_change=lambda e, ef=ef:
+                                            ef.update({'upper': float(e.value or 0) or None}),
+                                    ).props('dense dark outlined').classes('w-28')
+                                if ef.get('lower') is not None:
+                                    el = ui.number(
+                                        label='Lower', value=ef['lower'],
+                                        min=0, format='%g',
+                                        on_change=lambda e, ef=ef:
+                                            ef.update({'lower': float(e.value or 0) or None}),
+                                    ).props('dense dark outlined').classes('w-28')
+                                ui.select(
+                                    {'current': 'Live', '1m': '1m', '5m': '5m'},
+                                    value=ef.get('period', 'current'),
+                                    on_change=lambda e, ef=ef:
+                                        ef.update({'period': e.value}),
+                                ).props('dense dark outlined').classes('w-24')
+
+                            with ui.row().classes('gap-1 mt-0.5'):
+                                async def confirm_edit(a=aid, ef=ef) -> None:
+                                    # Delete old + create updated alert
+                                    await commands.delete_alert(redis, a)
+                                    await commands.set_alert(redis, {
+                                        'exchange': alert.get('exchange', ''),
+                                        'symbol':   alert.get('symbol',   ''),
+                                        'upper':    ef.get('upper'),
+                                        'lower':    ef.get('lower'),
+                                        'period':   ef.get('period', 'current'),
+                                        'order_side':        alert.get('order_side'),
+                                        'order_type':        alert.get('order_type'),
+                                        'order_entry_price': alert.get('order_entry_price'),
+                                        'order_stop':        alert.get('order_stop'),
+                                        'order_target':      alert.get('order_target'),
+                                        'order_risk_pct':    alert.get('order_risk_pct'),
+                                    })
+                                    editing.pop(a, None)
+                                    ui.notify('Alert updated', type='positive',
+                                              position='bottom-right')
+
+                                ui.button('Save', on_click=confirm_edit).props(
+                                    'dense unelevated size=xs'
+                                ).classes('bg-blue-700 text-white')
+                                ui.button('Cancel', on_click=_close_edit).props(
+                                    'flat dense size=xs'
+                                ).classes('text-gray-500')
+                    else:
+                        # Edit / Delete buttons
+                        def open_edit(a=aid, al=alert) -> None:
+                            editing[a] = {
+                                'upper':  al.get('upper'),
+                                'lower':  al.get('lower'),
+                                'period': al.get('period', 'current'),
+                            }
+                            _redraw()
+
+                        ui.button(icon='edit', on_click=open_edit).props(
+                            'flat round dense size=xs'
+                        ).classes('text-blue-400')
+
+                        async def del_alert(a=aid) -> None:
+                            editing.pop(a, None)
+                            prev_triggered.discard(a)
+                            await commands.delete_alert(redis, a)
+
+                        ui.button(icon='close', on_click=del_alert).props(
+                            'flat round dense size=xs'
+                        ).classes('text-gray-500')
+
     def update() -> None:
-        # Keep prev_triggered in sync — remove IDs no longer in state
+        # Keep prev_triggered in sync
         current_ids = {a.get('id', '') for a in state.alerts}
         prev_triggered.intersection_update(current_ids)
 
+        # Sound on new trigger
         if sound_cfg['enabled']:
             for alert in state.alerts:
                 aid = alert.get('id', '')
@@ -197,30 +419,6 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     prev_triggered.add(aid)
                     _play(sound_cfg['name'], sound_cfg['duration'])
 
-        alerts_container.clear()
-        with alerts_container:
-            active = [a for a in state.alerts if not a.get('triggered')]
-            if not active:
-                ui.label('No active alerts').classes('text-gray-600 text-xs')
-                return
-            for alert in active:
-                with ui.row().classes('w-full items-center justify-between py-0.5'):
-                    sym  = alert.get('symbol', '')
-                    exch = (alert.get('exchange', '').upper()
-                            .replace('_FUTURES', '-F').replace('BINANCE', 'BNF'))
-                    per  = alert.get('period', 'current')
-                    u, l = alert.get('upper'), alert.get('lower')
-                    parts = [f"{exch}:{sym}"]
-                    if u: parts.append(f'▲{u:g}')
-                    if l: parts.append(f'▼{l:g}')
-                    if per != 'current': parts.append(f'[{per}]')
-                    ui.label('  '.join(parts)).classes('text-xs text-yellow-300 font-mono')
-
-                    async def del_alert(aid=alert.get('id', '')) -> None:
-                        prev_triggered.discard(aid)
-                        await commands.delete_alert(redis, aid)
-
-                    ui.button(icon='close', on_click=del_alert).props(
-                        'flat round dense size=xs').classes('text-gray-500')
+        _redraw()
 
     return {'update': update}
