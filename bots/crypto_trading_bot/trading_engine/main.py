@@ -332,6 +332,19 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         except Exception as exc:
             logger.error("CMD_OPEN_SLOT: %s", exc)
             return
+
+        if getattr(new_slot, 'fire_on', None):
+            new_slot.status = 'conditional'
+            slot  = await sm.create_slot(new_slot)
+            entry = slot.entries[0] if slot.entries else None
+            ep    = entry.price      if entry else 0
+            ot    = entry.order_type if entry else ''
+            sp.log(
+                f"Conditional {slot.side} {slot.fire_on} {ot} @ {ep:g} queued",
+                exchange=slot.exchange, symbol=slot.symbol,
+            )
+            return
+
         entry = new_slot.entries[0] if new_slot.entries else None
         if not entry:
             return
@@ -482,6 +495,14 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
     elif action == redis_keys.CMD_CANCEL_ORDER:
         order_id = cmd.get('order_id', '')
         sid      = cmd.get('slot_id', '')
+
+        if order_id.startswith('VCOND-'):
+            slot = sm.get_slot(sid)
+            if slot and slot.status == 'conditional':
+                await sm.close_slot(slot.id, 0.0)
+                sp.log(f"Conditional order cancelled {slot.symbol}",
+                       exchange=slot.exchange, symbol=slot.symbol)
+            return
 
         # ── Virtual stop/target orders (not in slot.orders) ──────────────────
         if order_id.startswith('VSTOP-') or order_id.startswith('VTGT-'):
@@ -799,11 +820,50 @@ async def main() -> None:
                     exchange=alert.exchange, symbol=alert.symbol,
                 )
 
+    async def _on_conditional_triggered(slot: TradeSlot) -> None:
+        """Submit the entry order once the candle-close condition fires."""
+        current = slot_manager.get_slot(slot.id)
+        if not current or current.status != 'conditional':
+            return
+        entry = current.entries[0] if current.entries else None
+        if not entry:
+            return
+        current.fire_on = None
+        current.status  = 'pending'
+        await slot_manager.update_slot(current)
+        order = Order(
+            exchange=current.exchange, symbol=current.symbol,
+            side='buy' if current.side == 'long' else 'sell',
+            order_type=entry.order_type,
+            price=entry.price or None,
+            qty=entry.qty,
+            slot_id=current.id,
+        )
+        order = await order_manager.place_order(order, current)
+        current.orders.append(order)
+        if order.status == 'filled':
+            await _process_filled_entry(
+                order, current, slot_manager, paper_engine,
+                csv_writer, state_pub, redis,
+            )
+        elif order.status in ('open', 'pending', 'working'):
+            current.status = 'working'
+            await slot_manager.update_slot(current)
+        state_pub.log(
+            f"[COND ENTRY PLACED] {current.side} {current.symbol} "
+            f"{entry.order_type} @ {entry.price or 'MKT'}",
+            exchange=current.exchange, symbol=current.symbol,
+        )
+        await notifier.send(
+            f"[COND ENTRY] {current.side.upper()} {current.symbol} order placed"
+        )
+
     trigger = TriggerEngine(
         redis_client=redis, slot_manager=slot_manager,
         on_exit=on_exit, on_alert=_on_alert_fired,
         paper_engine=paper_engine,
         adapters=adapters,
+        on_conditional=_on_conditional_triggered,
     )
     await trigger.start()
     await state_pub.start()

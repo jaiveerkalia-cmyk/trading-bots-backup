@@ -162,19 +162,21 @@ class SlotManager:
         return sorted(history, key=lambda o: (o.created_at or datetime.min), reverse=True)
 
     def get_open_orders(self) -> list[Order]:
-        """Working orders + virtual stop/target orders."""
+        """Working orders + virtual stop/target orders + virtual conditional entry orders."""
         orders = [
             o for s in self._slots.values()
             for o in s.orders
             if o.status in ('pending', 'working')
         ]
-        for slot in self.get_active_slots():
+        for slot in self._slots.values():
             if not slot.position or not slot.is_paper:
+                continue
+            if slot.status != 'active':
                 continue
             close_side = 'sell' if slot.side == 'long' else 'buy'
             if slot.stop_price and not slot.sl_order_id:
                 orders.append(Order(
-                    id=f"VSTOP-{slot.id}",   # use full id for reliable lookup
+                    id=f"VSTOP-{slot.id}",
                     exchange=slot.exchange, symbol=slot.symbol,
                     side=close_side, order_type='stop_limit',
                     stop_price=slot.stop_price, price=slot.stop_price,
@@ -190,6 +192,24 @@ class SlotManager:
                     qty=slot.position.qty,
                     status='working', is_paper=True, slot_id=slot.id,
                 ))
+        # Virtual conditional orders — slots waiting for a candle-close trigger
+        for slot in self._slots.values():
+            if slot.status != 'conditional':
+                continue
+            entry = slot.entries[0] if slot.entries else None
+            if not entry:
+                continue
+            orders.append(Order(
+                id=f"VCOND-{slot.id}",
+                exchange=slot.exchange, symbol=slot.symbol,
+                side='buy' if slot.side == 'long' else 'sell',
+                order_type=entry.order_type,
+                price=entry.price,
+                qty=entry.qty,
+                status='working',
+                is_paper=slot.is_paper,
+                slot_id=slot.id,
+            ))
         return orders
 
     # ── Alert management ──────────────────────────────────────────────────────

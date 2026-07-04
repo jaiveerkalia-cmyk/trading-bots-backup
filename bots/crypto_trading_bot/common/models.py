@@ -122,7 +122,7 @@ class TradeSlot(BaseModel):
     margin_mode:      Literal['cross', 'isolated'] = 'cross'
     qty_mode:         Literal['base', 'quote', 'risk'] = 'risk'
     risk_pct:         float           = 0.5
-    status:           Literal['pending', 'active', 'closed', 'stopped'] = 'pending'
+    status:           Literal['pending', 'working', 'active', 'closed', 'stopped', 'conditional'] = 'pending'
     position:         Optional[Position] = None
     orders:           List[Order]     = Field(default_factory=list)
     sl_order_id:      Optional[str]   = None
@@ -131,7 +131,8 @@ class TradeSlot(BaseModel):
     created_at:       datetime        = Field(default_factory=datetime.utcnow)
     closed_at:        Optional[datetime] = None
     realized_pnl:     float           = 0.0
-    pnl_target:   Optional[float] = None   # close when unrealized PnL reaches this value
+    pnl_target:       Optional[float] = None   # close when unrealized PnL reaches this value
+    fire_on:          Optional[Literal['1m', '5m']] = None   # candle-close conditional entry
 
 # ── Alerts ─────────────────────────────────────────────────────────────────────
 

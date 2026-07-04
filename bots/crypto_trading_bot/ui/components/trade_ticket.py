@@ -36,6 +36,7 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         'qty':          0.0,
         'margin_mode':  'cross',
         'qty_mode':     'risk',
+        'fire_on':      'current',
     }
     refs     = {}
     # Initialise had_pos with sym key to prevent false clears on context changes
@@ -127,6 +128,15 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         refs['info_lbl'] = info_lbl
         refs['fee_lbl']  = fee_lbl
         refs['be_lbl']   = be_lbl
+
+        # Fire on: place immediately or wait for candle close
+        with ui.row().classes('w-full items-center gap-2 mb-2'):
+            ui.label('Fire on:').classes('text-xs text-gray-500 shrink-0')
+            ui.select(
+                {'current': 'Live', '1m': '1m Close', '5m': '5m Close'},
+                value='current',
+                on_change=lambda e: f.update({'fire_on': e.value}),
+            ).props('dense dark outlined').classes('flex-1')
 
         async def place():
             await _place(side, f, shared, redis, state, refs)
@@ -409,6 +419,34 @@ async def _place(side: str, f: dict, shared: dict,
             if not proceed:
                 ui.notify('Order not placed', type='info')
                 return
+
+    # ── Conditional order (1m / 5m candle close) ───────────────────────
+    fire_on = f.get('fire_on', 'current')
+    if fire_on in ('1m', '5m'):
+        if entry <= 0:
+            ui.notify('Set entry price for candle-close order', type='negative')
+            return
+        await commands.set_alert(redis, {
+            'exchange':          shared.get('exchange', 'binance_futures'),
+            'symbol':            shared.get('symbol', 'BTC/USDT'),
+            # Long fires when close >= entry; Short fires when close <= entry
+            'upper':             entry if side == 'long'  else None,
+            'lower':             entry if side == 'short' else None,
+            'period':            fire_on,
+            'order_side':        side,
+            'order_type':        order_type,
+            'order_entry_price': entry  if order_type != 'market' else None,
+            'order_stop':        stop   if stop   > 0 else None,
+            'order_target':      target if target > 0 else None,
+            'order_qty':         qty    if qty    > 0 else None,
+            'order_risk_pct':    shared.get('risk_pct', settings.DEFAULT_RISK_PCT),
+        })
+        ui.notify(
+            f'{fire_on} conditional {side} {order_type} @ {entry:g} set ✓',
+            type='positive',
+        )
+        _clear(f, refs)
+        return
 
     exchange = shared.get('exchange', 'binance_futures')
     balance  = max(shared.get('balance', 0), 1)

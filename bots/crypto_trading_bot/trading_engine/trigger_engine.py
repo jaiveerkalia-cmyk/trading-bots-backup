@@ -26,23 +26,25 @@ logger = logging.getLogger('trigger_engine')
 
 class TriggerEngine:
     __slots__ = ('_redis', '_slots', '_paper', '_on_exit', '_on_alert',
-                 '_task', '_clock_task', '_adapters')
+                 '_task', '_clock_task', '_adapters', '_on_conditional')
 
     def __init__(
         self,
         redis_client: aioredis.Redis,
         slot_manager: 'SlotManager',
-        on_exit:      Callable[[str, str], Awaitable[None]],
-        on_alert:     Callable[[Alert],    Awaitable[None]],
-        paper_engine: 'PaperEngine',
-        adapters:     dict | None = None,
+        on_exit:       Callable[[str, str], Awaitable[None]],
+        on_alert:      Callable[[Alert],    Awaitable[None]],
+        paper_engine:  'PaperEngine',
+        adapters:      dict | None = None,
+        on_conditional: Callable | None = None,
     ) -> None:
-        self._redis       = redis_client
-        self._slots       = slot_manager
-        self._paper       = paper_engine
-        self._on_exit     = on_exit
-        self._on_alert    = on_alert
-        self._adapters    = adapters or {}
+        self._redis          = redis_client
+        self._slots          = slot_manager
+        self._paper          = paper_engine
+        self._on_exit        = on_exit
+        self._on_alert       = on_alert
+        self._adapters       = adapters or {}
+        self._on_conditional = on_conditional
         self._task:        asyncio.Task | None = None
         self._clock_task:  asyncio.Task | None = None
 
@@ -197,6 +199,45 @@ class TriggerEngine:
                                 alert.symbol, interval, close,
                             )
                             await self._on_alert(alert)
+
+                # ── Conditional entry slots: placed from trade ticket with fire_on set ─
+                for slot in self._slots.get_all_slots():
+                    if slot.status != 'conditional':
+                        continue
+                    fire_on = getattr(slot, 'fire_on', None)
+                    if not fire_on:
+                        continue
+                    if fire_on == '5m' and not is_5m:
+                        continue   # 5m slot only fires at 5m boundaries
+
+                    entry = slot.entries[0] if slot.entries else None
+                    if not entry:
+                        continue
+                    ep         = entry.price or 0.0
+                    order_type = entry.order_type or 'limit'
+
+                    close_c = await self._fetch_closed_candle_close(
+                        slot.exchange, slot.symbol, fire_on
+                    )
+                    if close_c <= 0:
+                        continue
+
+                    # Trigger logic (based on OHLC close, not live tick):
+                    # limit  long : close <= entry  (price pulled back to buy level)
+                    # limit  short: close >= entry  (price rallied to sell level)
+                    # stop   long : close >= entry  (candle closed above breakout level)
+                    # stop   short: close <= entry  (candle closed below breakdown level)
+                    if slot.side == 'long':
+                        cond_met = (close_c <= ep) if order_type == 'limit' else (close_c >= ep)
+                    else:
+                        cond_met = (close_c >= ep) if order_type == 'limit' else (close_c <= ep)
+
+                    if cond_met and self._on_conditional:
+                        logger.info(
+                            "Conditional entry triggered [%s %s %s] close=%.6g ep=%.6g",
+                            slot.symbol, slot.side, order_type, close_c, ep,
+                        )
+                        asyncio.create_task(self._on_conditional(slot))
 
             except asyncio.CancelledError:
                 break
