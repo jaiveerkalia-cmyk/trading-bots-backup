@@ -422,30 +422,12 @@ async def _place(side: str, f: dict, shared: dict,
 
     # ── Conditional order (1m / 5m candle close) ───────────────────────
     fire_on = f.get('fire_on', 'current')
-    if fire_on in ('1m', '5m'):
-        if entry <= 0:
-            ui.notify('Set entry price for candle-close order', type='negative')
-            return
-        await commands.set_alert(redis, {
-            'exchange':          shared.get('exchange', 'binance_futures'),
-            'symbol':            shared.get('symbol', 'BTC/USDT'),
-            # Long fires when close >= entry; Short fires when close <= entry
-            'upper':             entry if side == 'long'  else None,
-            'lower':             entry if side == 'short' else None,
-            'period':            fire_on,
-            'order_side':        side,
-            'order_type':        order_type,
-            'order_entry_price': entry  if order_type != 'market' else None,
-            'order_stop':        stop   if stop   > 0 else None,
-            'order_target':      target if target > 0 else None,
-            'order_qty':         qty    if qty    > 0 else None,
-            'order_risk_pct':    shared.get('risk_pct', settings.DEFAULT_RISK_PCT),
-        })
-        ui.notify(
-            f'{fire_on} conditional {side} {order_type} @ {entry:g} set ✓',
-            type='positive',
-        )
-        _clear(f, refs)
+    if fire_on in ('1m', '5m') and order_type == 'market':
+        ui.notify('Candle-close orders require Limit or Stop Market order type',
+                  type='warning')
+        return
+    if fire_on in ('1m', '5m') and entry <= 0:
+        ui.notify('Set entry price for candle-close order', type='negative')
         return
 
     exchange = shared.get('exchange', 'binance_futures')
@@ -473,10 +455,12 @@ async def _place(side: str, f: dict, shared: dict,
         'qty_mode':     'base',
         'risk_pct':     shared.get('risk_pct', settings.DEFAULT_RISK_PCT),
         'is_paper':     not state.live_mode,
+        'fire_on':      fire_on if fire_on in ('1m', '5m') else None,
     })
 
+    cond_label = f'{fire_on.upper()} candle-close' if fire_on in ('1m', '5m') else order_type
     ui.notify(
-        f'{"Long" if side == "long" else "Short"} {order_type} queued ✓',
+        f'{"Long" if side == "long" else "Short"} {cond_label} queued',
         type='positive',
     )
     _clear(f, refs)

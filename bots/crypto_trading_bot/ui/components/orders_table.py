@@ -44,7 +44,8 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                 oid       = o.get('id', '')
                 is_vstop  = oid.startswith('VSTOP-')
                 is_vtgt   = oid.startswith('VTGT-')
-                is_virtual = is_vstop or is_vtgt
+                is_vcond  = oid.startswith('VCOND-')
+                is_virtual = is_vstop or is_vtgt or is_vcond
                 side       = o.get('side', '')
                 side_color = 'text-green-400' if side == 'buy' else 'text-red-400'
                 sid        = o.get('slot_id', '')
@@ -76,14 +77,18 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     ui.label(o.get('exchange', '')).classes('w-20 truncate')
                     ui.label(sym).classes('w-24 font-medium text-white')
                     ui.label(side.upper()).classes(f'w-12 {side_color}')
-                    type_label = ('STOP' if is_vstop else 'TARGET' if is_vtgt
-                                  else o.get('order_type', '').replace('_', ' '))
+                    type_label = ('STOP'   if is_vstop else
+                                  'TARGET' if is_vtgt  else
+                                  f"COND {o.get('order_type','').replace('_',' ').upper()}" if is_vcond else
+                                  o.get('order_type', '').replace('_', ' '))
                     type_color = ('text-orange-400' if is_vstop else
-                                  'text-blue-400' if is_vtgt else 'text-gray-300')
+                                  'text-blue-400'   if is_vtgt  else
+                                  'text-purple-400' if is_vcond else
+                                  'text-gray-300')
                     ui.label(type_label).classes(f'w-20 {type_color}')
-                    # Price column: limit price for real orders; '—' for virtual rows
+                    # Price: entry level for real orders + VCOND; hidden for VSTOP/VTGT
                     ui.label(
-                        f"{price:g}" if (price and not is_virtual) else '—'
+                        f"{price:g}" if (price and not (is_vstop or is_vtgt)) else '—'
                     ).classes('w-24 text-right font-mono')
                     ui.label(
                         f"{display_stop:g}" if display_stop else '—'
@@ -95,27 +100,38 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     ui.badge(o.get('status', ''), color='blue').classes('w-16')
 
                     with ui.row().classes('flex-1 gap-1 justify-end'):
-                        # Modify button
-                        async def toggle_modify(order_id=oid):
-                            if order_id in modifying:
-                                del modifying[order_id]
-                            else:
-                                modifying[order_id] = True
-                            rows.refresh()
-                        ui.button('Modify', on_click=toggle_modify).props('dense flat size=xs').classes('text-blue-400')
+                        # Modify button — not shown for VCOND (cancel and re-place)
+                        if not is_vcond:
+                            async def toggle_modify(order_id=oid):
+                                if order_id in modifying:
+                                    del modifying[order_id]
+                                else:
+                                    modifying[order_id] = True
+                                rows.refresh()
+                            ui.button('Modify', on_click=toggle_modify).props(
+                                'dense flat size=xs'
+                            ).classes('text-blue-400')
 
                         # Cancel / Remove button
-                        async def do_cancel(order_id=oid, slot_id=sid, symbol=sym, vstop=is_vstop, vtgt=is_vtgt):
+                        async def do_cancel(
+                            order_id=oid, slot_id=sid, symbol=sym,
+                            vstop=is_vstop, vtgt=is_vtgt, vcond=is_vcond,
+                        ):
                             await commands.cancel_order(redis, slot_id, order_id)
                             if vstop:
                                 ui.notify(f'Stop removed for {symbol}', type='info')
                             elif vtgt:
                                 ui.notify(f'Target removed for {symbol}', type='info')
+                            elif vcond:
+                                ui.notify(f'Conditional order cancelled for {symbol}',
+                                          type='info')
                             else:
                                 ui.notify(f'Cancel sent for {symbol}', type='warning')
                             modifying.pop(order_id, None)
                         lbl = 'Remove' if is_virtual else 'Cancel'
-                        ui.button(lbl, on_click=do_cancel).props('dense flat size=xs').classes('text-red-400')
+                        ui.button(lbl, on_click=do_cancel).props(
+                            'dense flat size=xs'
+                        ).classes('text-red-400')
 
                 # Inline modify form — shown when this order is being modified
                 if modifying.get(oid):
@@ -146,9 +162,9 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
             for o in state.open_orders
         ])
         slots_h = str([
-            (s.get('id'), s.get('stop_price'), s.get('target_price'))
+            (s.get('id'), s.get('stop_price'), s.get('target_price'), s.get('status'))
             for s in state.slots
-            if s.get('status') in ('working', 'active')
+            if s.get('status') in ('working', 'active', 'conditional')
         ])
         h = orders_h + slots_h
         if h != prev_hash['v']:
