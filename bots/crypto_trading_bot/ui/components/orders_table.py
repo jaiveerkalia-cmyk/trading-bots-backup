@@ -196,34 +196,60 @@ def _render_modify_form(
 ) -> None:
     """Render the inline modify form below an order row."""
 
-    # Mutable form state — updated by on_change callbacks
+    # Mutable form state — auto mode on by default
     mf: dict = {
         'entry':  price,
         'stop':   slot_stop,
         'target': slot_target,
         'qty':    float(o.get('qty', 0)),
-        'auto':   False,
+        'auto':   True,
     }
-    # Mutable ref so _recalc_auto can update the qty label after creation
-    qty_lbl_ref: list = [None]
+    qty_lbl_ref: list = [None]   # label showing auto qty
+    tgt_inp_ref: list = [None]   # tgt_inp widget so _recalc_auto can update it
 
     def _recalc_auto() -> None:
-        """Recompute qty from risk% whenever entry or stop changes (auto mode only)."""
+        """Recompute qty and R:R target whenever entry or stop changes (auto mode)."""
         if not mf['auto']:
             return
         ep = mf['entry']
         sp = mf['stop']
         if ep > 0 and sp > 0 and abs(ep - sp) > 1e-10:
-            exchange  = o.get('exchange', 'binance_futures')
-            balance   = max(shared.get('balance', 1), 1)
-            risk_pct  = shared.get('risk_pct', settings.DEFAULT_RISK_PCT)
-            fees      = settings.EXCHANGE_FEES.get(
+            exchange   = o.get('exchange', 'binance_futures')
+            balance    = max(shared.get('balance', 1), 1)
+            risk_pct   = shared.get('risk_pct', settings.DEFAULT_RISK_PCT)
+            fees_cfg   = settings.EXCHANGE_FEES.get(
                 exchange, {'maker': 0.001, 'taker': 0.001}
             )
-            fee_unit  = ep * fees['maker'] + sp * fees['taker']
-            mf['qty'] = round(
-                (balance * (risk_pct / 100)) / (abs(ep - sp) + fee_unit), 8
-            )
+            ot         = o.get('order_type', 'limit')
+            entry_fee  = fees_cfg['maker'] if ot == 'limit' else fees_cfg['taker']
+            taker_fee  = fees_cfg['taker']
+            fee_unit   = ep * entry_fee + sp * taker_fee
+            risk_amt   = balance * (risk_pct / 100)
+            mf['qty']  = round(risk_amt / (abs(ep - sp) + fee_unit), 8)
+
+            # R:R-based auto target
+            rr       = float(shared.get('rr_ratio', 2.0) or 2.0)
+            qty      = mf['qty']
+            pos_side = 'long' if o.get('side') == 'buy' else 'short'
+            if rr > 0 and qty > 0:
+                if pos_side == 'long':
+                    denom    = qty * (1.0 - taker_fee)
+                    auto_tgt = round(
+                        (rr * risk_amt + ep * qty * (1.0 + entry_fee)) / denom, 6
+                    ) if denom > 0 else 0.0
+                else:
+                    denom    = qty * (1.0 + taker_fee)
+                    auto_tgt = round(
+                        (ep * qty * (1.0 - entry_fee) - rr * risk_amt) / denom, 6
+                    ) if denom > 0 else 0.0
+                if auto_tgt > 0:
+                    mf['target'] = auto_tgt
+                    if tgt_inp_ref[0]:
+                        try:
+                            tgt_inp_ref[0].set_value(auto_tgt)
+                        except Exception:
+                            pass
+
         if qty_lbl_ref[0]:
             qty_lbl_ref[0].set_text(
                 f'Auto: {mf["qty"]:g}' if (mf['auto'] and mf['qty'] > 0) else ''
@@ -300,6 +326,7 @@ def _render_modify_form(
                 value=slot_target, min=0, format='%g',
                 on_change=lambda e: mf.update({'target': float(e.value or 0)}),
             ).props('dense dark outlined').classes('w-28')
+            tgt_inp_ref[0] = tgt_inp
 
             ui.label('Qty:').classes('text-gray-500 ml-2')
             qty_inp = ui.number(
@@ -308,7 +335,7 @@ def _render_modify_form(
             ).props('dense dark outlined').classes('w-24')
 
             ui.toggle(
-                {'auto': 'Auto Qty', 'manual': 'Manual'}, value='manual',
+                {'auto': 'Auto Qty', 'manual': 'Manual'}, value='auto',
                 on_change=lambda e: (
                     mf.update({'auto': e.value == 'auto'}),
                     _recalc_auto(),
@@ -319,6 +346,7 @@ def _render_modify_form(
                 'text-xs text-yellow-400 ml-1 self-center'
             )
             qty_lbl_ref[0] = qty_auto_lbl
+            _recalc_auto()   # populate qty + target immediately on open
 
             async def confirm_real(
                 order_id=oid, slot_id=sid,

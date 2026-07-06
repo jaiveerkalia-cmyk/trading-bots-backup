@@ -180,8 +180,13 @@ class PaperEngine:
             for item in self._pending_limits:
                 if item['order'].id == order_id:
                     o = item['order']
-                    if new_price > 0: o.price = new_price
-                    if new_qty   > 0: o.qty   = new_qty
+                    if new_price > 0:
+                        # stop_limit orders trigger on stop_price; limit orders on price
+                        if o.order_type == 'stop_limit':
+                            o.stop_price = new_price
+                        else:
+                            o.price = new_price
+                    if new_qty > 0: o.qty = new_qty
                     o.updated_at = datetime.now(timezone.utc)
                     return True
         return False

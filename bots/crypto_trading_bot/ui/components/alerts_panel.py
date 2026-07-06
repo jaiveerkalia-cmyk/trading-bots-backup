@@ -306,6 +306,8 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                             'flat round dense size=xs'
                         ).classes('text-gray-500')
 
+    prev_alert_hash = {'v': ''}
+
     def update() -> None:
         # Keep prev_triggered in sync
         current_ids = {a.get('id', '') for a in state.alerts}
@@ -319,6 +321,25 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     prev_triggered.add(aid)
                     _play(sound_cfg['name'], sound_cfg['duration'])
 
-        _redraw()
+        active     = [a for a in state.alerts if not a.get('triggered')]
+        new_hash   = str([(a.get('id'), a.get('upper'), a.get('lower'),
+                           a.get('period')) for a in active])
+        changed    = new_hash != prev_alert_hash['v']
+        prev_alert_hash['v'] = new_hash
+
+        if editing:
+            # While an edit form is open, only redraw if the edited alert
+            # disappeared (triggered or deleted) — otherwise leave the form
+            # untouched so the user can keep typing without losing focus.
+            active_ids = {a.get('id') for a in active}
+            stale = [aid for aid in list(editing) if aid not in active_ids]
+            if stale:
+                for aid in stale:
+                    editing.pop(aid, None)
+                _redraw()
+            return
+
+        if changed:
+            _redraw()
 
     return {'update': update}

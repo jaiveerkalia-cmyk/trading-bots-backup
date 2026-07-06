@@ -401,35 +401,23 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
 
         if order_type == 'limit' and limit_price:
-            if slot.is_paper:
-                # Paper: simulate immediate fill at the specified limit price
-                order = Order(
+            order = Order(
+                exchange=slot.exchange, symbol=slot.symbol,
+                side='sell' if slot.side == 'long' else 'buy',
+                order_type='limit', price=limit_price,
+                qty=actual, slot_id=slot.id,
+            )
+            order = await om.place_order(order, slot)
+            slot.orders.append(order)
+            if order.status != 'filled':
+                # Working (paper pending or live pending) — shows in open orders
+                await sm.update_slot(slot)
+                sp.log(
+                    f"Limit exit placed {actual:g} {slot.symbol} @ {limit_price:g}",
                     exchange=slot.exchange, symbol=slot.symbol,
-                    side='sell' if slot.side == 'long' else 'buy',
-                    order_type='limit', price=limit_price,
-                    qty=actual, slot_id=slot.id,
-                    status='filled', filled_qty=actual,
-                    avg_fill_price=limit_price, is_paper=True,
                 )
-                order.updated_at = datetime.now(timezone.utc)
-                slot.orders.append(order)
-            else:
-                # Live: submit limit exit to exchange
-                order = Order(
-                    exchange=slot.exchange, symbol=slot.symbol,
-                    side='sell' if slot.side == 'long' else 'buy',
-                    order_type='limit', price=limit_price,
-                    qty=actual, slot_id=slot.id,
-                )
-                order = await om.place_order(order, slot)
-                slot.orders.append(order)
-                if order.status != 'filled':
-                    await sm.update_slot(slot)
-                    sp.log(
-                        f"Limit exit placed {actual:g} {slot.symbol} @ {limit_price:g}",
-                        exchange=slot.exchange, symbol=slot.symbol,
-                    )
-                    return
+                return
+            # Immediate fill (live only) — fall through to PnL calc below
         else:
             order = Order(exchange=slot.exchange, symbol=slot.symbol,
                            side='sell' if slot.side == 'long' else 'buy',
@@ -620,20 +608,61 @@ async def _on_trigger_exit(slot_id, reason, sm, om, sp, cw, notifier, redis) -> 
 # Paper fill checker
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _handle_paper_exit_fill(
+    order: Order, slot: TradeSlot,
+    sm: 'SlotManager', pe: 'PaperEngine',
+    cw: 'CSVWriter', sp: 'StatePublisher', redis
+) -> None:
+    """Handle a paper pending limit exit order that just filled."""
+    actual      = order.filled_qty or order.qty or 0.0
+    if actual <= 0:
+        return
+    ep          = slot.position.entry_price
+    entry_time  = slot.position.opened_at
+    funding_pnl = getattr(slot.position, 'funding_pnl', 0.0)
+    pnl         = _partial_pnl(slot, order.avg_fill_price or 0.0, actual)
+    upd, _      = await pe.partial_close_position(slot.id, actual)
+    if upd is None:
+        await sm.close_slot(slot.id, pnl)
+        await _csv_close(cw, sm, slot, order, pnl, ep, 'partial',
+                         entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
+    else:
+        slot.position     = upd
+        slot.realized_pnl = round(getattr(slot, 'realized_pnl', 0.0) + pnl, 6)
+        await sm.update_slot(slot)
+        await _csv_close(cw, sm, slot, order, pnl, ep, 'partial',
+                         entry_time=entry_time, funding_pnl=funding_pnl, redis=redis)
+    sp.log(
+        f"Paper limit exit filled {slot.symbol} @ {order.avg_fill_price:g} "
+        f"pnl={pnl:+.4f}",
+        exchange=slot.exchange, symbol=slot.symbol,
+    )
+
+
 async def _paper_fill_checker(sm, om, sp, cw, pe, redis) -> None:
     while True:
         try:
+            # Include active slots (have positions with pending limit exits)
             pairs = {(s.exchange, s.symbol) for s in sm.get_all_slots()
-                     if s.status == 'working'}
+                     if s.status in ('working', 'active')}
             for exch, sym in pairs:
                 price = await pe._last_tick(exch, sym)
                 if price <= 0:
                     continue
                 for order in await pe.check_pending_fills(exch, sym, price):
                     slot = sm.get_slot(order.slot_id)
-                    if not slot or slot.status != 'working':
+                    if not slot:
                         continue
-                    await _process_filled_entry(order, slot, sm, pe, cw, sp, redis)
+                    # Determine entry vs exit by comparing order side to slot side
+                    exit_side = 'sell' if slot.side == 'long' else 'buy'
+                    if slot.position and order.side == exit_side:
+                        await _handle_paper_exit_fill(
+                            order, slot, sm, pe, cw, sp, redis
+                        )
+                    elif slot.status == 'working':
+                        await _process_filled_entry(
+                            order, slot, sm, pe, cw, sp, redis
+                        )
         except asyncio.CancelledError:
             break
         except Exception as exc:

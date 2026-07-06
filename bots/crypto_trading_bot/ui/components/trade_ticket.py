@@ -129,6 +129,28 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         refs['fee_lbl']  = fee_lbl
         refs['be_lbl']   = be_lbl
 
+        # Risk % and R:R (moved here from top bar)
+        with ui.row().classes('w-full gap-2 mb-2'):
+            ui.number(
+                value=shared.get('risk_pct', settings.DEFAULT_RISK_PCT),
+                min=0.01, max=10, step=0.1, format='%g',
+                label='Risk %',
+                on_change=lambda e: (
+                    shared.update({'risk_pct': float(e.value or 0.5)}),
+                    _recalc(f, shared, refs, state),
+                ),
+            ).props('dense dark outlined').classes('flex-1')
+
+            ui.number(
+                value=shared.get('rr_ratio', 2.0),
+                min=0.1, max=100, step=0.5, format='%g',
+                label='R:R',
+                on_change=lambda e: (
+                    shared.update({'rr_ratio': float(e.value or 2)}),
+                    _recalc(f, shared, refs, state),
+                ),
+            ).props('dense dark outlined').classes('flex-1')
+
         # Fire on: place immediately or wait for candle close
         with ui.row().classes('w-full items-center gap-2 mb-2'):
             ui.label('Fire on:').classes('text-xs text-gray-500 shrink-0')

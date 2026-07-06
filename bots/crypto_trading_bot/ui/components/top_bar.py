@@ -75,22 +75,6 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                 sym_inp.on('keydown.enter', lambda _: _apply_symbol())
 
                 ui.number(
-                    value=shared['risk_pct'], min=0.01, max=10,
-                    step=0.1, format='%g',
-                    on_change=lambda e: shared.update(
-                        {'risk_pct': float(e.value or 0.5)}
-                    ),
-                ).props('dense dark outlined label="Risk %"').classes('w-20')
-
-                ui.number(
-                    value=shared.get('rr_ratio', 2.0), min=0.1, max=100,
-                    step=0.5, format='%g',
-                    on_change=lambda e: shared.update(
-                        {'rr_ratio': float(e.value or 2)}
-                    ),
-                ).props('dense dark outlined label="R:R"').classes('w-20')
-
-                ui.number(
                     value=shared['balance'], min=0, step=100, format='%g',
                     on_change=lambda e: _on_balance(e, state, shared),
                 ).props('dense dark outlined label="Balance $"').classes('w-28')
