@@ -132,7 +132,8 @@ def build(state: 'UIState') -> dict:
                 'exchange':       o.get('exchange', ''),
                 'symbol':         o.get('symbol', ''),
                 'side':           o.get('side', ''),
-                'order_type':     o.get('order_type', '').replace('_', ' '),
+                'order_type':     ('Stop Market' if o.get('order_type') == 'stop_limit'
+                                   else o.get('order_type', '').replace('_', ' ').title()),
                 'filled_qty':     f"{float(o.get('filled_qty', 0)):g}",
                 'trigger_price':  _trigger_px(o),
                 'avg_fill_price': f"{fill_px:g}" if fill_px else '—',

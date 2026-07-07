@@ -480,7 +480,8 @@ async def _place(side: str, f: dict, shared: dict,
         'fire_on':      fire_on if fire_on in ('1m', '5m') else None,
     })
 
-    cond_label = f'{fire_on.upper()} candle-close' if fire_on in ('1m', '5m') else order_type
+    cond_label = (f'{fire_on.upper()} candle-close' if fire_on in ('1m', '5m') else
+                  'Stop Market' if order_type == 'stop_limit' else order_type)
     ui.notify(
         f'{"Long" if side == "long" else "Short"} {cond_label} queued',
         type='positive',

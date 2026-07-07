@@ -79,16 +79,23 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     ui.label(side.upper()).classes(f'w-12 {side_color}')
                     type_label = ('STOP'   if is_vstop else
                                   'TARGET' if is_vtgt  else
-                                  f"COND {o.get('order_type','').replace('_',' ').upper()}" if is_vcond else
-                                  o.get('order_type', '').replace('_', ' '))
+                                  f"COND {_ot_label(o.get('order_type',''))}" if is_vcond else
+                                  _ot_label(o.get('order_type', '')))
                     type_color = ('text-orange-400' if is_vstop else
                                   'text-blue-400'   if is_vtgt  else
                                   'text-purple-400' if is_vcond else
                                   'text-gray-300')
                     ui.label(type_label).classes(f'w-20 {type_color}')
-                    # Price: entry level for real orders + VCOND; hidden for VSTOP/VTGT
+                    # For stop_limit, trigger is stop_price; fall back to price
+                    # (VCOND virtual orders store trigger in price, not stop_price)
+                    ot_key        = o.get('order_type', '')
+                    display_price = (
+                        float(o.get('stop_price') or o.get('price') or 0)
+                        if ot_key == 'stop_limit' else price
+                    )
+                    # Price: entry/trigger for real orders + VCOND; hidden for VSTOP/VTGT
                     ui.label(
-                        f"{price:g}" if (price and not (is_vstop or is_vtgt)) else '—'
+                        f"{display_price:g}" if (display_price and not (is_vstop or is_vtgt)) else '—'
                     ).classes('w-24 text-right font-mono')
                     ui.label(
                         f"{display_stop:g}" if display_stop else '—'
@@ -135,12 +142,17 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
 
                 # Inline modify form — shown when this order is being modified
                 if modifying.get(oid):
+                    # stop_limit trigger is stop_price, not price
+                    trigger_price = (
+                        float(o.get('stop_price') or 0)
+                        if o.get('order_type') == 'stop_limit' else price
+                    )
                     _render_modify_form(
                         o           = o,
                         oid         = oid,
                         sid         = sid,
                         sym         = sym,
-                        price       = price,
+                        price       = trigger_price,
                         slot_stop   = slot_stop,
                         slot_target = slot_target,
                         is_vstop    = is_vstop,
@@ -178,6 +190,13 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Modify form (module-level so rows() stays readable)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _ot_label(ot: str) -> str:
+    """Human-readable order type label (stop_limit -> Stop Market)."""
+    if ot == 'stop_limit':
+        return 'Stop Market'
+    return ot.replace('_', ' ').title()
+
 
 def _render_modify_form(
     o: dict,
@@ -302,8 +321,10 @@ def _render_modify_form(
             ).classes('bg-blue-700 text-white ml-2')
 
         else:
-            # ── Real working order: entry + stop + target + qty + auto toggle ─
-            ui.label('Entry:').classes('text-gray-500')
+            # ── Real working order: entry/trigger + stop + target + qty + auto ─
+            is_stop_limit = o.get('order_type') == 'stop_limit'
+            entry_label   = 'Trigger:' if is_stop_limit else 'Entry:'
+            ui.label(entry_label).classes('text-gray-500')
             entry_inp = ui.number(
                 value=price, min=0, format='%g',
                 on_change=lambda e: (
