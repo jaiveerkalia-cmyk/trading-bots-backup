@@ -61,11 +61,15 @@ async def update_slot(
     stop_price   = _UNSET,
     target_price = _UNSET,
     pnl_target   = _UNSET,
+    entry_price  = _UNSET,
+    entry_qty    = _UNSET,
 ) -> None:
     cmd: dict = {'type': redis_keys.CMD_UPDATE_SLOT, 'slot_id': slot_id}
     if stop_price   is not _UNSET: cmd['stop_price']   = stop_price
     if target_price is not _UNSET: cmd['target_price'] = target_price
     if pnl_target   is not _UNSET: cmd['pnl_target']   = pnl_target
+    if entry_price  is not _UNSET: cmd['entry_price']  = entry_price
+    if entry_qty    is not _UNSET: cmd['entry_qty']    = entry_qty
     await _push(redis, cmd)
 
 async def clear_all_alerts(redis) -> None:

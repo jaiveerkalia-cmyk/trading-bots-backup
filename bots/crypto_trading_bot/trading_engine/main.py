@@ -478,6 +478,10 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         if 'stop_price'   in cmd: slot.stop_price   = cmd['stop_price']
         if 'target_price' in cmd: slot.target_price = cmd['target_price']
         if 'pnl_target'   in cmd: slot.pnl_target   = cmd['pnl_target']
+        if 'entry_price'  in cmd and slot.entries:
+            slot.entries[0].price = cmd['entry_price']
+        if 'entry_qty'    in cmd and slot.entries:
+            slot.entries[0].qty   = cmd['entry_qty']
         await sm.update_slot(slot)
 
     elif action == redis_keys.CMD_CANCEL_ORDER:
