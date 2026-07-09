@@ -148,6 +148,11 @@ class PaperEngine:
     ) -> list[Order]:
         if not self._pending_limits:
             return []
+
+        # Fetch book once, outside the lock, so we don't hold the lock
+        # while doing I/O. Falls back to tick price if unavailable.
+        book = await self._fetch_book(exchange, symbol)
+
         filled: list[Order] = []
         remaining: list[dict] = []
         async with self._lock:
@@ -156,15 +161,74 @@ class PaperEngine:
                     remaining.append(item)
                     continue
                 o = item['order']
-                # was: self._do_fill(o, o.price or price)
                 if self._is_fillable(o, price):
-                    fill_price = price if o.order_type == 'stop_limit' else (o.price or price)
+                    if book:
+                        fill_price = self._fill_price_from_book(o, book, price)
+                    else:
+                        # No book yet — fall back to tick price
+                        fill_price = (
+                            price if o.order_type == 'stop_limit'
+                            else (o.price or price)
+                        )
                     self._do_fill(o, fill_price)
                     filled.append(o)
                 else:
                     remaining.append(item)
             self._pending_limits = remaining
         return filled
+
+    def _fill_price_from_book(
+        self, order: Order, book: 'OrderBook', fallback: float
+    ) -> float:
+        """
+        Walk bid/ask levels to compute a realistic average fill price.
+
+        Limit orders: consumes levels up to the limit price only.
+        Stop Market : consumes from best available level (market fill).
+        Leftover qty that exceeds available depth is filled at the last
+        touched level price — simulating market impact.
+        """
+        is_buy   = order.side == 'buy'
+        levels   = [
+            (lv.price, lv.qty)
+            for lv in (book.asks if is_buy else book.bids)
+        ]
+        limit_px = order.price if order.order_type == 'limit' else None
+
+        if not levels:
+            return fallback
+
+        remaining   = order.qty
+        total_cost  = 0.0
+        filled      = 0.0
+        last_price  = levels[0][0]   # best available
+
+        for lp, lq in levels:
+            last_price = lp
+            # Limit orders: stop at the limit price
+            if limit_px is not None:
+                if is_buy  and lp > limit_px: break
+                if not is_buy and lp < limit_px: break
+
+            take        = min(remaining, lq)
+            total_cost += take * lp
+            filled     += take
+            remaining  -= take
+
+            if remaining <= 1e-10:
+                break
+
+        if filled <= 1e-10:
+            # Nothing could be filled at an acceptable price —
+            # limit order stays pending; use fallback for stop market
+            return fallback if order.order_type != 'limit' else 0.0
+
+        # Remainder beyond available depth — fill at last level (market impact)
+        if remaining > 1e-10:
+            total_cost += remaining * last_price
+            filled     += remaining
+
+        return round(total_cost / filled, 8)
 
     def cancel_pending(self, order_id: str) -> bool:
         before = len(self._pending_limits)

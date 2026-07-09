@@ -39,6 +39,8 @@ VIX_SYMBOL = 'NSE:INDIA VIX'
 # TARGETS (Per Lot)
 TARGET_PROFIT_PER_LOT = 45000 
 MAX_LOSS_PER_LOT = 3000
+# While skip_till_hour is active, close for the day if net PnL reaches this multiple of GLOBAL_MAX_LOSS. Set 0 to disable.
+SKIP_CHECKING_TILL_HOUR_LOSS_BYPASS = 2
 # Once one leg is closed, close the other leg when total profit crosses this value.
 POST_LEG_CLOSE_PROFIT_TARGET = 100
 # PREMIUM THRESHOLDS (For Total_premium_skip)
@@ -101,7 +103,7 @@ DAY_CONFIGURATION = {
     3: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:19', 'entry_gap': 10, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': True, 'atr_ema_window': 20,
         'atr_stop_per_lot': 10, 'atr_entry_gap': 20, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False, 'hedgeless_mode': True,
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': True,
         'index_based_entry': True, 'atr_entry_multiplier': 2},
 
     # Friday (NIFTY)
@@ -673,6 +675,7 @@ def run_trading_process():
         target_profit_per_lot = config.get('target_profit_per_lot', TARGET_PROFIT_PER_LOT)
         max_loss_per_lot = config.get('max_loss_per_lot', MAX_LOSS_PER_LOT)
         stop_percent = config.get('stop_percent', 50)
+        skip_checking_till_hour_loss_bypass = config.get('skip_checking_till_hour_loss_bypass', SKIP_CHECKING_TILL_HOUR_LOSS_BYPASS)
         GLOBAL_PROFIT_TARGET = target_profit_per_lot * LOTS
         GLOBAL_MAX_LOSS = max_loss_per_lot * LOTS
         
@@ -683,6 +686,7 @@ def run_trading_process():
         print(f"Entry Gap:         {'ATR-DERIVED' if ATR_MODE_ON else config['entry_gap']}", flush=True)
         print(f"Strike Gap:        {config['strike_gap']}", flush=True)
         print(f"Risk Checks:       Start after {config.get('skip_till_hour', 8)}:59", flush=True)
+        print(f"Skip-Hour Bypass:  {skip_checking_till_hour_loss_bypass}x Global Max Loss ({'DISABLED' if skip_checking_till_hour_loss_bypass == 0 else 'ENABLED'})", flush=True)
         print(f"Stop %:            {stop_percent}", flush=True)
         print(f"ATM Finder:        {'ENABLED' if config.get('find_atm', True) else 'DISABLED'}", flush=True)
         print(f"ATR Mode:          {'ENABLED' if ATR_MODE_ON else 'DISABLED'} | EMA Window: {config.get('atr_ema_window', 20)} | Stop Mult: {config.get('atr_stop_per_lot', 30)} | Gap %: {config.get('atr_entry_gap', 10)}", flush=True)
@@ -1252,6 +1256,17 @@ def run_trading_process():
             
             gross_pnl = pnl_sp + pnl_sc + pnl_hp + pnl_hc + pnl_bp + pnl_bc
             current_net_pnl = gross_pnl - comm_curr
+            total_net_pnl = current_net_pnl + final_realized_pnl
+
+            if (
+                skip_checking_till_hour_loss_bypass > 0
+                and not risk_checks_enabled
+                and total_net_pnl <= -(GLOBAL_MAX_LOSS * skip_checking_till_hour_loss_bypass)
+            ):
+                bypass_loss_limit = -(GLOBAL_MAX_LOSS * skip_checking_till_hour_loss_bypass)
+                print(f"!!! SKIP-HOUR LOSS BYPASS TRIGGERED: Net PnL {total_net_pnl:.2f} <= {bypass_loss_limit:.2f} while normal risk checks are skipped !!!", flush=True)
+                close_all_positions(f"Skip_Hour_Loss_Bypass_({total_net_pnl:.2f})")
+                break
             
             # --- MINUTE LOG ---
             if datetime.now().minute != last_print_minute:
