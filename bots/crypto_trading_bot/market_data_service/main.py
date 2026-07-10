@@ -207,6 +207,15 @@ async def _do_subscribe(
         try:
             if stream == 'ticker':
                 await adapter.subscribe_ticker(symbol, publisher.publish)
+                # Co-subscribe order book depth so the paper engine can compute
+                # realistic fill prices (VWAP-through-book / slippage simulation)
+                try:
+                    await adapter.subscribe_orderbook(symbol, publisher.publish)
+                except Exception as e:
+                    logger.debug(
+                        "Orderbook not available [%s %s]: %s (skipping)",
+                        exchange, symbol, e,
+                    )
             elif stream == 'orderbook':
                 await adapter.subscribe_orderbook(symbol, publisher.publish)
             elif stream.startswith('candles:'):

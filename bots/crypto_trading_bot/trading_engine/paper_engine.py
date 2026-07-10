@@ -219,9 +219,9 @@ class PaperEngine:
                 break
 
         if filled <= 1e-10:
-            # Nothing could be filled at an acceptable price —
-            # limit order stays pending; use fallback for stop market
-            return fallback if order.order_type != 'limit' else 0.0
+            # No book levels at an acceptable price — use conservative fallback:
+            # limit order fills at its own price; stop market fills at tick price.
+            return order.price or fallback
 
         # Remainder beyond available depth — fill at last level (market impact)
         if remaining > 1e-10:
