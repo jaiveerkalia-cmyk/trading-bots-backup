@@ -293,6 +293,8 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
         """Fetch historical OHLCV via Binance Futures REST (ccxt).
         Returns [[ts_ms, o, h, l, c, v], ...] sorted oldest-first.
         """
+        if not self._ex:
+            return []
         try:
             return await self._ex.fetch_ohlcv(symbol, interval, limit=limit)
         except Exception as e:

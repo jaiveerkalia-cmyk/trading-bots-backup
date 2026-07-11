@@ -27,6 +27,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger('market_data')
 
+
+class _SuppressCcxtCancelled(logging.Filter):
+    """ccxt's after_interrupt callback calls .exception() on cancelled tasks,
+    which raises CancelledError and logs it as an asyncio error.  This is a
+    known ccxt bug (missing .cancelled() check) — suppress the noise."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not (
+            'Exception in callback' in msg
+            and 'CancelledError' in msg
+        )
+
+
+logging.getLogger('asyncio').addFilter(_SuppressCcxtCancelled())
+
 CONTROL_CHANNEL = 'market_data:control'
 ACTIVE_SUBS_KEY = 'market_data:active_subs'
 DEFAULT_STREAMS  = ['ticker']

@@ -335,8 +335,11 @@ class BinanceAdapter(BaseExchangeAdapter):
         """Fetch historical OHLCV via Binance REST (ccxt), routing to spot or futures.
         Returns [[ts_ms, o, h, l, c, v], ...] sorted oldest-first.
         """
+        ex = self._get_ex(symbol)
+        if not ex:
+            return []
         try:
-            return await self._get_ex(symbol).fetch_ohlcv(symbol, interval, limit=limit)
+            return await ex.fetch_ohlcv(symbol, interval, limit=limit)
         except Exception as e:
             logger.error(f"Binance fetch_ohlcv [{symbol} {interval}]: {e}")
             return []
