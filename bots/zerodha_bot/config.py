@@ -20,6 +20,16 @@ INDICES = {
 FORCE_EXIT_TIME = dtime(23, 59)
 AUTO_SQUAREOFF_TIME = dtime(15, 19)
 
+# --- ALERT SOUND LIBRARY ---
+# Reuses the same known-good sound URLs already used elsewhere in the app (open/close/error),
+# just exposed as user-selectable named options for the Upper/Lower price alert cards.
+ALERT_SOUND_URLS = {
+    'Wood Plank': 'https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg',
+    'Pop': 'https://actions.google.com/sounds/v1/cartoon/pop.ogg',
+    'Boing': 'https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg',
+    'Crash': 'https://actions.google.com/sounds/v1/cartoon/clank_car_crash.ogg',
+}
+
 # --- SHARED STATE ---
 shared_state = {
     'NIFTY': {'ltp': 0.0, 'open': 0.0, 'high': 0.0, 'low': 0.0},
@@ -73,7 +83,12 @@ UI_OPTS = {
     'open_modes': ['Current', '5m', '1m', 'Loss'],
     'index_times': ['Current', '5m', '1m'],
     'toggles': ['Yes', 'No'],
-    'on_off': ['On', 'Off']
+    'on_off': ['On', 'Off'],
+    # Unified Open Short/Long card options (order type + fire-on timeframe)
+    'order_types': ['Market', 'Limit', 'Stop-Market'],
+    'fire_on_opts': ['Live', '1m', '5m', '15m', '60m'],
+    # Alert sound options (Upper/Lower alert cards)
+    'alert_sounds': list(ALERT_SOUND_URLS.keys()),
 }
 
 # --- USER PARAMETERS ---
@@ -100,6 +115,11 @@ params = {
     'alert_upper': 0, 'alert_lower': 0,
     'alert_upper_active': False, 'alert_lower_active': False,
 
+    # Split Upper/Lower alert cards: independent period, sound choice, and sound duration (secs)
+    'alert_upper_period': 'Current', 'alert_lower_period': 'Current',
+    'alert_upper_sound': 'Wood Plank', 'alert_lower_sound': 'Wood Plank',
+    'alert_upper_duration': 5, 'alert_lower_duration': 5,
+
     'global_stop_value': 0, 'global_target_value': 0, 'global_stop_active': False, 'global_tgt_active': False,
 
     'call_index_stop_val': 0, 'call_index_stop_time': 'Current', 'call_index_stop_active': False,
@@ -114,4 +134,15 @@ params = {
 
     'put_prem_stop_val': 0, 'put_prem_stop_time': 'Current', 'put_prem_stop_active': False,
     'put_prem_target_val': 0, 'put_prem_target_time': 'Current', 'put_prem_tgt_active': False,
+
+    # --- Unified Open Short/Long cards (index-based, single-step order entry) ---
+    # order_type: Market fires immediately. Limit/Stop-Market check trigger_price against
+    # index price on the fire_on timeframe, then fire a market order for the option leg.
+    'call_order_type': 'Market', 'call_trigger_price': 0, 'call_strike_offset': 1,
+    'call_fire_on': 'Live', 'call_qty': 4, 'call_armed': False,
+    'call_new_stop': '', 'call_new_target': '',
+
+    'put_order_type': 'Market', 'put_trigger_price': 0, 'put_strike_offset': 1,
+    'put_fire_on': 'Live', 'put_qty': 4, 'put_armed': False,
+    'put_new_stop': '', 'put_new_target': '',
 }

@@ -60,7 +60,7 @@ class CsvManager:
 class LogicEngine:
     def __init__(self, ticker_client, instrument_manager):
         self.ticker = ticker_client; self.inst_manager = instrument_manager; self.csv_manager = CsvManager()
-        self.last_trigger_time = {'1m': None, '5m': None, 'chart': None}
+        self.last_trigger_time = {'1m': None, '5m': None, '15m': None, '60m': None, 'chart': None}
         self.alert_triggered = {'upper': False, 'lower': False}
         self.trading_active = True
 
@@ -75,6 +75,16 @@ class LogicEngine:
     def play_sound(self, type='alert'):
         if params['mute_sound']: return
         shared_state['sound_queue'].append(type)
+
+    def play_alert_sound(self, sound_name, duration):
+        """Pushes a user-selectable (sound, duration) alert sound. Distinct tuple shape from
+        the legacy string entries ('open'/'close'/'error'/'alert') so existing sound_queue
+        consumers keep working unchanged; consumers check for this tuple shape additively."""
+        if params['mute_sound']: return
+        try: dur = float(duration)
+        except (ValueError, TypeError): dur = 5
+        if dur <= 0: dur = 5
+        shared_state['sound_queue'].append(('alert_custom', sound_name, dur))
 
     def add_chart_marker(self, text, value):
         t = datetime.now().strftime("%H:%M")
@@ -119,7 +129,7 @@ class LogicEngine:
                 attempts += 1; self.log_action(f"⚠️ RETRY {attempts}: {symbol}", str(e)); time.sleep(1)
         self.log_action(f"❌ FAILED: {symbol}", "Manual Check Req"); self.play_sound('error'); return False
 
-    def open_position(self, side, manual_strike=None, reason="Manual"):
+    def open_position(self, side, manual_strike=None, reason="Manual", qty_override=None, strike_offset=None):
         if not self.trading_active: return False, "Trading Stopped"
         index_name = params['trading_index']; index_ltp = shared_state[index_name]['ltp']
         step = INDICES[index_name]['step']; lot_size = INDICES[index_name]['lot_size']
@@ -129,7 +139,14 @@ class LogicEngine:
         if index_ltp == 0: return False, "Index Price 0"
         if shared_state['active_trades'][side] is not None: return False, "Position Open"
 
-        if manual_strike: main_strike = manual_strike
+        if manual_strike:
+            main_strike = manual_strike
+        elif strike_offset is not None:
+            # Unified card strike selection: 0 = ATM, positive = ITM steps, negative = OTM steps.
+            try: offset = float(strike_offset)
+            except: offset = 0
+            atm = round(index_ltp / step) * step
+            main_strike = (atm - (offset * step)) if side == 'Call' else (atm + (offset * step))
         else:
             entry_mode = params['call_entry_mode'] if side == 'Call' else params['put_entry_mode']
             manual_key = 'call_manual_strike' if side == 'Call' else 'put_manual_strike'
@@ -142,7 +159,7 @@ class LogicEngine:
         main_token, main_symbol = self.inst_manager.get_atm_token(index_name, main_strike, opt_type)
         if not main_token: return False, "Token Not Found"
 
-        qty = int(params['lots']) * lot_size
+        qty = int(qty_override) * lot_size if qty_override is not None else int(params['lots']) * lot_size
         kite = self.inst_manager.kite
 
         if hedgeless:
@@ -302,6 +319,8 @@ class LogicEngine:
         is_new_min = now.second < 5; curr_min = now.minute
         fire_1m = is_new_min and self.last_trigger_time['1m'] != curr_min
         fire_5m = is_new_min and (curr_min % 5 == 0) and self.last_trigger_time['5m'] != curr_min
+        fire_15m = is_new_min and (curr_min % 15 == 0) and self.last_trigger_time['15m'] != curr_min
+        fire_60m = is_new_min and (curr_min == 0) and self.last_trigger_time['60m'] != curr_min
 
         # 15:19 Auto-Squareoff (SAVES PNL)
         if now.time() >= AUTO_SQUAREOFF_TIME and now.time() < dtime(15, 20) and not shared_state['auto_sq_done']:
@@ -314,12 +333,20 @@ class LogicEngine:
         if shared_state['active_trades']['Put'] is None and params['long_trigger_active']:
             self._check_single_open('Put', 'long', idx_ltp, fire_1m, fire_5m)
 
+        # Unified Open Short/Long cards (index-based, order-type + fire-on aware)
+        if shared_state['active_trades']['Call'] is None and params.get('call_armed'):
+            self._check_unified_open('Call', idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+        if shared_state['active_trades']['Put'] is None and params.get('put_armed'):
+            self._check_unified_open('Put', idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+
         self._check_exits(idx_ltp, fire_1m, fire_5m)
         self._check_global_limits()
         self._check_alerts(idx_ltp, fire_1m, fire_5m)
 
         if fire_1m: self.last_trigger_time['1m'] = curr_min
         if fire_5m: self.last_trigger_time['5m'] = curr_min
+        if fire_15m: self.last_trigger_time['15m'] = curr_min
+        if fire_60m: self.last_trigger_time['60m'] = curr_min
 
     def _check_single_open(self, side, prefix, idx_ltp, fire_1m, fire_5m):
         mode = params[f'{prefix}_open_mode']
@@ -351,6 +378,71 @@ class LogicEngine:
             if not success:
                 self.log_action(f"⚠️ Trigger Fired but Open Failed: {msg}")
                 params[f'{prefix}_trigger_active'] = False
+                self.play_sound('error')
+
+    def _check_unified_open(self, side, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m):
+        """Checks/fires the new unified Open Short/Long card (order type + fire-on timeframe)."""
+        prefix = 'call' if side == 'Call' else 'put'
+        order_type = params.get(f'{prefix}_order_type', 'Market')
+        fire_on = params.get(f'{prefix}_fire_on', 'Live')
+
+        try: trigger_price = float(params.get(f'{prefix}_trigger_price', 0))
+        except: trigger_price = 0
+        try: strike_offset = float(params.get(f'{prefix}_strike_offset', 1))
+        except: strike_offset = 1
+        try: qty = int(float(params.get(f'{prefix}_qty', 4)))
+        except: qty = 4
+
+        # Gate by the selected candle-close timeframe. 'Live' checks every tick.
+        if fire_on == 'Live': timing_ok = True
+        elif fire_on == '1m': timing_ok = fire_1m
+        elif fire_on == '5m': timing_ok = fire_5m
+        elif fire_on == '15m': timing_ok = fire_15m
+        elif fire_on == '60m': timing_ok = fire_60m
+        else: timing_ok = True
+
+        if idx_ltp <= 0: return
+
+        should_fire = False
+        reason = f"{order_type} @ {trigger_price} ({fire_on})"
+
+        if order_type == 'Market':
+            # Market orders fire immediately via the UI callback, not through this polling
+            # path. Kept here defensively in case armed is ever set for a Market order.
+            should_fire = True
+            reason = "Market (Immediate)"
+        elif not timing_ok:
+            return
+        elif order_type == 'Stop-Market':
+            # Breakout confirmation in the direction of the trade's original bias.
+            if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
+            elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
+        elif order_type == 'Limit':
+            # Wait for a better (opposite-direction) entry price.
+            if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
+            elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
+
+        if should_fire:
+            self.log_action(f"⚡ UNIFIED TRIGGER FIRED: {side} ({reason})")
+            success, msg = self.open_position(side, reason=reason, qty_override=qty, strike_offset=strike_offset)
+            if success:
+                params[f'{prefix}_armed'] = False
+                # Optional stop/target set at entry, applied via the existing PnL exit engine.
+                try:
+                    new_stop = float(params.get(f'{prefix}_new_stop', ''))
+                    if new_stop > 0:
+                        params[f'{prefix}_stop_val'] = new_stop
+                        params[f'{prefix}_stop_active'] = True
+                except (ValueError, TypeError): pass
+                try:
+                    new_target = float(params.get(f'{prefix}_new_target', ''))
+                    if new_target > 0:
+                        params[f'{prefix}_target_val'] = new_target
+                        params[f'{prefix}_target_active'] = True
+                except (ValueError, TypeError): pass
+            else:
+                self.log_action(f"⚠️ Unified Trigger Fired but Open Failed: {msg}")
+                params[f'{prefix}_armed'] = False
                 self.play_sound('error')
 
     def _check_exits(self, idx_ltp, fire_1m, fire_5m):
@@ -438,16 +530,20 @@ class LogicEngine:
 
     def _check_alerts(self, idx_ltp, fire_1m, fire_5m):
         up = params['alert_upper']; low = params['alert_lower']
-        mode = params['alert_period']
-        check = (mode == 'Current') or (mode == '1m' and fire_1m) or (mode == '5m' and fire_5m)
-        if check:
-            triggered = False
-            if params['alert_upper_active'] and up > 0 and idx_ltp >= up:
-                ui.notify(f"ALERT: Price {idx_ltp} > {up}", type='warning', close_button=True)
-                triggered = True; params['alert_upper_active'] = False; params['alert_upper_input'] = 0
-                self.log_action(f"🔔 ALERT: {idx_ltp} >= {up}")
-            if params['alert_lower_active'] and low > 0 and idx_ltp <= low:
-                ui.notify(f"ALERT: Price {idx_ltp} < {low}", type='warning', close_button=True)
-                triggered = True; params['alert_lower_active'] = False; params['alert_lower_input'] = 0
-                self.log_action(f"🔔 ALERT: {idx_ltp} <= {low}")
-            if triggered: self.play_sound('error')
+
+        upper_mode = params.get('alert_upper_period', 'Current')
+        lower_mode = params.get('alert_lower_period', 'Current')
+        check_upper = (upper_mode == 'Current') or (upper_mode == '1m' and fire_1m) or (upper_mode == '5m' and fire_5m)
+        check_lower = (lower_mode == 'Current') or (lower_mode == '1m' and fire_1m) or (lower_mode == '5m' and fire_5m)
+
+        if check_upper and params['alert_upper_active'] and up > 0 and idx_ltp >= up:
+            ui.notify(f"ALERT: Price {idx_ltp} > {up}", type='warning', close_button=True)
+            params['alert_upper_active'] = False; params['alert_upper_input'] = 0
+            self.log_action(f"🔔 ALERT: {idx_ltp} >= {up}")
+            self.play_alert_sound(params.get('alert_upper_sound', 'Wood Plank'), params.get('alert_upper_duration', 5))
+
+        if check_lower and params['alert_lower_active'] and low > 0 and idx_ltp <= low:
+            ui.notify(f"ALERT: Price {idx_ltp} < {low}", type='warning', close_button=True)
+            params['alert_lower_active'] = False; params['alert_lower_input'] = 0
+            self.log_action(f"🔔 ALERT: {idx_ltp} <= {low}")
+            self.play_alert_sound(params.get('alert_lower_sound', 'Wood Plank'), params.get('alert_lower_duration', 5))

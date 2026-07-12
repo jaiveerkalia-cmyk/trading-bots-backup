@@ -15,6 +15,60 @@ def entry_card(side, label, mode_key, input_key, on_open=None, on_close=None):
             ui.button(f'Open', color=btn_color, on_click=on_open).classes('grow rounded-lg shadow-sm')
             ui.button(f'Close', on_click=on_close).classes('grow rounded-lg shadow-sm bg-gray-200 text-gray-800 hover:bg-gray-300')
 
+def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
+    """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
+    Stop-Market), trigger price, strike offset (0=ATM, 1=ITM, -1=OTM), optional stop/target,
+    a fire-on timeframe, and its own qty. Market fires immediately via on_fire_market.
+    Limit/Stop-Market arm the trade; index conditions are then checked and fired by
+    LogicEngine._check_unified_open in logic_engine.py."""
+    color_class = 'bg-red-100 border-red-300' if side == 'Call' else 'bg-green-100 border-green-300'
+    btn_color = 'red' if side == 'Call' else 'green'
+    title = 'Open Short' if side == 'Call' else 'Open Long'
+    order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
+    strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
+    fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
+    stop_key = f'{prefix}_new_stop'; target_key = f'{prefix}_new_target'
+
+    with ui.card().classes(f'w-full p-3 gap-2 {color_class} border shadow-md rounded-xl'):
+        ui.label(title).classes('font-bold text-sm uppercase text-gray-800')
+
+        with ui.row().classes('w-full justify-start'):
+            ui.radio(UI_OPTS['order_types'], value=params[order_key]).bind_value(params, order_key).props('inline dense')
+
+        with ui.row().classes('w-full gap-2'):
+            trig_input = ui.input('Trigger Price').bind_value(params, trig_key).props('outlined dense bg-color=white').classes('grow')
+            trig_input.bind_enabled_from(params, order_key, backward=lambda v: v != 'Market')
+            ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, strike_key).props('outlined dense bg-color=white').classes('grow')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.input('Qty (Lots)').bind_value(params, qty_key).props('outlined dense bg-color=white').classes('grow')
+            ui.select(UI_OPTS['fire_on_opts'], value=params[fire_key]).bind_value(params, fire_key).props('outlined dense bg-color=white').classes('grow')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.input('Stop (optional)').bind_value(params, stop_key).props('outlined dense bg-color=white').classes('grow')
+            ui.input('Target (optional)').bind_value(params, target_key).props('outlined dense bg-color=white').classes('grow')
+
+        status = ui.label().classes('w-full text-center text-xs font-bold text-white bg-green-600 rounded p-1 shadow-sm')
+        status.bind_visibility_from(params, armed_key)
+
+        def fire_or_arm():
+            if params[order_key] == 'Market':
+                if on_fire_market: on_fire_market()
+            else:
+                params[armed_key] = True
+                status.set_text(f"ARMED: {params[order_key]} @ {params[trig_key]} ({params[fire_key]})")
+                ui.notify(f"{title} ARMED", type='positive')
+
+        def cancel():
+            params[armed_key] = False
+            ui.notify(f"{title} Cancelled", type='info')
+
+        with ui.row().classes('w-full gap-2'):
+            fire_btn = ui.button('Open Now', color=btn_color, on_click=fire_or_arm).classes('grow h-8 text-xs rounded-lg shadow-sm')
+            fire_btn.bind_text_from(params, order_key, backward=lambda v: 'Open Now' if v == 'Market' else 'Arm')
+            ui.button('Cancel', on_click=cancel).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
+            ui.button('Close', on_click=on_close).classes('grow h-8 text-xs rounded-lg bg-gray-300 text-gray-800 hover:bg-gray-400')
+
 def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_active_key):
     color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
     with ui.card().classes(f'w-full p-2 gap-2 {color_class} border shadow-sm rounded-xl'):
@@ -151,34 +205,47 @@ def premium_exit_card(side):
                     ui.button('Set', color='black', on_click=act_t).props('outline').classes('grow h-6 text-[10px] rounded')
                     ui.button('Reset', on_click=rst_t).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
 
-def alerts_card():
+def _alert_side_card(side_label, threshold_key, threshold_input_key, active_key, period_key, sound_key, duration_key, notify_fn):
+    """Shared builder for a single-sided (Upper or Lower) price alert card."""
     with ui.card().classes('w-full p-3 gap-2 bg-yellow-50 shadow-md border-l-4 border-yellow-400 rounded-xl'):
-        ui.label('Price Alerts').classes('font-bold text-gray-800')
+        ui.label(f'{side_label} Price Alert').classes('font-bold text-gray-800')
+
         with ui.row().classes('items-center w-full justify-between'):
             ui.label('Period:').classes('text-xs text-gray-500')
-            ui.radio(UI_OPTS['alert_periods'], value=params['alert_period']).bind_value(params, 'alert_period').props('inline dense')
-        with ui.row().classes('w-full gap-2'):
-            ui.input('Upper').bind_value(params, 'alert_upper_input').props('outlined dense bg-color=white').classes('grow')
-            ui.input('Lower').bind_value(params, 'alert_lower_input').props('outlined dense bg-color=white').classes('grow')
+            ui.radio(UI_OPTS['alert_periods'], value=params[period_key]).bind_value(params, period_key).props('inline dense')
 
-        def set_alerts():
+        ui.input(side_label).bind_value(params, threshold_input_key).props('outlined dense bg-color=white').classes('w-full')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.select(UI_OPTS['alert_sounds'], value=params[sound_key], label='Sound').bind_value(params, sound_key).props('outlined dense bg-color=white').classes('grow')
+            ui.input('Duration (s)').bind_value(params, duration_key).props('outlined dense bg-color=white').classes('w-28')
+
+        status = ui.label().classes('w-full text-center text-xs font-bold text-white bg-orange-500 rounded p-1 shadow-sm')
+        status.bind_visibility_from(params, active_key)
+
+        def set_alert():
             try:
-                params['alert_upper'] = float(params['alert_upper_input'])
-                params['alert_lower'] = float(params['alert_lower_input'])
-                params['alert_upper_active'] = True if params['alert_upper'] > 0 else False
-                params['alert_lower_active'] = True if params['alert_lower'] > 0 else False
-                ui.notify(f"Alerts ARMED: >{params['alert_upper']}, <{params['alert_lower']}", type='positive')
-            except: ui.notify("Invalid Alert Values", type='negative')
+                params[threshold_key] = float(params[threshold_input_key])
+                params[active_key] = True if params[threshold_key] > 0 else False
+                status.set_text(f"ARMED: {params[threshold_key]}")
+                notify_fn(f"{side_label} Alert ARMED: {params[threshold_key]}", type='positive')
+            except: notify_fn("Invalid Alert Value", type='negative')
 
-        def reset_alerts():
-            params['alert_upper'] = 0; params['alert_lower'] = 0
-            params['alert_upper_input'] = 0; params['alert_lower_input'] = 0
-            params['alert_upper_active'] = False; params['alert_lower_active'] = False
-            ui.notify("Alerts DISARMED", type='info')
+        def reset_alert():
+            params[threshold_key] = 0; params[threshold_input_key] = 0; params[active_key] = False
+            notify_fn(f"{side_label} Alert DISARMED", type='info')
 
         with ui.row().classes('w-full gap-2'):
-            ui.button('Set', color='orange', on_click=set_alerts).classes('grow h-8 rounded-lg')
-            ui.button('Reset', color='grey', on_click=reset_alerts).props('flat').classes('grow h-8 rounded-lg')
+            ui.button('Set', color='orange', on_click=set_alert).classes('grow h-8 rounded-lg')
+            ui.button('Reset', color='grey', on_click=reset_alert).props('flat').classes('grow h-8 rounded-lg')
+
+def alerts_card_upper():
+    _alert_side_card('Upper', 'alert_upper', 'alert_upper_input', 'alert_upper_active',
+                      'alert_upper_period', 'alert_upper_sound', 'alert_upper_duration', ui.notify)
+
+def alerts_card_lower():
+    _alert_side_card('Lower', 'alert_lower', 'alert_lower_input', 'alert_lower_active',
+                      'alert_lower_period', 'alert_lower_sound', 'alert_lower_duration', ui.notify)
 
 # --- HEADER / CHART / LOG ---
 
@@ -203,10 +270,6 @@ def render_master_banner(update_lots_callback):
             with ui.row().classes('items-center gap-2'):
                 ui.label('Index:').classes('font-bold text-orange-900 text-xs')
                 ui.radio(UI_OPTS['indices'], value=params['trading_index'], on_change=update_lots_callback).bind_value(params, 'trading_index').props('inline dense')
-            with ui.row().classes('items-center gap-2'):
-                ui.label('Lots:').classes('font-bold text-orange-900 text-xs ml-4')
-                ui.number(value=params['lots']).bind_value(params, 'lots').props('outlined dense bg-color=white').classes('w-20')
-                ui_refs['calc_qty'] = ui.label('(Qty: --)').classes('text-xs font-mono text-gray-500')
             with ui.row().classes('items-center gap-2'):
                 ui.label('Live Trading:').classes('font-bold text-orange-900 text-xs ml-4')
                 ui.radio(UI_OPTS['on_off'], value=params['live_trading']).bind_value(params, 'live_trading').props('inline dense')

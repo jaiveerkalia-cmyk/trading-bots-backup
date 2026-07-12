@@ -37,12 +37,34 @@ def handle_open(side):
 def handle_close(side):
     s, m = logic.close_position(side); ui.notify(m, type='positive' if s else 'negative')
 
+def handle_fire_market(side):
+    """Fires the unified Open Short/Long card immediately when order type is Market."""
+    prefix = 'call' if side == 'Call' else 'put'
+    try: qty = int(float(params.get(f'{prefix}_qty', 4)))
+    except: qty = 4
+    try: strike_offset = float(params.get(f'{prefix}_strike_offset', 1))
+    except: strike_offset = 1
+    s, m = logic.open_position(side, reason="Market (Immediate)", qty_override=qty, strike_offset=strike_offset)
+    if s:
+        try:
+            new_stop = float(params.get(f'{prefix}_new_stop', ''))
+            if new_stop > 0:
+                params[f'{prefix}_stop_val'] = new_stop
+                params[f'{prefix}_stop_active'] = True
+        except (ValueError, TypeError): pass
+        try:
+            new_target = float(params.get(f'{prefix}_new_target', ''))
+            if new_target > 0:
+                params[f'{prefix}_target_val'] = new_target
+                params[f'{prefix}_target_active'] = True
+        except (ValueError, TypeError): pass
+    ui.notify(m, type='positive' if s else 'negative')
+
 def reset_keys(keys, default=0):
     for k in keys: params[k] = default
 
 def build_left_stack(): 
-    comp.open_logic_card('Open Short', 'Call', 'short_open_mode', 'short_open_amount', 'short_open_strike', 'short_trigger_active')
-    comp.entry_card('Call', 'Entry', 'call_entry_mode', 'call_manual_strike', on_open=lambda: handle_open('Call'), on_close=lambda: handle_close('Call'))
+    comp.unified_entry_card('Call', 'call', on_fire_market=lambda: handle_fire_market('Call'), on_close=lambda: handle_close('Call'))
     # UPDATED: Passing independent keys
     comp.auto_close_card('Call', 'call_target_val', 'call_target_active', 'call_stop_val', 'call_stop_active')
     with ui.card().classes('w-full p-2 gap-2 bg-red-50 border border-red-200 shadow-sm rounded-xl'):
@@ -59,8 +81,7 @@ def build_center_stack():
     ui.button('CLOSE ALL', on_click=lambda: logic.close_all_positions("Manual Close All", save_pnl=True), color='red').classes('w-full font-bold shadow-md rounded-xl mt-4')
 
 def build_right_stack():
-    comp.open_logic_card('Open Long', 'Put', 'long_open_mode', 'long_open_amount', 'long_open_strike', 'long_trigger_active')
-    comp.entry_card('Put', 'Entry', 'put_entry_mode', 'put_manual_strike', on_open=lambda: handle_open('Put'), on_close=lambda: handle_close('Put'))
+    comp.unified_entry_card('Put', 'put', on_fire_market=lambda: handle_fire_market('Put'), on_close=lambda: handle_close('Put'))
     # UPDATED: Passing independent keys
     comp.auto_close_card('Put', 'put_target_val', 'put_target_active', 'put_stop_val', 'put_stop_active')
     with ui.card().classes('w-full p-2 gap-2 bg-green-50 border border-green-200 shadow-sm rounded-xl'):
@@ -112,6 +133,12 @@ def index():
             params[f'{prefix}_stop_val'] = 0
             params[f'{prefix}_index_stop_val'] = 0
             params[f'{prefix}_index_target_val'] = 0
+
+            # Reset Unified Open Short/Long card fields
+            params[f'{prefix}_armed'] = False
+            params[f'{prefix}_trigger_price'] = 0
+            params[f'{prefix}_new_stop'] = ''
+            params[f'{prefix}_new_target'] = ''
             
             ui.notify(f"Reset {side} Controls", type='warning')
 
@@ -136,7 +163,7 @@ def index():
         if ui_refs['last_action']: ui_refs['last_action'].set_text(shared_state['last_action'])
         
         if ui_refs['monitor_status']:
-            if params['short_trigger_active'] or params['long_trigger_active']:
+            if params['short_trigger_active'] or params['long_trigger_active'] or params.get('call_armed') or params.get('put_armed'):
                 ui_refs['monitor_status'].set_text('TRIGGERS ACTIVE'); ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-green-500 text-white px-2 py-1 rounded animate-pulse')
             else:
                 ui_refs['monitor_status'].set_text('TRIGGERS OFF'); ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-gray-800 text-gray-400 px-2 py-1 rounded')

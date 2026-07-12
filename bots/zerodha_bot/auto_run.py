@@ -45,7 +45,7 @@ def safe_ui_context():
 
 # --- IMPORT EXISTING MODULES ---
 import config
-from config import shared_state, params, ui_refs, INDICES, UI_OPTS
+from config import shared_state, params, ui_refs, INDICES, UI_OPTS, ALERT_SOUND_URLS
 import ui_components as comp
 from auth_manager import get_kite_session
 from ticker_engine import TickerClient
@@ -329,6 +329,9 @@ class AutoController:
             params['call_manual_strike'] = ""
             params['call_prem_stop_val'] = 0; params['call_prem_stop_active'] = False
             params['call_prem_target_val'] = 0; params['call_prem_tgt_active'] = False
+            # Unified Open Short card
+            params['call_armed'] = False; params['call_trigger_price'] = 0
+            params['call_new_stop'] = ''; params['call_new_target'] = ''
         elif side == 'Put':
             params['put_target_val'] = 0; params['put_target_active'] = False
             params['put_stop_val'] = 0; params['put_stop_active'] = False
@@ -339,6 +342,9 @@ class AutoController:
             params['put_manual_strike'] = ""
             params['put_prem_stop_val'] = 0; params['put_prem_stop_active'] = False
             params['put_prem_target_val'] = 0; params['put_prem_tgt_active'] = False
+            # Unified Open Long card
+            params['put_armed'] = False; params['put_trigger_price'] = 0
+            params['put_new_stop'] = ''; params['put_new_target'] = ''
 
     def sync_ui_parameters(self):
         if not self.is_active: return
@@ -470,29 +476,6 @@ class AutoController:
         params['call_manual_strike'] = str(int(itm_call_strike))
         
         self.log(f"♻️ Reversal Strikes Set (Base: {trigger_price}): Call {itm_call_strike} | Put {itm_put_strike}")
-
-    def clear_leg_fields(self, side):
-        """Wipes the physical text fields and disables toggles for a specific leg."""
-        if side == 'Call':
-            params['call_target_val'] = 0; params['call_target_active'] = False
-            params['call_stop_val'] = 0; params['call_stop_active'] = False
-            params['call_index_stop_val'] = ""; params['call_index_stop_active'] = False
-            params['call_index_target_val'] = ""; params['call_index_tgt_active'] = False
-            params['short_open_amount'] = ""; params['short_trigger_active'] = False
-            params['short_open_strike'] = ""
-            params['call_manual_strike'] = ""
-            params['call_prem_stop_val'] = 0; params['call_prem_stop_active'] = False
-            params['call_prem_target_val'] = 0; params['call_prem_tgt_active'] = False
-        elif side == 'Put':
-            params['put_target_val'] = 0; params['put_target_active'] = False
-            params['put_stop_val'] = 0; params['put_stop_active'] = False
-            params['put_index_stop_val'] = ""; params['put_index_stop_active'] = False
-            params['put_index_target_val'] = ""; params['put_index_tgt_active'] = False
-            params['long_open_amount'] = ""; params['long_trigger_active'] = False
-            params['long_open_strike'] = ""
-            params['put_manual_strike'] = ""
-            params['put_prem_stop_val'] = 0; params['put_prem_stop_active'] = False
-            params['put_prem_target_val'] = 0; params['put_prem_tgt_active'] = False
 
     def run_loop(self):
         now = datetime.now()
@@ -834,6 +817,21 @@ def update_ui():
     # 2. PROCESS SOUND QUEUE (Fixes 'No Sound')
     while shared_state.get('sound_queue'):
         snd = shared_state['sound_queue'].pop(0)
+
+        # NEW: user-selectable alert sound + duration, from the split Upper/Lower alert cards.
+        # Distinct tuple shape, so it can't collide with the legacy string entries below.
+        if isinstance(snd, tuple) and len(snd) == 3 and snd[0] == 'alert_custom':
+            _, sound_name, duration = snd
+            url = ALERT_SOUND_URLS.get(sound_name, ALERT_SOUND_URLS['Wood Plank'])
+            try: dur_ms = int(float(duration) * 1000)
+            except (ValueError, TypeError): dur_ms = 5000
+            if dur_ms <= 0: dur_ms = 5000
+            ui.run_javascript(
+                f'const a = new Audio("{url}"); a.play();'
+                f'setTimeout(() => {{ a.pause(); a.currentTime = 0; }}, {dur_ms});'
+            )
+            continue
+
         # We use a generic notification beep for all for now, or specific if desired
         # You can replace these URLs with any public mp3 link
         if snd == 'success':
@@ -871,7 +869,7 @@ def update_ui():
     if ui_refs['last_action']: ui_refs['last_action'].set_text(shared_state['last_action'])
     
     if ui_refs['monitor_status']:
-        if params['short_trigger_active'] or params['long_trigger_active']:
+        if params['short_trigger_active'] or params['long_trigger_active'] or params.get('call_armed') or params.get('put_armed'):
             ui_refs['monitor_status'].set_text('TRIGGERS ACTIVE')
             ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-green-500 text-white px-2 py-1 rounded animate-pulse whitespace-nowrap')
         else:
@@ -970,10 +968,6 @@ def custom_render_master_banner(update_lots_callback):
             with ui.row().classes('items-center gap-2'):
                 ui.label('Index:').classes('font-bold text-orange-900 text-xs')
                 ui.radio(UI_OPTS['indices'], value=params['trading_index'], on_change=update_lots_callback).bind_value(params, 'trading_index').props('inline dense')
-            with ui.row().classes('items-center gap-2'):
-                ui.label('Lots:').classes('font-bold text-orange-900 text-xs ml-4')
-                ui.number(value=params['lots']).bind_value(params, 'lots').props('outlined dense bg-color=white').classes('w-20')
-                ui_refs['calc_qty'] = ui.label('(Qty: --)').classes('text-xs font-mono text-gray-500')
             with ui.row().classes('items-center gap-2'):
                 ui.label('Live Trading:').classes('font-bold text-orange-900 text-xs ml-4')
                 ui.radio(UI_OPTS['on_off'], value=params['live_trading']).bind_value(params, 'live_trading').props('inline dense')
@@ -1135,6 +1129,29 @@ def handle_close(side):
         controller.clear_leg_fields(side)  # Wipe the fields
     ui.notify(m, type='positive' if s else 'negative')
 
+def handle_fire_market(side):
+    """Fires the unified Open Short/Long card immediately when order type is Market."""
+    prefix = 'call' if side == 'Call' else 'put'
+    try: qty = int(float(params.get(f'{prefix}_qty', 4)))
+    except: qty = 4
+    try: strike_offset = float(params.get(f'{prefix}_strike_offset', 1))
+    except: strike_offset = 1
+    s, m = logic.open_position(side, reason="Market (Immediate)", qty_override=qty, strike_offset=strike_offset)
+    if s:
+        try:
+            new_stop = float(params.get(f'{prefix}_new_stop', ''))
+            if new_stop > 0:
+                params[f'{prefix}_stop_val'] = new_stop
+                params[f'{prefix}_stop_active'] = True
+        except (ValueError, TypeError): pass
+        try:
+            new_target = float(params.get(f'{prefix}_new_target', ''))
+            if new_target > 0:
+                params[f'{prefix}_target_val'] = new_target
+                params[f'{prefix}_target_active'] = True
+        except (ValueError, TypeError): pass
+    ui.notify(m, type='positive' if s else 'negative')
+
 def handle_close_all():
     """Wrapper to ensure CLOSE ALL button wipes both sides of the UI."""
     try:
@@ -1146,8 +1163,7 @@ def handle_close_all():
         ui.notify(f"Error closing all: {e}", type='negative')
 
 def build_left_stack():
-    comp.open_logic_card('Open Short', 'Call', 'short_open_mode', 'short_open_amount', 'short_open_strike', 'short_trigger_active')
-    comp.entry_card('Call', 'Entry', 'call_entry_mode', 'call_manual_strike', on_open=lambda: handle_open('Call'), on_close=lambda: handle_close('Call'))
+    comp.unified_entry_card('Call', 'call', on_fire_market=lambda: handle_fire_market('Call'), on_close=lambda: handle_close('Call'))
     comp.auto_close_card('Call', 'call_target_val', 'call_target_active', 'call_stop_val', 'call_stop_active')
     comp.premium_exit_card('Call')
     with ui.card().classes('w-full p-2 gap-2 bg-red-50 border border-red-200 shadow-sm rounded-xl'):
@@ -1160,14 +1176,14 @@ def build_center_stack():
     ui.button('Run 9 AM Daily Scan', on_click=run_daily_scan).classes('bg-orange-200 text-orange-900 w-full shadow-md rounded-xl h-12 font-bold')
     comp.global_control_card('Global Stop Loss', 'global_stop_value', 'global_stop_active')
     comp.global_control_card('Global Target', 'global_target_value', 'global_tgt_active')
-    comp.alerts_card()
+    comp.alerts_card_upper()
+    comp.alerts_card_lower()
     
     # FIX: Point to our new wrapper that includes the UI wipe
     ui.button('CLOSE ALL', on_click=handle_close_all, color='red').classes('w-full font-bold shadow-md rounded-xl mt-4')
 
 def build_right_stack():
-    comp.open_logic_card('Open Long', 'Put', 'long_open_mode', 'long_open_amount', 'long_open_strike', 'long_trigger_active')
-    comp.entry_card('Put', 'Entry', 'put_entry_mode', 'put_manual_strike', on_open=lambda: handle_open('Put'), on_close=lambda: handle_close('Put'))
+    comp.unified_entry_card('Put', 'put', on_fire_market=lambda: handle_fire_market('Put'), on_close=lambda: handle_close('Put'))
     comp.auto_close_card('Put', 'put_target_val', 'put_target_active', 'put_stop_val', 'put_stop_active')
     comp.premium_exit_card('Put')
     with ui.card().classes('w-full p-2 gap-2 bg-green-50 border border-green-200 shadow-sm rounded-xl'):
@@ -1364,4 +1380,3 @@ if __name__ in {"__main__", "__mp_main__"}:
                 print("\n--- MANAGER STOPPING ---")
                 if 'p' in locals(): p.terminate()
                 break
-
