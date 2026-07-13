@@ -77,7 +77,8 @@ def build_center_stack():
     ui.button('Run 9 AM Daily Scan', on_click=run_daily_scan).classes('bg-orange-200 text-orange-900 w-full shadow-md rounded-xl h-12 font-bold')
     comp.global_control_card('Global Stop Loss', 'global_stop_value', 'global_stop_active')
     comp.global_control_card('Global Target', 'global_target_value', 'global_tgt_active')
-    comp.alerts_card()
+    comp.alerts_card_upper()
+    comp.alerts_card_lower()
     ui.button('CLOSE ALL', on_click=lambda: logic.close_all_positions("Manual Close All", save_pnl=True), color='red').classes('w-full font-bold shadow-md rounded-xl mt-4')
 
 def build_right_stack():
@@ -102,6 +103,10 @@ def index():
         with ui.column().classes('grow gap-4'): build_left_stack()
         with ui.column().classes('grow gap-4'): build_center_stack()
         with ui.column().classes('grow gap-4'): build_right_stack()
+
+    # Order Book (pending Limit/Stop-Market triggers) and Order History (full tradebook)
+    comp.render_orderbook()
+    comp.render_order_history()
 
     def update_dashboard():
         logic.check_triggers(); logic.update_pnl()

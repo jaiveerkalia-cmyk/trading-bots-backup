@@ -1,5 +1,6 @@
 from nicegui import ui
-from config import params, UI_OPTS, ui_refs
+from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE
+import pandas as pd
 
 # --- CONTROL CARDS ---
 
@@ -14,6 +15,18 @@ def entry_card(side, label, mode_key, input_key, on_open=None, on_close=None):
         with ui.row().classes('w-full gap-2'):
             ui.button(f'Open', color=btn_color, on_click=on_open).classes('grow rounded-lg shadow-sm')
             ui.button(f'Close', on_click=on_close).classes('grow rounded-lg shadow-sm bg-gray-200 text-gray-800 hover:bg-gray-300')
+
+def _reset_unified_card_defaults(prefix):
+    """Fully resets a unified Open Short/Long card (Cancel button) back to defaults:
+    disarms, clears the trigger price, and restores order type/strike/qty/fire-on/stop/target."""
+    params[f'{prefix}_armed'] = False
+    params[f'{prefix}_order_type'] = 'Market'
+    params[f'{prefix}_trigger_price'] = 0
+    params[f'{prefix}_strike_offset'] = 1
+    params[f'{prefix}_qty'] = 4
+    params[f'{prefix}_fire_on'] = 'Live'
+    params[f'{prefix}_new_stop'] = ''
+    params[f'{prefix}_new_target'] = ''
 
 def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
@@ -60,8 +73,9 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
                 ui.notify(f"{title} ARMED", type='positive')
 
         def cancel():
-            params[armed_key] = False
-            ui.notify(f"{title} Cancelled", type='info')
+            # Full reset: trigger price + every other field back to default (not just disarm).
+            _reset_unified_card_defaults(prefix)
+            ui.notify(f"{title} Cancelled & Reset", type='info')
 
         with ui.row().classes('w-full gap-2'):
             fire_btn = ui.button('Open Now', color=btn_color, on_click=fire_or_arm).classes('grow h-8 text-xs rounded-lg shadow-sm')
@@ -247,6 +261,77 @@ def alerts_card_lower():
     _alert_side_card('Lower', 'alert_lower', 'alert_lower_input', 'alert_lower_active',
                       'alert_lower_period', 'alert_lower_sound', 'alert_lower_duration', ui.notify)
 
+# --- ORDER BOOK (pending / armed Limit & Stop-Market unified triggers) ---
+
+def _orderbook_row(side, prefix):
+    color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
+    armed_key = f'{prefix}_armed'
+    title = 'Open Short (Call)' if side == 'Call' else 'Open Long (Put)'
+    with ui.card().classes(f'w-full p-2 gap-2 {color_class} border rounded-lg') as card:
+        card.bind_visibility_from(params, armed_key)
+        ui.label(f'{title} - Pending').classes('font-bold text-xs uppercase text-gray-700')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.radio(UI_OPTS['order_types'], value=params[f'{prefix}_order_type']).bind_value(params, f'{prefix}_order_type').props('inline dense')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.input('Trigger Price').bind_value(params, f'{prefix}_trigger_price').props('outlined dense bg-color=white').classes('grow')
+            ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, f'{prefix}_strike_offset').props('outlined dense bg-color=white').classes('grow')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.input('Qty (Lots)').bind_value(params, f'{prefix}_qty').props('outlined dense bg-color=white').classes('grow')
+            ui.select(UI_OPTS['fire_on_opts'], value=params[f'{prefix}_fire_on']).bind_value(params, f'{prefix}_fire_on').props('outlined dense bg-color=white').classes('grow')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.input('Stop (optional)').bind_value(params, f'{prefix}_new_stop').props('outlined dense bg-color=white').classes('grow')
+            ui.input('Target (optional)').bind_value(params, f'{prefix}_new_target').props('outlined dense bg-color=white').classes('grow')
+
+        def cancel_order():
+            _reset_unified_card_defaults(prefix)
+            ui.notify(f"{title} Order Cancelled", type='info')
+
+        ui.button('Cancel Order', color='red', on_click=cancel_order).classes('w-full h-8 text-xs rounded-lg')
+
+def render_orderbook():
+    """Full-width Order Book: shows only armed-but-unfired Limit/Stop-Market unified
+    triggers (Market fires immediately, so it never appears here). Editable in place;
+    Cancel fully resets that side's card back to defaults."""
+    with ui.card().classes('w-full p-3 gap-2 border border-gray-300 rounded-xl shadow-sm mb-4'):
+        ui.label('ORDER BOOK (Pending Triggers)').classes('font-bold text-sm text-gray-700')
+        with ui.row().classes('w-full gap-2 items-start'):
+            _orderbook_row('Call', 'call')
+            _orderbook_row('Put', 'put')
+        empty_lbl = ui.label('No pending orders.').classes('w-full text-center text-xs text-gray-400 italic')
+        empty_lbl.bind_visibility_from(params, 'call_armed', backward=lambda v: not v and not params.get('put_armed'))
+        ui_refs['orderbook_empty'] = empty_lbl
+
+# --- ORDER HISTORY (full options_tradebook.csv) ---
+
+def _refresh_history_table():
+    try:
+        df = pd.read_csv(TRADEBOOK_FILE)
+        df = df.iloc[::-1]  # most recent (last appended) first
+        cols = [{'name': c, 'label': c.replace('_', ' '), 'field': c, 'sortable': True, 'align': 'left'} for c in df.columns]
+        rows = df.to_dict('records')
+        tbl = ui_refs.get('history_table')
+        if tbl:
+            tbl.columns = cols
+            tbl.rows = rows
+            tbl.update()
+    except Exception:
+        pass  # e.g. file not yet created; table just stays empty
+
+def render_order_history():
+    """Full-width Order History: the complete, all-time options_tradebook.csv log."""
+    with ui.card().classes('w-full p-2 gap-2 border border-gray-300 rounded-xl shadow-sm mb-4'):
+        with ui.row().classes('w-full justify-between items-center'):
+            ui.label('ORDER HISTORY (All Trades)').classes('font-bold text-sm text-gray-700')
+            ui.button('Refresh', on_click=_refresh_history_table).props('dense flat').classes('text-xs')
+        with ui.scroll_area().classes('w-full h-64'):
+            ui_refs['history_table'] = ui.table(columns=[], rows=[], row_key='Trade_ID').classes('w-full').props('dense flat bordered')
+    _refresh_history_table()
+    ui.timer(10.0, _refresh_history_table)
+
 # --- HEADER / CHART / LOG ---
 
 def render_master_banner(update_lots_callback):
@@ -258,6 +343,10 @@ def render_master_banner(update_lots_callback):
                     ui.label('Zerodha Trading Engine').classes('text-xl font-bold tracking-wide whitespace-nowrap')
                     ui_refs['monitor_status'] = ui.label('TRIGGERS OFF').classes('text-xs font-bold bg-gray-800 text-gray-400 px-2 py-1 rounded whitespace-nowrap')
                     ui.switch('Mute', value=params['mute_sound']).bind_value(params, 'mute_sound').props('color=red dense')
+                    ui.button('🔊 Enable Sound', on_click=lambda: ui.run_javascript(
+                        'try { const a = new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg"); '
+                        'a.volume = 0.4; a.play().catch(()=>{}); } catch(e) {}'
+                    )).props('dense flat size=sm').classes('text-[10px] text-orange-900')
                 with ui.row().classes('gap-6 items-center flex-nowrap justify-end'):
                     with ui.column().classes('gap-0 items-end'):
                         ui.label('Unrealized PnL').classes('text-orange-800 text-[10px] uppercase tracking-wider whitespace-nowrap')

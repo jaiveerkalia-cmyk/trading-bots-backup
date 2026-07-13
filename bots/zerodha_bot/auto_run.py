@@ -815,6 +815,10 @@ def update_ui():
         original_notify(msg, type=type_)
 
     # 2. PROCESS SOUND QUEUE (Fixes 'No Sound')
+    # NOTE: modern browsers block audio.play() unless a real user gesture happened on the
+    # page first (autoplay policy). Each play() call below is wrapped in .catch(()=>{}) so a
+    # blocked play() fails silently instead of throwing. Click the "Enable Sound" button in
+    # the banner once per session to satisfy the browser's gesture requirement.
     while shared_state.get('sound_queue'):
         snd = shared_state['sound_queue'].pop(0)
 
@@ -827,7 +831,7 @@ def update_ui():
             except (ValueError, TypeError): dur_ms = 5000
             if dur_ms <= 0: dur_ms = 5000
             ui.run_javascript(
-                f'const a = new Audio("{url}"); a.play();'
+                f'const a = new Audio("{url}"); a.play().catch(()=>{{}});'
                 f'setTimeout(() => {{ a.pause(); a.currentTime = 0; }}, {dur_ms});'
             )
             continue
@@ -835,13 +839,13 @@ def update_ui():
         # We use a generic notification beep for all for now, or specific if desired
         # You can replace these URLs with any public mp3 link
         if snd == 'success':
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg").play()')
+            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg").play().catch(()=>{})')
         elif snd == 'error':
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/clank_car_crash.ogg").play()')
+            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/clank_car_crash.ogg").play().catch(()=>{})')
         elif snd == 'open':
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg").play()')
+            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg").play().catch(()=>{})')
         else: # alert/general
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg").play()')
+            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg").play().catch(()=>{})')
 
     # 3. Standard UI Updates
     if controller.state != 'DONE':
@@ -956,6 +960,10 @@ def custom_render_master_banner(update_lots_callback):
                     ui.label('Zerodha Trading Engine').classes('text-xl font-bold tracking-wide whitespace-nowrap')
                     ui_refs['monitor_status'] = ui.label('TRIGGERS OFF').classes('text-xs font-bold bg-gray-800 text-gray-400 px-2 py-1 rounded whitespace-nowrap')
                     ui.switch('Mute', value=params['mute_sound']).bind_value(params, 'mute_sound').props('color=red dense')
+                    ui.button('🔊 Enable Sound', on_click=lambda: ui.run_javascript(
+                        'try { const a = new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg"); '
+                        'a.volume = 0.4; a.play().catch(()=>{}); } catch(e) {}'
+                    )).props('dense flat size=sm').classes('text-[10px] text-orange-900')
                 with ui.row().classes('absolute right-2 top-2 gap-4 text-right bg-orange-200 pl-4'):
                     with ui.column().classes('gap-0 items-end'):
                         ui.label('Unrealized').classes('text-orange-800 text-[9px] uppercase tracking-wider')
@@ -1289,6 +1297,10 @@ def index():
         with ui.column().classes('grow gap-4'): build_left_stack()
         with ui.column().classes('grow gap-4'): build_center_stack()
         with ui.column().classes('grow gap-4'): build_right_stack()
+
+    # Order Book (pending Limit/Stop-Market triggers) and Order History (full tradebook)
+    comp.render_orderbook()
+    comp.render_order_history()
 
     # 2. LOCAL TIMER
     # This ensures the UI updates ONLY when this page is open in a browser.

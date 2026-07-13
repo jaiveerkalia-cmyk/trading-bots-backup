@@ -18,46 +18,59 @@ import math
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
-# AUDITED FINAL VERSION - OI comparison and single whale mention fixed - 2026-07-13
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ==========================================
-# 1. CONSTANTS - PRODUCTION GRADE - FULL DESCRIPTIVE NAMES
+# 1. CONSTANTS - PRODUCTION GRADE
 # ==========================================
-MAX_HISTORY_ROWS = 10080
+MAX_HISTORY_ROWS = 10080  # 7 days 1m = 672x15m, 336x30m - Bug 6
 UI_REFRESH_INTERVAL = 10000
-USE_SPOT_CVD_FILTER_DEFAULT = False
+USE_SPOT_CVD_FILTER_DEFAULT = True
 PRESSURE_CLIP_MAX = 10.0
 PRESSURE_CLIP_MIN = 0.1
-WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN = 10
-WHALE_EMA_SPAN = WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN
-CVD_NOISE_THRESHOLD_MINIMUM_VALUE = 0.5
-CVD_NOISE_THRESHOLD_FACTOR_MULTIPLIER = 0.2
-CVD_NOISE_MIN = CVD_NOISE_THRESHOLD_MINIMUM_VALUE
-CVD_NOISE_FACTOR = CVD_NOISE_THRESHOLD_FACTOR_MULTIPLIER
-VOLATILITY_SCALER_ENABLED = False
-DIVERGENCE_LOOKBACK_BARS = 10
-DIVERGENCE_LOOKBACK = DIVERGENCE_LOOKBACK_BARS
-PRICE_CHANGE_THRESHOLD_LOOKBACK_BARS = 30
-OPEN_INTEREST_CHANGE_THRESHOLD_LOOKBACK_BARS = 30
-PRICE_THRESHOLD_MULTIPLIER_STANDARD_DEVIATIONS = 1.5
-BASIS_PREMIUM_THRESHOLD_LOOKBACK_BARS = 100
-TAKER_BUY_PRESSURE_THRESHOLD_LOOKBACK_BARS = 100
-TAKER_SELL_PRESSURE_THRESHOLD_LOOKBACK_BARS = 100
-SPOT_DELTA_VOLATILITY_LOOKBACK_BARS = 20
-EXPECTED_CSV_COLUMN_ORDER = ['timestamp','price','basis','oi','taker_imbalance','whale_div','spot_delta']
-EXPECTED_COLS = EXPECTED_CSV_COLUMN_ORDER
-SIGNAL_CSV_COLUMN_ORDER = ['epoch','timestamp','timeframe','signal','price','reason','price_change','price_thresh','oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure','sp_thresh','basis','premium_thresh','premium_thresh_lower']
+WHALE_EMA_SPAN = 3  # Bug 14
+CVD_NOISE_MIN = 0.5
+CVD_NOISE_FACTOR = 0.2  # Bug 13 adaptive
+VOLATILITY_SCALER_ENABLED = False  # Bug 16 - see note below, keep False to avoid double-counting
+DIVERGENCE_LOOKBACK = 10  # Bug 17
 
+# --- IST wall-clock helpers -----------------------------------------------
+# India does not observe DST, so a fixed UTC+5:30 offset is always exactly
+# correct. Previously several places called datetime.datetime.now()/
+# fromtimestamp() directly and assumed the HOST machine's OS clock was
+# already set to IST. On a server whose OS timezone is UTC (common on
+# cloud hosts/containers) that assumption silently shifted every stored
+# timestamp, the "Session CVD (resets daily)" anchor, and the "IST" label
+# in the status bar by up to 5.5 hours. These helpers compute true IST
+# regardless of the host's configured timezone, and are a drop-in
+# replacement for the old calls (same naive-datetime return type).
+IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+def now_ist():
+    """Current true India Standard Time as a naive datetime."""
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(IST_TZ).replace(tzinfo=None)
+
+def ist_from_epoch(epoch_seconds):
+    """Convert a UTC unix epoch (e.g. from time.time()) to a naive true-IST datetime."""
+    return datetime.datetime.fromtimestamp(epoch_seconds, datetime.timezone.utc).astimezone(IST_TZ).replace(tzinfo=None)
 
 DATA_FILE = "data/lci_history.csv"
 SIGNAL_LOG_FILE = "data/signal_events.csv"
 os.makedirs("data", exist_ok=True)
 
 if os.path.exists(DATA_FILE):
-    global_df = pd.read_csv(DATA_FILE, parse_dates=['timestamp'])
+    # Not using read_csv(parse_dates=[...]) here: it silently gives up and leaves
+    # the whole column as plain text (no error, no visible warning) the moment it
+    # hits a row in a different format than the rest - which is exactly what the
+    # once-a-day midnight formatting quirk (fixed in append_row_atomic above)
+    # already wrote into this file. Parsing explicitly with format='ISO8601'
+    # correctly handles a mix of "YYYY-MM-DD HH:MM:SS" and "YYYY-MM-DD" rows (any
+    # already on disk from before the write-side fix), so existing history loads
+    # correctly without needing to hand-edit the file.
+    global_df = pd.read_csv(DATA_FILE)
+    global_df['timestamp'] = pd.to_datetime(global_df['timestamp'], format='ISO8601')
     if len(global_df) > MAX_HISTORY_ROWS:
         global_df = global_df.iloc[-MAX_HISTORY_ROWS:]
     print(f"Loaded {len(global_df)} rows")
@@ -65,18 +78,64 @@ else:
     global_df = pd.DataFrame(columns=['timestamp','price','basis','oi','taker_imbalance','whale_div','spot_delta'])
 
 df_lock = threading.Lock()
-file_lock = threading.Lock()
+file_lock = threading.RLock()  # RLock (not Lock): ensure_signal_log_schema() below needs to
+# be safely callable both on its own AND from inside log_signal_to_csv, which already
+# holds this same lock - a plain Lock would deadlock on the second acquire.
 csv_lock = file_lock
+cvd_setting_lock = threading.Lock()
+# Mirrors whatever CVD-filter state the live dashboard last had selected, so the
+# background daemon's persisted event log (signal_events.csv) stays consistent
+# with what the UI is showing instead of always evaluating with the filter
+# hardcoded on regardless of the user's toggle.
+current_cvd_filter_setting = USE_SPOT_CVD_FILTER_DEFAULT
+
+SIGNAL_LOG_COLUMNS = ['epoch','timestamp','timeframe','signal','price','reason','price_change','price_thresh',
+                      'oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure',
+                      'sp_thresh','basis','premium_thresh','premium_thresh_lower']
+
+def ensure_signal_log_schema():
+    """If signal_events.csv exists but its header doesn't match SIGNAL_LOG_COLUMNS
+    (e.g. left over from an older version of log_signal_to_csv with a different set
+    of fields), archive it and let a fresh file start clean. Called once at startup
+    (before anything tries to read the file) and again from log_signal_to_csv before
+    every write, so a mismatch can never linger and get silently re-read/re-warned
+    about on every dashboard refresh in the meantime."""
+    with file_lock:
+        if not os.path.exists(SIGNAL_LOG_FILE):
+            return
+        try:
+            with open(SIGNAL_LOG_FILE, 'r') as fchk:
+                existing_header = fchk.readline().strip().split(',')
+            if existing_header == SIGNAL_LOG_COLUMNS:
+                return
+            reason = f"header mismatch ({len(existing_header)} vs {len(SIGNAL_LOG_COLUMNS)} columns)"
+        except Exception as e:
+            reason = f"unreadable ({e})"
+        archive_name = SIGNAL_LOG_FILE.replace('.csv', f'_legacy_{int(time.time())}.csv')
+        try:
+            os.replace(SIGNAL_LOG_FILE, archive_name)
+            print(f"signal_events.csv {reason} - archived old file to {archive_name} and starting fresh", flush=True)
+        except Exception:
+            pass
 
 logged_signals = set()
+ensure_signal_log_schema()
 if os.path.exists(SIGNAL_LOG_FILE):
     try:
-        sdf = pd.read_csv(SIGNAL_LOG_FILE)
+        sdf = pd.read_csv(SIGNAL_LOG_FILE, on_bad_lines='skip')
         for _, r in sdf.iterrows():
-            if 'epoch' in sdf.columns:
+            if 'epoch' in sdf.columns and pd.notna(r.get('epoch', None)):
                 logged_signals.add(f"{int(r['epoch'])}_{r['timeframe']}_{r['signal']}")
             else:
-                logged_signals.add(f"{r['timestamp']}_{r['timeframe']}_{r['signal']}")
+                # Legacy rows without a usable epoch column: derive the same
+                # epoch-based key the daemon writes (log_signal_to_csv) so dedup
+                # stays consistent across restarts instead of permanently using a
+                # differently-formatted key for these rows.
+                try:
+                    epoch_from_ts = int(pd.to_datetime(r['timestamp']).timestamp())
+                    logged_signals.add(f"{epoch_from_ts}_{r['timeframe']}_{r['signal']}")
+                except Exception:
+                    logged_signals.add(f"{r['timestamp']}_{r['timeframe']}_{r['signal']}")
         print(f"Loaded {len(logged_signals)} signals")
     except Exception:
         pass
@@ -90,6 +149,9 @@ async def fetch_json(session, url, retries=3):
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                if attempt == retries - 1:
+                    print(f"API FAIL {url}: HTTP {resp.status}", flush=True)
+                    return None
                 await asyncio.sleep(2 ** attempt)
         except Exception as e:
             if attempt == retries-1:
@@ -102,7 +164,7 @@ async def fetch_binance_data():
     async with aiohttp.ClientSession() as session:
         urls = {
             "spot": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-            "spot_kline": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1",
+            "spot_kline": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=2",
             "premium": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT",
             "oi": "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT",
             "taker": "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=5m&limit=1",
@@ -114,7 +176,7 @@ async def fetch_binance_data():
         data = dict(zip(tasks.keys(), results))
         if not data.get("spot") or not data.get("premium") or not data.get("oi"):
             return None
-        ts = datetime.datetime.now().replace(second=0, microsecond=0)
+        ts = now_ist().replace(second=0, microsecond=0)
         try:
             spot_price = float(data["spot"]["price"])
             mark = float(data["premium"]["markPrice"])
@@ -130,12 +192,38 @@ async def fetch_binance_data():
                 whale = ar/pr if pr>0 else 1.0
             basis = mark - index
             taker_imb = float(np.clip(taker_imb, PRESSURE_CLIP_MIN, PRESSURE_CLIP_MAX))
-            whale = float(np.clip(whale, PRESSURE_CLIP_MIN, PRESSURE_CLIP_MAX))
+            # FIX 18:00 flatline - use closed kline, not forming (limit=2, take closed)
             spot_delta = 0.0
-            if data.get("spot_kline"):
-                k = data["spot_kline"][0]
-                tot = float(k[5]); tb = float(k[9]); spot_delta = tb - (tot - tb)
-                spot_delta = float(np.clip(spot_delta, -100, 100))
+            closed_ts = None
+            if data.get("spot_kline") and len(data["spot_kline"]) >= 1:
+                klines = data["spot_kline"]
+                try:
+                    # When limit=2 at HH:MM:00.1, Binance returns [closed-1, forming]
+                    # Closed is the one whose close_time < now, or simply klines[-2]
+                    if len(klines) >= 2:
+                        last_close_ms = int(klines[-1][6])
+                        now_ms = int(ts.timestamp() * 1000)
+                        k = klines[-2] if last_close_ms > now_ms else klines[-1]
+                    else:
+                        k = klines[0]
+                    tot = float(k[5]); tb = float(k[9])
+                    if tot == 0 and len(klines) >= 2:
+                        # fallback if we picked a zero-volume forming kline
+                        k_alt = klines[0] if k is klines[-1] else klines[-1]
+                        if float(k_alt[5]) != 0:
+                            k = k_alt; tot = float(k[5]); tb = float(k[9])
+                    spot_delta = tb - (tot - tb)
+                    closed_ts = int(k[0])
+                except Exception as e:
+                    print(f"spot_delta parse err {e}", flush=True)
+                    spot_delta = 0.0
+            # Keep timestamp aligned to closed kline to avoid future ts with old delta
+            if closed_ts is not None:
+                try:
+                    import datetime as _dt
+                    ts = _dt.datetime.fromtimestamp(closed_ts/1000.0)
+                except:
+                    pass
             return {'timestamp':ts,'price':spot_price,'basis':basis,'oi':oi,'taker_imbalance':taker_imb,'whale_div':whale,'spot_delta':spot_delta}
         except Exception as e:
             print(f"parse err {e}", flush=True)
@@ -143,36 +231,27 @@ async def fetch_binance_data():
 
 def append_row_atomic(row):
     with file_lock:
-        df_row = pd.DataFrame([row], columns=EXPECTED_CSV_COLUMN_ORDER)[EXPECTED_CSV_COLUMN_ORDER]
-        if not os.path.exists(DATA_FILE):
-            df_row.to_csv(DATA_FILE, index=False, date_format='%Y-%m-%d %H:%M:%S')
-            return
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                hdr = f.readline().strip().split(',')
-                hdr = [h.strip().strip('"') for h in hdr]
-            if hdr != EXPECTED_CSV_COLUMN_ORDER:
-                import datetime, os as _os
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                bak = f"{DATA_FILE}.mismatch_{ts}.bak"
-                _os.rename(DATA_FILE, bak)
-                df_row.to_csv(DATA_FILE, index=False, date_format='%Y-%m-%d %H:%M:%S')
-                return
-        except:
-            pass
-        df_row.to_csv(DATA_FILE, mode='a', header=False, index=False, date_format='%Y-%m-%d %H:%M:%S')
+        exists = os.path.exists(DATA_FILE)
+        # date_format is required here: pandas silently drops the time-of-day and
+        # writes date-only (e.g. "2026-07-13" instead of "2026-07-13 00:00:00")
+        # when a datetime value being written happens to land exactly at midnight
+        # AND it's the only row in that particular to_csv() call - which is exactly
+        # what happens once a day, every day, since each daemon tick appends a
+        # single row. That malformed row then breaks pd.to_datetime() the next
+        # time this file is read, since it no longer matches the other rows'
+        # format. Forcing the format explicitly makes every row consistent.
+        pd.DataFrame([row])[['timestamp','price','basis','oi','taker_imbalance','whale_div','spot_delta']].to_csv(DATA_FILE, mode='a', header=not exists, index=False, date_format='%Y-%m-%d %H:%M:%S')
 
 def compact_csv_if_needed():
     with file_lock:
         try:
             with df_lock:
                 if global_df.empty: return
-                trimmed = global_df[EXPECTED_CSV_COLUMN_ORDER].iloc[-MAX_HISTORY_ROWS:].copy()
-            import tempfile as _tf, os as _os
-            with _tf.NamedTemporaryFile(mode='w', delete=False, dir='data', suffix='.tmp') as tf:
+                trimmed = global_df.iloc[-MAX_HISTORY_ROWS:].copy()
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, dir='data', suffix='.tmp') as tf:
                 tmp = tf.name
                 trimmed.to_csv(tmp, index=False, date_format='%Y-%m-%d %H:%M:%S')
-            _os.replace(tmp, DATA_FILE)
+            os.replace(tmp, DATA_FILE)
         except Exception as e:
             print(f"compact fail {e}", flush=True)
 
@@ -181,29 +260,28 @@ def log_signal_to_csv(epoch_int, ts_str, timeframe, sig_name, price, reason, row
     with file_lock:
         if sig_id not in logged_signals:
             logged_signals.add(sig_id)
-            d = {'epoch': epoch_int, 'timestamp': ts_str, 'timeframe': timeframe, 'signal': sig_name, 'price': float(price), 'reason': str(reason),
-                 'price_change':0.0,'price_thresh':0.0,'oi_change':0.0,'oi_thresh_upper':0.0,'oi_thresh_lower':0.0,'buy_pressure':0.0,'bp_thresh':0.0,'sell_pressure':0.0,'sp_thresh':0.0,'basis':0.0,'premium_thresh':0.0,'premium_thresh_lower':0.0}
+            d = {
+                'epoch': epoch_int, 'timestamp': ts_str, 'timeframe': timeframe, 'signal': sig_name, 'price': price, 'reason': reason,
+                'price_change': float(row.get('price_change',0)) if isinstance(row, dict) or hasattr(row,'get') else float(row['price_change']) if 'price_change' in row else 0,
+                'price_thresh': float(row.get('price_thresh',0)) if hasattr(row,'get') else 0,
+                'oi_change': 0, 'oi_thresh_upper':0,'oi_thresh_lower':0,'buy_pressure':0,'bp_thresh':0,'sell_pressure':0,'sp_thresh':0,'basis':0,'premium_thresh':0,'premium_thresh_lower':0
+            }
             try:
-                if isinstance(row, dict):
-                    for k in d:
-                        if k in row and k not in ['epoch','timestamp','timeframe','signal','price','reason']:
-                            try: d[k]=float(row.get(k,d[k]))
-                            except: pass
-                else:
-                    for k in ['price_change','price_thresh','oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure','sp_thresh','basis','premium_thresh','premium_thresh_lower']:
+                # pull rest if Series
+                if not isinstance(row, dict):
+                    for k in ['oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure','sp_thresh','basis','premium_thresh','premium_thresh_lower','price_change','price_thresh']:
                         if k in row:
-                            try: d[k]=float(row[k])
-                            except: pass
+                            d[k]=float(row[k])
             except: pass
+            ensure_signal_log_schema()  # safe to call while holding file_lock - it's an RLock
             hdr = not os.path.exists(SIGNAL_LOG_FILE)
-            df_out = pd.DataFrame([d], columns=SIGNAL_CSV_COLUMN_ORDER)[SIGNAL_CSV_COLUMN_ORDER]
-            df_out.to_csv(SIGNAL_LOG_FILE, mode='a', header=hdr, index=False)
+            pd.DataFrame([d]).to_csv(SIGNAL_LOG_FILE, mode='a', header=hdr, index=False)
 
 def build_resampled_view(base_df, timeframe):
     if base_df.empty:
         return pd.DataFrame()
     df = base_df.copy()
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
     df.set_index('timestamp', inplace=True)
     if timeframe != '1min':
         agg = {'price':'last','basis':'last','oi':'last','taker_imbalance':'last','whale_div':'last','spot_delta':'sum'}
@@ -214,7 +292,9 @@ def build_resampled_view(base_df, timeframe):
     df = df.reset_index()
     # Session anchored at 00:00 UTC - Bug 1 final: convert IST naive to UTC date
     try:
-        # Assume timestamps are IST (Asia/Kolkata) from datetime.now() on your machine
+        # Timestamps are genuine IST (via now_ist()/ist_from_epoch()), independent of
+        # the host OS timezone, so this tz_localize step is always correct. The except
+        # fallback below is kept as a defensive no-op safety net.
         ts_ist = df['timestamp'].dt.tz_localize('Asia/Kolkata', ambiguous='infer', nonexistent='shift_forward')
         ts_utc = ts_ist.dt.tz_convert('UTC')
         df['session_date'] = ts_utc.dt.floor('D').dt.tz_localize(None)
@@ -226,12 +306,14 @@ def build_resampled_view(base_df, timeframe):
     df['time_diff'] = df['timestamp'].diff()
     return df
 
-def compute_signals_for_view(df_input, timeframe, use_cvd_filter=False):
+def compute_signals_for_view(df_input, timeframe, use_cvd_filter=True):
     if len(df_input) < 2:
         return df_input, True
     df = df_input.copy()
-    df['whale_div_smooth'] = df['whale_div'].ewm(span=WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN, adjust=False).mean()
+    # Whale EMA smoothing - Bug 14
+    df['whale_div_smooth'] = df['whale_div'].ewm(span=WHALE_EMA_SPAN, adjust=False).mean()
     df['whale_delta'] = df['whale_div_smooth'].diff()
+    # Pressure clipping - Bug 15
     df['taker_imbalance'] = np.clip(df['taker_imbalance'], PRESSURE_CLIP_MIN, PRESSURE_CLIP_MAX)
     df['buy_pressure'] = np.clip(np.where(df['taker_imbalance']>0, 1/df['taker_imbalance'], 1), 0, PRESSURE_CLIP_MAX)
     df['sell_pressure'] = np.clip(df['taker_imbalance'], 0, PRESSURE_CLIP_MAX)
@@ -241,46 +323,49 @@ def compute_signals_for_view(df_input, timeframe, use_cvd_filter=False):
     tf_min = tf_map.get(timeframe,5)
     gap_thr = pd.Timedelta(minutes=tf_min*1.5)
     df.loc[df['time_diff'] > gap_thr, ['price_change','oi_change']] = np.nan
+    # Bug 4: mean(abs) not abs(mean)
     abs_price = df['price_change'].abs()
     abs_oi = df['oi_change'].abs()
-    ewm_price_mean = abs_price.ewm(span=PRICE_CHANGE_THRESHOLD_LOOKBACK_BARS, adjust=False).mean()
-    ewm_price_std = abs_price.ewm(span=PRICE_CHANGE_THRESHOLD_LOOKBACK_BARS, adjust=False).std().fillna(0)
-    df['price_thresh'] = ewm_price_mean + (ewm_price_std * PRICE_THRESHOLD_MULTIPLIER_STANDARD_DEVIATIONS)
-    ewm_oi_mean = abs_oi.ewm(span=OPEN_INTEREST_CHANGE_THRESHOLD_LOOKBACK_BARS, adjust=False).mean()
-    ewm_oi_std = abs_oi.ewm(span=OPEN_INTEREST_CHANGE_THRESHOLD_LOOKBACK_BARS, adjust=False).std().fillna(0)
-    df['oi_thresh_upper'] = ewm_oi_mean + (ewm_oi_std * PRICE_THRESHOLD_MULTIPLIER_STANDARD_DEVIATIONS)
+    df['price_thresh'] = abs_price.rolling(20).mean() + (abs_price.rolling(20).std().fillna(0)*1.5)
+    df['oi_thresh_upper'] = abs_oi.rolling(20).mean() + (abs_oi.rolling(20).std().fillna(0)*1.5)
     df['oi_thresh_lower'] = -df['oi_thresh_upper']
-    df['premium_thresh'] = df['basis'].rolling(BASIS_PREMIUM_THRESHOLD_LOOKBACK_BARS).quantile(0.90)
-    df['premium_thresh_lower'] = df['basis'].rolling(BASIS_PREMIUM_THRESHOLD_LOOKBACK_BARS).quantile(0.10)
-    df['bp_thresh'] = df['buy_pressure'].rolling(TAKER_BUY_PRESSURE_THRESHOLD_LOOKBACK_BARS).mean() + (df['buy_pressure'].rolling(TAKER_BUY_PRESSURE_THRESHOLD_LOOKBACK_BARS).std().fillna(0)*PRICE_THRESHOLD_MULTIPLIER_STANDARD_DEVIATIONS)
-    df['sp_thresh'] = df['sell_pressure'].rolling(TAKER_SELL_PRESSURE_THRESHOLD_LOOKBACK_BARS).mean() + (df['sell_pressure'].rolling(TAKER_SELL_PRESSURE_THRESHOLD_LOOKBACK_BARS).std().fillna(0)*PRICE_THRESHOLD_MULTIPLIER_STANDARD_DEVIATIONS)
+    df['premium_thresh'] = df['basis'].rolling(100).quantile(0.90)
+    df['premium_thresh_lower'] = df['basis'].rolling(100).quantile(0.10)
+    df['bp_thresh'] = df['buy_pressure'].rolling(100).mean() + (df['buy_pressure'].rolling(100).std().fillna(0)*1.5)
+    df['sp_thresh'] = df['sell_pressure'].rolling(100).mean() + (df['sell_pressure'].rolling(100).std().fillna(0)*1.5)
+    # Bug 16: Volatility scaling - std already timeframe-native, so no extra sqrt. Keep scaler=1 to avoid double-count.
+    # If you want equal absolute move across TFs, set scaler = math.sqrt(5/tf_min). If you want equal rarity on top of native std, keep 1.0.
     tf_scaler = 1.0
     if VOLATILITY_SCALER_ENABLED:
-        import math
         tf_scaler = math.sqrt(5.0 / max(tf_min,1))
-        df['price_thresh'] *= tf_scaler
-        df['oi_thresh_upper'] *= tf_scaler
+        df['price_thresh'] = df['price_thresh'] * tf_scaler
+        df['oi_thresh_upper'] = df['oi_thresh_upper'] * tf_scaler
         df['oi_thresh_lower'] = -df['oi_thresh_upper']
     if len(df) < 100:
         return df, True
-    for col in ['price_thresh','oi_thresh_upper','oi_thresh_lower','premium_thresh','premium_thresh_lower','bp_thresh','sp_thresh']:
-        df[col] = df[col].fillna({'price_thresh':0.15,'oi_thresh_upper':0.4,'oi_thresh_lower':-0.4,'premium_thresh':8.0,'premium_thresh_lower':-8.0,'bp_thresh':1.3,'sp_thresh':1.3}.get(col,0))
+    for c in ['price_thresh','oi_thresh_upper','oi_thresh_lower','premium_thresh','premium_thresh_lower','bp_thresh','sp_thresh']:
+        df[c] = df[c].fillna({'price_thresh':0.15,'oi_thresh_upper':0.4,'oi_thresh_lower':-0.4,'premium_thresh':8.0,'premium_thresh_lower':-8.0,'bp_thresh':1.3,'sp_thresh':1.3}.get(c,0))
+    # Raw signals
     raw_breakout = (df['price_change'] > df['price_thresh']) & (df['oi_change'] > df['oi_thresh_upper']) & (df['whale_delta'] < 0)
     raw_fakeout = (df['price_change'] > df['price_thresh']) & (df['oi_change'] < df['oi_thresh_lower'])
     raw_exhaust = (df['price_change'] > 0) & (df['buy_pressure'] > df['bp_thresh']) & (df['basis'] > df['premium_thresh']) & (df['whale_delta'] > 0)
     raw_breakdown = (df['price_change'] < -df['price_thresh']) & (df['oi_change'] > df['oi_thresh_upper']) & (df['whale_delta'] > 0)
     raw_liq = (df['price_change'] < -df['price_thresh']) & (df['oi_change'] < df['oi_thresh_lower'])
     raw_bottom = (df['price_change'] < 0) & (df['sell_pressure'] > df['sp_thresh']) & (df['basis'] < df['premium_thresh_lower']) & (df['whale_delta'] < 0)
-    price_roll_max = df['price'].rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).max()
-    price_roll_min = df['price'].rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).min()
+    # Bug 17: True divergence - price local high but CVD weak
+    price_roll_max = df['price'].rolling(DIVERGENCE_LOOKBACK, min_periods=5).max()
+    price_roll_min = df['price'].rolling(DIVERGENCE_LOOKBACK, min_periods=5).min()
+    # Session-aware CVD mean to avoid cross-day contamination
     try:
-        cvd_roll_mean = df.groupby('session_date')['spot_cvd'].transform(lambda x: x.rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).mean())
+        cvd_roll_mean = df.groupby('session_date')['spot_cvd'].transform(lambda x: x.rolling(DIVERGENCE_LOOKBACK, min_periods=5).mean())
     except:
-        cvd_roll_mean = df['spot_cvd'].rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).mean()
+        cvd_roll_mean = df['spot_cvd'].rolling(DIVERGENCE_LOOKBACK, min_periods=5).mean()
+    # Exhaustion requires price at local extreme AND CVD failing to confirm
     raw_exhaust = raw_exhaust & (df['price'] >= price_roll_max) & (df['spot_cvd'] < cvd_roll_mean)
     raw_bottom = raw_bottom & (df['price'] <= price_roll_min) & (df['spot_cvd'] > cvd_roll_mean)
-    spot_std = df['spot_delta'].rolling(SPOT_DELTA_VOLATILITY_LOOKBACK_BARS).std().fillna(0)
-    df['cvd_noise_thresh'] = np.maximum(CVD_NOISE_THRESHOLD_MINIMUM_VALUE, CVD_NOISE_THRESHOLD_FACTOR_MULTIPLIER * spot_std)
+    # Bug 13 adaptive noise
+    spot_std = df['spot_delta'].rolling(20).std().fillna(0)
+    df['cvd_noise_thresh'] = np.maximum(CVD_NOISE_MIN, CVD_NOISE_FACTOR * spot_std)
     if use_cvd_filter:
         df['is_breakout'] = raw_breakout & (df['cvd_trend'] > df['cvd_noise_thresh'])
         df['is_fakeout'] = raw_fakeout & (df['cvd_trend'] <= df['cvd_noise_thresh'])
@@ -290,46 +375,16 @@ def compute_signals_for_view(df_input, timeframe, use_cvd_filter=False):
         df['is_bottom_exhaust'] = raw_bottom & (df['cvd_trend'] > df['cvd_noise_thresh'])
     else:
         df['is_breakout'], df['is_fakeout'], df['is_exhaustion'], df['is_breakdown'], df['is_long_liq'], df['is_bottom_exhaust'] = raw_breakout, raw_fakeout, raw_exhaust, raw_breakdown, raw_liq, raw_bottom
+    # Bug 18: Priority hierarchy - exhaustions override everything
+    df['is_exhaustion'] = df['is_exhaustion']
+    df['is_bottom_exhaust'] = df['is_bottom_exhaust']
+    # Mean reversions suppressed by exhaustions
     df['is_fakeout'] = df['is_fakeout'] & ~df['is_exhaustion'] & ~df['is_bottom_exhaust']
     df['is_long_liq'] = df['is_long_liq'] & ~df['is_exhaustion'] & ~df['is_bottom_exhaust']
+    # Trend continuations suppressed by both above
     df['is_breakout'] = df['is_breakout'] & ~df['is_exhaustion'] & ~df['is_bottom_exhaust'] & ~df['is_fakeout'] & ~df['is_long_liq']
     df['is_breakdown'] = df['is_breakdown'] & ~df['is_exhaustion'] & ~df['is_bottom_exhaust'] & ~df['is_fakeout'] & ~df['is_long_liq']
     return df, False
-
-
-def generate_detailed_cumulative_volume_delta_inference_description(signal_name, cumulative_volume_delta_trend_value, cumulative_volume_delta_noise_threshold_value, spot_cumulative_volume_delta_value, cumulative_volume_delta_rolling_mean_value, price_change_value, open_interest_change_value):
-    try:
-        trend=float(cumulative_volume_delta_trend_value); noise=float(cumulative_volume_delta_noise_threshold_value)
-        cvd=float(spot_cumulative_volume_delta_value) if spot_cumulative_volume_delta_value is not None else 0.0
-        cvd_mean=float(cumulative_volume_delta_rolling_mean_value) if cumulative_volume_delta_rolling_mean_value is not None else 0.0
-    except:
-        return f"CVD {cumulative_volume_delta_trend_value} vs noise {cumulative_volume_delta_noise_threshold_value}"
-    if signal_name=="TRUE_BREAKOUT": return f"CVD {trend:.2f} > noise {noise:.2f} = strong spot buying confirms breakout, VALID" if trend>noise else f"CVD {trend:.2f} <= noise {noise:.2f} = weak spot buying, would INVALIDATE breakout if filter ON"
-    if signal_name=="TRUE_BREAKDOWN": return f"CVD {trend:.2f} < -noise {-noise:.2f} = strong spot selling confirms breakdown, VALID" if trend<-noise else f"CVD {trend:.2f} >= -noise {-noise:.2f} = weak spot selling, would INVALIDATE breakdown if filter ON"
-    if signal_name=="SHORT_SQUEEZE": return f"CVD {trend:.2f} <= noise {noise:.2f} = low spot buying, VALID squeeze" if trend<=noise else f"CVD {trend:.2f} > noise {noise:.2f} = strong spot buying, would INVALIDATE squeeze if filter ON, real demand"
-    if signal_name=="LONG_LIQUIDATION": return f"CVD {trend:.2f} >= -noise {-noise:.2f} = limited spot selling, VALID long liq" if trend>=-noise else f"CVD {trend:.2f} < -noise {-noise:.2f} = strong spot selling, would INVALIDATE long liq if filter ON"
-    if signal_name=="TOP_EXHAUSTION":
-        div="CVD below mean" if cvd<cvd_mean else "CVD above mean"
-        return f"CVD {trend:.2f} < -noise {-noise:.2f} + CVD {cvd:.2f} < mean {cvd_mean:.2f} ({div}) = bearish divergence VALID top" if trend<-noise and cvd<cvd_mean else f"CVD {trend:.2f} vs -noise {-noise:.2f}, CVD {cvd:.2f} vs mean {cvd_mean:.2f} ({div}) = divergence weak"
-    if signal_name=="BOTTOM_EXHAUSTION":
-        div="CVD above mean" if cvd>cvd_mean else "CVD below mean"
-        return f"CVD {trend:.2f} > noise {noise:.2f} + CVD {cvd:.2f} > mean {cvd_mean:.2f} ({div}) = bullish divergence VALID bottom" if trend>noise and cvd>cvd_mean else f"CVD {trend:.2f} vs noise {noise:.2f}, CVD {cvd:.2f} vs mean {cvd_mean:.2f} ({div}) = divergence weak"
-    return f"CVD {trend:.2f} vs noise {noise:.2f}"
-
-def generate_whale_delta_comparison_text(whale_delta_value):
-    try: wd=float(whale_delta_value)
-    except: wd=0.0
-    if wd<0: return f"(<0 = whales buying accumulating, long bias)"
-    if wd>0: return f"(>0 = whales selling distributing, short bias)"
-    return f"(=0 = neutral)"
-
-def generate_open_interest_change_comparison_text(open_interest_change_value, open_interest_threshold_upper_value, open_interest_threshold_lower_value):
-    try: oi=float(open_interest_change_value); up=float(open_interest_threshold_upper_value); lo=float(open_interest_threshold_lower_value)
-    except: return ""
-    if oi>up: return f"(OI {oi:+.2f}% > upper {up:.2f}% = OI up, new money entering)"
-    if oi<lo: return f"(OI {oi:+.2f}% < lower {lo:.2f}% = OI down, positions closing)"
-    return f"(OI {oi:+.2f}% vs upper {up:.2f}% / lower {lo:.2f}% = OI flat)"
-
 
 async def clock_sync_daemon():
     global global_df
@@ -344,7 +399,7 @@ async def clock_sync_daemon():
             with df_lock:
                 if not global_df.empty:
                     last = global_df.iloc[-1]
-                    synth_ts = datetime.datetime.fromtimestamp(next_epoch)
+                    synth_ts = ist_from_epoch(next_epoch)
                     new_data = {'timestamp':synth_ts,'price':float(last['price']),'basis':float(last['basis']),'oi':float(last['oi']),'taker_imbalance':1.0,'whale_div':float(last['whale_div']),'spot_delta':0.0}
                     print(f"[{synth_ts}] SYNTHETIC (API fail)", flush=True)
                 else:
@@ -363,17 +418,19 @@ async def clock_sync_daemon():
         try:
             with df_lock:
                 base = global_df.copy()
-            dt = datetime.datetime.fromtimestamp(next_epoch)
+            dt = ist_from_epoch(next_epoch)
             minute = dt.minute
             tfs=[]
             tfs.append('1min')
             if minute%5==0: tfs.append('5min')
             if minute%15==0: tfs.append('15min')
             if minute%30==0: tfs.append('30min')
+            with cvd_setting_lock:
+                active_cvd_filter = current_cvd_filter_setting
             for tf in tfs:
                 view = build_resampled_view(base, tf)
                 if len(view)<100: continue
-                sig_df, warm = compute_signals_for_view(view, tf, use_cvd_filter=USE_SPOT_CVD_FILTER_DEFAULT)
+                sig_df, warm = compute_signals_for_view(view, tf, use_cvd_filter=active_cvd_filter)
                 if warm or sig_df.empty: continue
                 last = sig_df.iloc[-1]
                 epoch_int = int(last['timestamp'].timestamp())
@@ -381,14 +438,7 @@ async def clock_sync_daemon():
                 mp = {'TRUE_BREAKOUT':last['is_breakout'],'SHORT_SQUEEZE':last['is_fakeout'],'TOP_EXHAUSTION':last['is_exhaustion'],'TRUE_BREAKDOWN':last['is_breakdown'],'LONG_LIQUIDATION':last['is_long_liq'],'BOTTOM_EXHAUSTION':last['is_bottom_exhaust']}
                 for name, active in mp.items():
                     if active:
-                        oi_change_val=float(last.get('oi_change',0)); oi_up=float(last.get('oi_thresh_upper',0.4)); oi_lo=float(last.get('oi_thresh_lower',-0.4))
-                        whale_delta_val=float(last.get('whale_delta',0)); cvd_trend_val=float(last.get('cvd_trend',0)); cvd_noise_val=float(last.get('cvd_noise_thresh',0.5))
-                        oi_text=generate_open_interest_change_comparison_text(oi_change_val, oi_up, oi_lo)
-                        whale_text=generate_whale_delta_comparison_text(whale_delta_val)
-                        cvd_mean_val=float(last.get('spot_cvd',0))
-                        detailed_cvd=generate_detailed_cumulative_volume_delta_inference_description(name, cvd_trend_val, cvd_noise_val, float(last.get('spot_cvd',0)), cvd_mean_val, float(last.get('price_change',0)), oi_change_val)
-                        base_reason=f"Daemon {tf} | Price {last['price_change']:+.2f}% > {last['price_thresh']:.2f}% mean(abs) | OI {oi_change_val:+.2f}% vs upper {oi_up:.2f}% / lower {oi_lo:.2f}% {oi_text} | CVD {cvd_trend_val:.2f} vs noise {cvd_noise_val:.2f} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {whale_delta_val:.3f} {whale_text} | Clipped {PRESSURE_CLIP_MAX}x | Div lookback {DIVERGENCE_LOOKBACK_BARS}"
-                        reason=f"{base_reason} | {detailed_cvd} | Filter {'ON' if USE_SPOT_CVD_FILTER_DEFAULT else 'OFF'}"
+                        reason = f"Daemon {tf} | Price {last['price_change']:+.2f}% > {last['price_thresh']:.2f}% mean(abs) | OI {last['oi_change']:+.2f}% | CVD {last['cvd_trend']:.2f} vs noise {last['cvd_noise_thresh']:.2f} | Whale EMA{WHALE_EMA_SPAN} Δ {last['whale_delta']:.3f} | Clipped {PRESSURE_CLIP_MAX}x | Div lookback {DIVERGENCE_LOOKBACK}"
                         log_signal_to_csv(epoch_int, ts_str, tf, name, last['price'], reason, last)
         except Exception as e:
             print(f"daemon eval err {e}", flush=True)
@@ -404,7 +454,7 @@ def create_metric_card(title, value, desc, thr, color="white"):
     return html.Div(style={'backgroundColor':'#222','padding':'15px','borderRadius':'8px','border':f'1px solid {color}','flex':'1','minWidth':'200px','margin':'10px','boxSizing':'border-box'}, children=[html.H3(title, style={'margin':'0 0 5px 0','fontSize':'16px','color':'#aaa'}), html.H2(value, style={'margin':'0 0 5px 0','color':color,'fontSize':'28px'}), html.P(desc, style={'margin':'0 0 5px 0','fontSize':'12px','color':'#777'}), html.P(thr, style={'margin':'0','fontSize':'11px','color':'#555','fontStyle':'italic'})])
 
 def create_signal_card(title, active, col, env, data, strat, regime, thr):
-    bg = f'rgba{col.replace("rgb","").replace(")","",", 0.15)")}' if active else '#141414'
+    bg = f'rgba({col[4:-1]}, 0.15)' if active else '#141414'
     bc = col if active else '#333'
     tc = col if active else '#555'
     stt = "🚨 ACTION REQUIRED" if active else "SCANNING..."
@@ -429,7 +479,7 @@ app.layout = html.Div(style={'backgroundColor':'#111','color':'white','fontFamil
         html.Div([html.Label("Timeframe: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='timeframe-dropdown', options=[{'label':'1 Minute','value':'1min'},{'label':'5 Minutes','value':'5min'},{'label':'15 Minutes','value':'15min'},{'label':'30 Minutes','value':'30min'}], value='5min', clearable=False, style={'width':'120px','display':'inline-block','color':'black','textAlign':'left'})]),
         html.Div([html.Label("History Range: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='range-dropdown', options=[{'label':'Last 1 Hour','value':'1h'},{'label':'Last 6 Hours','value':'6h'},{'label':'Last 24 Hours','value':'24h'},{'label':'Last 1 Week','value':'7d'},{'label':'All Time','value':'all'}], value='24h', clearable=False, style={'width':'140px','display':'inline-block','color':'black','textAlign':'left'})]),
         html.Div([html.Label("EMA Window: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='ema-window', type='number', value=20, min=2, max=200, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'})]),
-        html.Div([html.Label("CVD Filter: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Checklist(id='cvd-toggle', options=[{'label':' ON (Adaptive Noise + Divergence)','value':'on'}], value=[], style={'display':'inline-block','color':'white'})]),
+        html.Div([html.Label("CVD Filter: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Checklist(id='cvd-toggle', options=[{'label':' ON (Adaptive Noise + Divergence)','value':'on'}], value=['on'], style={'display':'inline-block','color':'white'})]),
         html.Div([html.Label("Alert Sound: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='sound-dropdown', options=[{'label':'Sonar Ping','value':'https://actions.google.com/sounds/v1/alarms/sonar_ping.ogg'},{'label':'Beep','value':'https://actions.google.com/sounds/v1/alarms/beep_short.ogg'},{'label':'Digital Watch','value':'https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg'},{'label':'Mute','value':'none'}], value='https://actions.google.com/sounds/v1/alarms/sonar_ping.ogg', clearable=False, style={'width':'150px','display':'inline-block','color':'black','textAlign':'left'})]),
         html.Div([html.Label("Duration (s): ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='sound-duration', type='number', value=6, min=1, max=60, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'})])
     ]),
@@ -485,7 +535,10 @@ app.clientside_callback(
     [State('last-signal-time','data')]
 )
 def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_signal_time):
+    global current_cvd_filter_setting
     use_cvd = 'on' in (cvd_toggle or [])
+    with cvd_setting_lock:
+        current_cvd_filter_setting = use_cvd
     with df_lock:
         if global_df.empty or len(global_df)<2:
             return "Initializing...", html.H3("GATHERING...", style={'textAlign':'center','color':'grey'}), "", "", "", go.Figure(), dash.no_update, dash.no_update
@@ -493,7 +546,7 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     view = build_resampled_view(base, timeframe)
     if len(view)<2:
         return "Resampling...", html.H3("CALIBRATING...", style={'color':'grey'}), "", "", "", go.Figure(), dash.no_update, dash.no_update
-    now_live = datetime.datetime.now()
+    now_live = now_ist()
     tf_map={'1min':1,'5min':5,'15min':15,'30min':30}
     tf_min=tf_map.get(timeframe,5)
     tf_delta=pd.Timedelta(minutes=tf_min)
@@ -507,31 +560,25 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     ema_window = ema_window if ema_window else 20
     live_str = now_live.strftime('%Y-%m-%d %H:%M:%S')
     if warm:
-        txt=f"CALIBRATING {len(df_eval)}/100 | Session CVD UTC | Clipped {PRESSURE_CLIP_MAX}x | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} | Divergence {DIVERGENCE_LOOKBACK_BARS} | Priority Hierarchy | uirevision locked"
+        txt=f"CALIBRATING {len(df_eval)}/100 | Session CVD UTC | Clipped {PRESSURE_CLIP_MAX}x | Whale EMA{WHALE_EMA_SPAN} | Divergence {DIVERGENCE_LOOKBACK} | Priority Hierarchy | uirevision locked"
         last_upd=f"System: {live_str} IST | {txt} | CVD:{'ON' if use_cvd else 'OFF'}"
         chart= df_display.copy()
         chart['buy_pressure']=np.clip(np.where(chart['taker_imbalance']>0,1/chart['taker_imbalance'],1),0,PRESSURE_CLIP_MAX)
-        chart['sell_pressure']=np.clip(chart['taker_imbalance'],0,PRESSURE_CLIP_MAX)
         chart['ema_buy']=chart['buy_pressure'].ewm(span=ema_window,adjust=False).mean()
-        chart['ema_sell']=chart['sell_pressure'].ewm(span=ema_window,adjust=False).mean()
-        chart['ema_whale']=chart['whale_div'].ewm(span=WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN,adjust=False).mean()
+        chart['ema_whale']=chart['whale_div'].ewm(span=WHALE_EMA_SPAN,adjust=False).mean()
         chart['ema_basis']=chart['basis'].ewm(span=ema_window,adjust=False).mean()
         chart['ema_cvd']=chart['spot_cvd'].ewm(span=ema_window,adjust=False).mean()
-        fig=make_subplots(rows=6,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.30,0.12,0.12,0.14,0.14,0.18],subplot_titles=("Price & OI","Buy Press Clipped","Sell Press Clipped","Whale EMA10 Smoothed","Basis Premium","CVD Session UTC + Divergence"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}]])
+        fig=make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.35,0.15,0.15,0.15,0.20],subplot_titles=("Price & OI","Buy Press Clipped","Whale EMA3","Basis","CVD Session"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}]])
         fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['price'],name="Price",line=dict(color='white')),row=1,col=1,secondary_y=False)
         fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['oi'],name="OI",line=dict(color='cyan',dash='dot')),row=1,col=1,secondary_y=True)
-        fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['buy_pressure'],name="Buy Press",line=dict(color='magenta')),row=2,col=1)
-        fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['sell_pressure'],name="Sell Press",line=dict(color='#ff5555')),row=3,col=1)
-        fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw",line=dict(color='rgba(255,255,0,0.3)')),row=4,col=1)
-        fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_whale'],name=f"Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN}",line=dict(color='yellow',width=2)),row=4,col=1)
-        fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session",line=dict(color='cyan'),fill='tozeroy'),row=6,col=1)
-        fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',height=1150,uirevision='locked')
+        fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session",line=dict(color='cyan'),fill='tozeroy'),row=5,col=1)
+        fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',height=1050,uirevision='locked')
         card=html.Div(style={'backgroundColor':'#1a1a1a','padding':'20px','borderRadius':'8px','border':'1px solid #ffaa00','textAlign':'center'},children=[html.H2(f"⏳ {txt}",style={'color':'#ffaa00'}),html.P("Mean(abs), no ffill, session CVD UTC, adaptive noise, divergence mask, priority hierarchy, audio unlock required, uirevision locked, grid responsive",style={'color':'#888','fontSize':'12px'})])
         return last_upd, card, html.Div(), card, html.Div("Calibrating..."), fig, last_signal_time, dash.no_update
     cur = df_eval.iloc[-1]
     closed_str = cur['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
     form_info = f" | Forming {forming.strftime('%H:%M')}..." if forming is not None else ""
-    last_upd = f"System: {live_str} IST | Last Closed: {closed_str}{form_info} | CVD:{'ON' if use_cvd else 'OFF'} Noise>{cur.get('cvd_noise_thresh',0.5):.2f} | Div {DIVERGENCE_LOOKBACK_BARS} | Priority ON | uirevision locked | Audio click to enable"
+    last_upd = f"System: {live_str} IST | Last Closed: {closed_str}{form_info} | CVD:{'ON' if use_cvd else 'OFF'} Noise>{cur.get('cvd_noise_thresh',0.5):.2f} | Div {DIVERGENCE_LOOKBACK} | Priority ON | uirevision locked | Audio click to enable"
     active=False
     an="NONE"
     if cur['is_breakout']: active=True; an="TRUE_BREAKOUT"
@@ -547,31 +594,35 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
         sound=sig_hash
         last_signal_time=sig_hash
     up = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px'}, children=[
-        create_signal_card("🟩 TRUE BREAKOUT", cur['is_breakout'], "rgb(0, 255, 0)", "Continuation", f"Price>thresh mean(abs) + OI up + Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN}<0 + CVD>noise + Div OK + Priority", "Long", "High Vol", f"Price > +{cur['price_thresh']:.2f}% | OI > +{cur['oi_thresh_upper']:.2f}% | CVD>{cur['cvd_noise_thresh']:.2f}"),
-        create_signal_card("🟪 LONG LIQ", cur['is_long_liq'], "rgb(170, 0, 255)", "Mean Rev", "Price down + OI down + CVD >= -noise + No Exhaustion", "Fade", "Low Vol", f"Price < -{cur['price_thresh']:.2f}% | OI < {cur['oi_thresh_lower']:.2f}%"),
-        create_signal_card("🔵 BOTTOM EXHAUST", cur['is_bottom_exhaust'], "rgb(0, 200, 255)", "Reversal Top Priority", f"Sell clipped + Basis < low + Whale buying + CVD>noise + Price<=min({DIVERGENCE_LOOKBACK_BARS}) + CVD>mean", "Long", "Death Spiral", f"Sell>{cur['sp_thresh']:.2f}x | Prem<${cur['premium_thresh_lower']:.2f} | Div confirmed")
+        create_signal_card("🟩 TRUE BREAKOUT", cur['is_breakout'], "rgb(0, 255, 0)", "Trend Continuation", "Price UP + OI UP + Whales Buying.", "Ride the Trend. Enter Long on close.", "High Volatility (NY/London)", f"Target: Price > +{cur['price_thresh']:.2f}% | OI > +{cur['oi_thresh_upper']:.2f}% | CVD Confirmed (Buying)"),
+        create_signal_card("🟪 LONG LIQUIDATION", cur['is_long_liq'], "rgb(170, 0, 255)", "Mean Reversion (Dip)", "Price DOWN + OI DOWN rapidly.", "Fade the Flush. Enter Long post-wick.", "Low Volatility (Weekends/Asia)", f"Target: Price < -{cur['price_thresh']:.2f}% | OI < {cur['oi_thresh_lower']:.2f}% | CVD Divergent (Absorption)"),
+        create_signal_card("🔵 BOTTOM EXHAUSTION", cur['is_bottom_exhaust'], "rgb(0, 200, 255)", "Macro Reversal", "Price DOWN + Extreme Sell Pressure + Whales Buying.", "Catch the Knife. Enter Long.", "Parabolic Bear / Death Spiral", f"Target: Sell Pressure > {cur['sp_thresh']:.2f}x | Premium < ${cur['premium_thresh_lower']:.2f} | CVD Confirmed (Buying)")
     ])
     down = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px'}, children=[
-        create_signal_card("🟥 TRUE BREAKDOWN", cur['is_breakdown'], "rgb(255, 0, 0)", "Continuation", f"Price< -thresh + OI up + Whale>0 + CVD<-noise + No Exhaustion/Squeeze", "Short", "High Vol", f"Price < -{cur['price_thresh']:.2f}% | CVD < -{cur['cvd_noise_thresh']:.2f}"),
-        create_signal_card("🟧 SHORT SQUEEZE", cur['is_fakeout'], "rgb(255, 165, 0)", "Mean Rev", "Price up + OI down + CVD<=noise + No Exhaustion", "Fade", "Low Vol", f"Price > +{cur['price_thresh']:.2f}%"),
-        create_signal_card("🔴 TOP EXHAUST", cur['is_exhaustion'], "rgb(255, 50, 50)", "Reversal Top Priority", f"Buy clipped + Basis>high + Whale sell + CVD<-noise + Price>=max({DIVERGENCE_LOOKBACK_BARS}) + CVD<mean", "Short", "Parabolic", f"Buy>{cur['bp_thresh']:.2f}x | Prem>${cur['premium_thresh']:.2f} | Div confirmed")
+        create_signal_card("🟥 TRUE BREAKDOWN", cur['is_breakdown'], "rgb(255, 0, 0)", "Trend Continuation", "Price DOWN + OI UP + Whales Selling.", "Ride the Trend. Enter Short on close.", "High Volatility (NY/London)", f"Target: Price < -{cur['price_thresh']:.2f}% | OI > +{cur['oi_thresh_upper']:.2f}% | CVD Confirmed (Selling)"),
+        create_signal_card("🟧 SHORT SQUEEZE", cur['is_fakeout'], "rgb(255, 165, 0)", "Mean Reversion (Top)", "Price UP + OI DOWN rapidly.", "Fade the Fakeout. Enter Short post-spike.", "Low Volatility (Weekends/Asia)", f"Target: Price > +{cur['price_thresh']:.2f}% | OI < {cur['oi_thresh_lower']:.2f}% | CVD Divergent (Absorption)"),
+        create_signal_card("🔴 TOP EXHAUSTION", cur['is_exhaustion'], "rgb(255, 50, 50)", "Macro Reversal", "Price UP + Extreme Buy Pressure + Whales Selling.", "Top Tick. Enter Short.", "Parabolic Bull Run", f"Target: Buy Pressure > {cur['bp_thresh']:.2f}x | Premium > ${cur['premium_thresh']:.2f} | CVD Divergent (Selling)")
     ])
     metrics = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(200px, 1fr))','gap':'10px'}, children=[
-        create_metric_card("Price Chg Closed", f"{cur['price_change']:+.2f}%", f"mean(abs) + tf_scaler=1.0 (no double count)", f"Thresh ±{cur['price_thresh']:.2f}%", "#0f0" if cur['price_change']>0 else "#f00"),
-        create_metric_card("OI Vel", f"{cur['oi_change']:+.2f}%", "Gap-dropped, clipped", f">{cur['oi_thresh_upper']:.2f}%", "#0ff"),
-        create_metric_card("Buy Press Clip", f"{cur['buy_pressure']:.2f}x", f"Capped {PRESSURE_CLIP_MAX}x, Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN}, Slow {TAKER_BUY_PRESSURE_THRESHOLD_LOOKBACK_BARS} bars", f"> {cur['bp_thresh']:.2f}x | Noise {cur['cvd_noise_thresh']:.2f}", "cyan"),
-        create_metric_card("Sell Press Clip", f"{cur['sell_pressure']:.2f}x", f"Capped {PRESSURE_CLIP_MAX}x, Slow {TAKER_SELL_PRESSURE_THRESHOLD_LOOKBACK_BARS} bars", f"> {cur['sp_thresh']:.2f}x", "#ff5555"),
-        create_metric_card("Basis", f"${cur['basis']:.2f}", "Session CVD UTC, divergence mask", f">{cur['premium_thresh']:.2f} <{cur['premium_thresh_lower']:.2f}", "orange")
+        create_metric_card("Price Change", f"{cur['price_change']:+.2f}%", "Momentum of current move.", f"Dynamic Vol Threshold: ±{cur['price_thresh']:.2f}%", "#00FF00" if cur['price_change'] > 0 else "#FF0000"),
+        create_metric_card("OI Velocity", f"{cur['oi_change']:+.2f}%", "New money entering vs closing.", f"Dynamic Target: > +{cur['oi_thresh_upper']:.2f}% or < {cur['oi_thresh_lower']:.2f}%", "#00FF00" if cur['oi_change'] > 0 else ("#FF0000" if cur['oi_change'] < 0 else "white")),
+        create_metric_card("Taker Buy Pressure", f"{cur['buy_pressure']:.2f}x", "Market Buy vs Sell Volume.", f"Dynamic Noise Filter: > {cur['bp_thresh']:.2f}x", "cyan"),
+        create_metric_card("Basis Premium", f"${cur['basis']:.2f}", "Futures Price minus Spot Price.", f"Regime Limits: > ${cur['premium_thresh']:.2f} | < ${cur['premium_thresh_lower']:.2f}", "orange" if cur['basis'] > cur['premium_thresh'] else ("cyan" if cur['basis'] < cur['premium_thresh_lower'] else "white"))
     ])
     logs=[]
     try:
         if os.path.exists(SIGNAL_LOG_FILE):
-            ldf=pd.read_csv(SIGNAL_LOG_FILE)
+            ldf=pd.read_csv(SIGNAL_LOG_FILE, on_bad_lines='skip')
             if not ldf.empty:
                 filt = ldf[ldf['timeframe']==timeframe].tail(20) if 'timeframe' in ldf.columns else ldf.tail(20)
                 if filt.empty: filt=ldf.tail(20)
                 for _, r in filt.iloc[::-1].iterrows():
-                    ts=r.get('timestamp',''); sig=r.get('signal',''); pr=r.get('price',0); rs=r.get('reason','')[:110]
+                    ts=r.get('timestamp',''); sig=r.get('signal',''); pr=r.get('price',0)
+                    pr = 0 if (isinstance(pr, float) and pd.isna(pr)) else pr
+                    sig = '' if (isinstance(sig, float) and pd.isna(sig)) else str(sig)
+                    rs=r.get('reason','')
+                    rs = '' if (isinstance(rs, float) and pd.isna(rs)) else str(rs)
+                    rs = rs[:110]
                     col='lime' if 'BREAKOUT' in sig else 'red' if 'BREAKDOWN' in sig else 'orange'
                     logs.append(html.Div([html.Span(f"[{ts}] {sig} @ ${pr:,.2f}", style={'fontWeight':'bold'}), html.Br(), html.Span(f"↳ {rs}", style={'fontSize':'11px','color':'#888','marginLeft':'10px'})], style={'color':col,'marginBottom':'8px'}))
             else:
@@ -590,21 +641,15 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     except Exception:
         pass
     computed_bp=np.clip(np.where(chart['taker_imbalance']>0,1/chart['taker_imbalance'],1),0,PRESSURE_CLIP_MAX)
-    computed_sp=np.clip(chart['taker_imbalance'],0,PRESSURE_CLIP_MAX)
     if 'buy_pressure' not in chart.columns:
         chart['buy_pressure']=computed_bp
     else:
         chart['buy_pressure']=chart['buy_pressure'].fillna(pd.Series(computed_bp, index=chart.index))
-    if 'sell_pressure' not in chart.columns:
-        chart['sell_pressure']=computed_sp
-    else:
-        chart['sell_pressure']=chart['sell_pressure'].fillna(pd.Series(computed_sp, index=chart.index))
     for c in ['premium_thresh','premium_thresh_lower']:
         if c not in chart.columns:
             chart[c]=np.nan
     chart['ema_buy']=chart['buy_pressure'].ewm(span=ema_window,adjust=False).mean()
-    chart['ema_sell']=chart['sell_pressure'].ewm(span=ema_window,adjust=False).mean()
-    chart['ema_whale']=chart['whale_div'].ewm(span=WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN,adjust=False).mean()
+    chart['ema_whale']=chart['whale_div'].ewm(span=WHALE_EMA_SPAN,adjust=False).mean()
     chart['ema_basis']=chart['basis'].ewm(span=ema_window,adjust=False).mean()
     chart['ema_cvd']=chart['spot_cvd'].ewm(span=ema_window,adjust=False).mean()
     if time_range!='all':
@@ -613,22 +658,24 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
         elif time_range=='6h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=6)]
         elif time_range=='24h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=24)]
         elif time_range=='7d': chart=chart[chart['timestamp']>=mt-pd.Timedelta(days=7)]
-    fig=make_subplots(rows=6,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.30,0.12,0.12,0.14,0.14,0.18],subplot_titles=("Price & OI (Forming)","Buy Press Clipped","Sell Press Clipped","Whale EMA10 Smoothed","Basis Premium","CVD Session UTC + Divergence"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}]])
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['price'],name="Price",line=dict(color='white',width=2)),row=1,col=1,secondary_y=False)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['oi'],name="OI",line=dict(color='cyan',dash='dot')),row=1,col=1,secondary_y=True)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['buy_pressure'],name="Buy Press",line=dict(color='magenta')),row=2,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_buy'],name=f"EMA {ema_window}",line=dict(color='rgba(255,255,255,0.6)',dash='dot')),row=2,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['sell_pressure'],name="Sell Press",line=dict(color='#ff5555')),row=3,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_sell'],name=f"EMA {ema_window}",line=dict(color='rgba(255,200,200,0.6)',dash='dot')),row=3,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw",line=dict(color='rgba(255,255,0,0.3)')),row=4,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_whale'],name=f"Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN}",line=dict(color='yellow',width=2)),row=4,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['premium_thresh'],name="90%",line=dict(color='rgba(255,165,0,0.3)',dash='dash')),row=5,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis'],name="Basis",line=dict(color='orange'),fill='tonexty'),row=5,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['premium_thresh_lower'],name="10%",line=dict(color='rgba(0,200,255,0.3)',dash='dash')),row=5,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session UTC",line=dict(color='cyan'),fill='tozeroy'),row=6,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_cvd'],name="EMA",line=dict(color='white',dash='dot')),row=6,col=1)
-    fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=40,r=40,t=40,b=20),hovermode="x unified",legend=dict(orientation="h",y=1.05,x=1),height=1150,uirevision='locked')
-    fig.update_xaxes(showgrid=True,gridcolor='#222')
+    fig=make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.06,row_heights=[0.35,0.15,0.15,0.15,0.20],subplot_titles=("Price & Open Interest (Live Forming Included)", "Taker Buy Pressure", "Whale Ratio", "Basis Premium (Session)", "Spot CVD Session-Anchored (Resets Daily)"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}]])
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['price'],name="BTC Price",line=dict(color='white',width=2),showlegend=True),row=1,col=1,secondary_y=False)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['oi'],name="Open Interest",line=dict(color='#00e5ff',width=2,dash='dot'),showlegend=True),row=1,col=1,secondary_y=True)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['buy_pressure'],name="Buy Pressure",line=dict(color='#ff00ff',width=1.2),showlegend=True),row=2,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_buy'],name=f"EMA {ema_window}",line=dict(color='rgba(255,255,255,0.85)',width=1.5,dash='dot'),showlegend=True),row=2,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw",line=dict(color='rgba(255,235,0,0.7)',width=1),showlegend=True),row=3,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_whale'],name=f"Whale EMA{WHALE_EMA_SPAN}",line=dict(color='#ffeb3b',width=2),showlegend=True),row=3,col=1)
+    # Fixed visibility: solid orange/cyan for thresholds, not 0.3 opacity (was invisible in legend)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['premium_thresh'],name="90th % Limit",line=dict(color='#ff9800',width=1.5,dash='dash'),showlegend=True),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis'],name="Basis Premium",line=dict(color='orange',width=1.5),fill='tonexty',fillcolor='rgba(255,165,0,0.18)',showlegend=True),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['premium_thresh_lower'],name="10th % Limit",line=dict(color='#00bcd4',width=1.5,dash='dash'),showlegend=True),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="Spot CVD Session",line=dict(color='#00e5ff',width=1.6),fill='tozeroy',fillcolor='rgba(0,229,255,0.18)',showlegend=True),row=5,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_cvd'],name=f"CVD EMA {ema_window}",line=dict(color='rgba(255,255,255,0.9)',width=1.2,dash='dot'),showlegend=True),row=5,col=1)
+    fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=50,r=50,t=95,b=30),hovermode="x unified",legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,font=dict(color="white",size=11),bgcolor="rgba(0,0,0,0)"),height=1100,uirevision='locked')
+    for ann in fig['layout']['annotations']:
+        ann['font']=dict(size=13,color="#bbb")
+    fig.update_xaxes(showgrid=True,gridcolor='#222',autorange=True)
+    fig.update_yaxes(showgrid=True,gridcolor='#1e1e1e')
     return last_upd, up, down, metrics, event_log, fig, last_signal_time, sound
 
 if __name__ == '__main__':
@@ -640,4 +687,3 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', '8050'))
     print(f"Starting on http://{host}:{port}", flush=True)
     app.run(host=host, port=port, debug=False)
-
