@@ -49,8 +49,11 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             ui.radio(UI_OPTS['order_types'], value=params[order_key]).bind_value(params, order_key).props('inline dense')
 
         with ui.row().classes('w-full gap-2'):
-            trig_input = ui.input('Trigger Price').bind_value(params, trig_key).props('outlined dense bg-color=white').classes('grow')
-            trig_input.bind_enabled_from(params, order_key, backward=lambda v: v != 'Market')
+            # NOTE: intentionally NOT disabled for Market (previously used bind_enabled_from,
+            # which could leave a typed value uncommitted after a disable->enable toggle on some
+            # NiceGUI/Quasar versions). Always-editable avoids that class of binding bug; the
+            # value is simply ignored by the firing logic when order type is Market.
+            ui.input('Trigger Price').bind_value(params, trig_key).props('outlined dense bg-color=white').classes('grow')
             ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, strike_key).props('outlined dense bg-color=white').classes('grow')
 
         with ui.row().classes('w-full gap-2'):

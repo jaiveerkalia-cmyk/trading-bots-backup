@@ -336,8 +336,12 @@ class LogicEngine:
         # Unified Open Short/Long cards (index-based, order-type + fire-on aware)
         if shared_state['active_trades']['Call'] is None and params.get('call_armed'):
             self._check_unified_open('Call', idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+        else:
+            shared_state['unified_debug']['Call'] = None
         if shared_state['active_trades']['Put'] is None and params.get('put_armed'):
             self._check_unified_open('Put', idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+        else:
+            shared_state['unified_debug']['Put'] = None
 
         self._check_exits(idx_ltp, fire_1m, fire_5m)
         self._check_global_limits()
@@ -386,12 +390,13 @@ class LogicEngine:
         order_type = params.get(f'{prefix}_order_type', 'Market')
         fire_on = params.get(f'{prefix}_fire_on', 'Live')
 
-        try: trigger_price = float(params.get(f'{prefix}_trigger_price', 0))
-        except: trigger_price = 0
+        raw_trigger = params.get(f'{prefix}_trigger_price', 0)
+        try: trigger_price = float(raw_trigger)
+        except (ValueError, TypeError): trigger_price = 0
         try: strike_offset = float(params.get(f'{prefix}_strike_offset', 1))
-        except: strike_offset = 1
+        except (ValueError, TypeError): strike_offset = 1
         try: qty = int(float(params.get(f'{prefix}_qty', 4)))
-        except: qty = 4
+        except (ValueError, TypeError): qty = 4
 
         # Gate by the selected candle-close timeframe. 'Live' checks every tick.
         if fire_on == 'Live': timing_ok = True
@@ -401,18 +406,19 @@ class LogicEngine:
         elif fire_on == '60m': timing_ok = fire_60m
         else: timing_ok = True
 
-        if idx_ltp <= 0: return
-
         should_fire = False
         reason = f"{order_type} @ {trigger_price} ({fire_on})"
+        skip_reason = None
 
-        if order_type == 'Market':
+        if idx_ltp <= 0:
+            skip_reason = "idx price is 0 (no tick yet)"
+        elif order_type == 'Market':
             # Market orders fire immediately via the UI callback, not through this polling
             # path. Kept here defensively in case armed is ever set for a Market order.
             should_fire = True
             reason = "Market (Immediate)"
         elif not timing_ok:
-            return
+            skip_reason = f"waiting for {fire_on} candle close"
         elif order_type == 'Stop-Market':
             # Breakout confirmation in the direction of the trade's original bias.
             if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
@@ -422,11 +428,24 @@ class LogicEngine:
             if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
             elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
 
+        # Live diagnostic snapshot (overwritten every tick, never logged/appended -> zero log
+        # spam). Read by the Order Book UI so a stuck pending order is debuggable at a glance.
+        shared_state['unified_debug'][side] = {
+            'idx_ltp': idx_ltp, 'trigger_price': trigger_price, 'raw_trigger': raw_trigger,
+            'order_type': order_type, 'fire_on': fire_on, 'timing_ok': timing_ok,
+            'should_fire': should_fire, 'skip_reason': skip_reason,
+            'updated': datetime.now().strftime('%H:%M:%S'),
+        }
+
+        if skip_reason and not should_fire:
+            return
+
         if should_fire:
             self.log_action(f"⚡ UNIFIED TRIGGER FIRED: {side} ({reason})")
             success, msg = self.open_position(side, reason=reason, qty_override=qty, strike_offset=strike_offset)
             if success:
                 params[f'{prefix}_armed'] = False
+                shared_state['unified_debug'][side] = None
                 # Optional stop/target set at entry, applied via the existing PnL exit engine.
                 try:
                     new_stop = float(params.get(f'{prefix}_new_stop', ''))
@@ -443,6 +462,7 @@ class LogicEngine:
             else:
                 self.log_action(f"⚠️ Unified Trigger Fired but Open Failed: {msg}")
                 params[f'{prefix}_armed'] = False
+                shared_state['unified_debug'][side] = None
                 self.play_sound('error')
 
     def _check_exits(self, idx_ltp, fire_1m, fire_5m):

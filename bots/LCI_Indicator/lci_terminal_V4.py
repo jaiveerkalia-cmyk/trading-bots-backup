@@ -47,11 +47,6 @@ BASIS_PREMIUM_THRESHOLD_LOOKBACK_BARS = 100
 TAKER_BUY_PRESSURE_THRESHOLD_LOOKBACK_BARS = 100
 TAKER_SELL_PRESSURE_THRESHOLD_LOOKBACK_BARS = 100
 SPOT_DELTA_VOLATILITY_LOOKBACK_BARS = 20
-
-# NEW: ROLLING ACCUMULATION WINDOWS
-SHORT_ROLLING_WINDOW_BARS = 3
-LONG_ROLLING_WINDOW_BARS = 6
-
 EXPECTED_CSV_COLUMN_ORDER = ['timestamp','price','basis','oi','taker_imbalance','whale_div','spot_delta']
 EXPECTED_COLS = EXPECTED_CSV_COLUMN_ORDER
 SIGNAL_CSV_COLUMN_ORDER = ['epoch','timestamp','timeframe','signal','price','reason','price_change','price_thresh','oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure','sp_thresh','basis','premium_thresh','premium_thresh_lower']
@@ -494,9 +489,7 @@ async def clock_sync_daemon():
                         price_text=generate_price_change_comparison_text(name, last['price_change'], last['price_thresh'])
                         pressure_basis_text=generate_pressure_basis_comparison_text(name, last.get('buy_pressure',0), last.get('bp_thresh',0), last.get('sell_pressure',0), last.get('sp_thresh',0), last.get('basis',0), last.get('premium_thresh',0), last.get('premium_thresh_lower',0))
                         pressure_basis_segment = f" | {pressure_basis_text}" if pressure_basis_text else ""
-                        
-                        # REMOVED: Redundant CVD check from base_reason
-                        base_reason=f"Daemon {tf} | {price_text} | {oi_text}{pressure_basis_segment} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {whale_delta_val:.3f} {whale_text}"
+                        base_reason=f"Daemon {tf} | {price_text} | {oi_text}{pressure_basis_segment} | CVD {cvd_trend_val:.2f} vs noise {cvd_noise_val:.2f} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {whale_delta_val:.3f} {whale_text}"
                         reason=f"{base_reason} | {detailed_cvd} | Filter {'ON' if active_cvd_filter else 'OFF'}"
                         log_signal_to_csv(epoch_int, ts_str, tf, name, last['price'], reason, last)
         except Exception as e:
@@ -517,8 +510,7 @@ def create_signal_card(title, active, col, env, data, strat, regime, thr):
     bc = col if active else '#333'
     tc = col if active else '#555'
     stt = "🚨 ACTION REQUIRED" if active else "SCANNING..."
-    # UPDATED: Changed the label from "Data: " to "Target: " per your request
-    return html.Div(style={'backgroundColor':bg,'padding':'15px','borderRadius':'8px','border':f'2px solid {bc}','flex':'1','minWidth':'280px','margin':'0','textAlign':'left','boxSizing':'border-box','transition':'all 0.3s ease'}, children=[html.Div(style={'textAlign':'center','marginBottom':'10px'}, children=[html.H2(title, style={'margin':'0 0 5px 0','color':tc,'fontSize':'18px','fontWeight':'bold'}), html.H3(stt, style={'margin':'0','color':tc,'fontSize':'14px','letterSpacing':'1px'})]), html.Div(style={'borderTop':'1px solid #333','paddingTop':'10px','marginTop':'10px'}, children=[html.P([html.Strong("Env: ", style={'color':'#aaa'}), env], style={'margin':'0 0 5px 0','fontSize':'12px','color':'#888'}), html.P([html.Strong("Target: ", style={'color':'#aaa'}), data], style={'margin':'0 0 5px 0','fontSize':'12px','color':'#888'}), html.P([html.Strong("Action: ", style={'color':'#aaa'}), strat], style={'margin':'0 0 5px 0','fontSize':'12px','color':'#888'}), html.P([html.Strong("Regime: ", style={'color':'#aaa'}), regime], style={'margin':'0 0 10px 0','fontSize':'12px','color':'#888'})]), html.P(thr, style={'margin':'0','fontSize':'11px','color':tc,'fontWeight':'bold','textAlign':'center'})])
+    return html.Div(style={'backgroundColor':bg,'padding':'15px','borderRadius':'8px','border':f'2px solid {bc}','flex':'1','minWidth':'280px','margin':'0','textAlign':'left','boxSizing':'border-box','transition':'all 0.3s ease'}, children=[html.Div(style={'textAlign':'center','marginBottom':'10px'}, children=[html.H2(title, style={'margin':'0 0 5px 0','color':tc,'fontSize':'18px','fontWeight':'bold'}), html.H3(stt, style={'margin':'0','color':tc,'fontSize':'14px','letterSpacing':'1px'})]), html.Div(style={'borderTop':'1px solid #333','paddingTop':'10px','marginTop':'10px'}, children=[html.P([html.Strong("Env: ", style={'color':'#aaa'}), env], style={'margin':'0 0 5px 0','fontSize':'12px','color':'#888'}), html.P([html.Strong("Data: ", style={'color':'#aaa'}), data], style={'margin':'0 0 5px 0','fontSize':'12px','color':'#888'}), html.P([html.Strong("Action: ", style={'color':'#aaa'}), strat], style={'margin':'0 0 5px 0','fontSize':'12px','color':'#888'}), html.P([html.Strong("Regime: ", style={'color':'#aaa'}), regime], style={'margin':'0 0 10px 0','fontSize':'12px','color':'#888'})]), html.P(thr, style={'margin':'0','fontSize':'11px','color':tc,'fontWeight':'bold','textAlign':'center'})])
 
 app = dash.Dash(__name__)
 app.index_string = """<!DOCTYPE html><html><head>{%metas%}<title>{%title%}</title>{%favicon%} {%css%}<style>.Select-control { background-color: #222 !important; border-color: #444 !important; color: white !important; } .Select-menu-outer { background-color: #222 !important; color: white !important; } .Select-value-label { color: white !important; }</style></head><body>{%app_entry%}<footer>{%config%} {%scripts%} {%renderer%}</footer></body></html>"""
@@ -546,13 +538,7 @@ app.layout = html.Div(style={'backgroundColor':'#111','color':'white','fontFamil
     html.Div(id='signal-row-up', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
     html.Div(id='signal-row-down', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
     html.Div(id='metrics-row', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(200px, 1fr))','gap':'10px','marginTop':'10px','boxSizing':'border-box'}),
-    
-    # FIXED: The scrollable container is now permanently attached to the DOM so React won't lose scroll positions
-    html.Div(style={'backgroundColor':'#1a1a1a','border':'1px solid #333','borderRadius':'8px','padding':'15px','height':'180px','overflowY':'auto','marginTop':'20px','fontFamily':'monospace'}, children=[
-        html.H3("EVENT LOG - DAEMON EPOCH HASHED - PRIORITY HIERARCHY", style={'margin':'0 0 10px 0','fontSize':'14px','color':'#aaa'}),
-        html.Div(id='event-log-row')
-    ]),
-    
+    html.Div(id='event-log-row'),
     html.Div(dcc.Graph(id='main-chart', config={'displayModeBar':False}), style={'marginTop':'20px','border':'1px solid #333','borderRadius':'8px'}),
     dcc.Interval(id='interval-component', interval=UI_REFRESH_INTERVAL, n_intervals=0)
 ])
@@ -644,8 +630,7 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
         fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw",line=dict(color='rgba(255,255,0,0.3)')),row=4,col=1)
         fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_whale'],name=f"Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN}",line=dict(color='yellow',width=2)),row=4,col=1)
         fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session",line=dict(color='cyan'),fill='tozeroy'),row=6,col=1)
-        # FIXED: Legend layout
-        fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=40,r=40,t=60,b=20),hovermode="x unified",legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0),height=1150,uirevision='locked')
+        fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',height=1150,uirevision='locked')
         card=html.Div(style={'backgroundColor':'#1a1a1a','padding':'20px','borderRadius':'8px','border':'1px solid #ffaa00','textAlign':'center'},children=[html.H2(f"⏳ {txt}",style={'color':'#ffaa00'}),html.P("Gathering statistical baseline. Please wait for enough data to populate the dynamic regime filters.",style={'color':'#888','fontSize':'12px'})])
         return last_upd, card, html.Div(), card, html.Div("Calibrating..."), fig, last_signal_time, dash.no_update
     cur = df_eval.iloc[-1]
@@ -667,16 +652,15 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
         sound=sig_hash
         last_signal_time=sig_hash
         
-    # UPDATED: Implemented the requested filters text changes and labeled them Filters:
     up = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px'}, children=[
-        create_signal_card("🟩 TRUE BREAKOUT", cur['is_breakout'], "rgb(0, 255, 0)", "Trend Continuation", f"Price UP + OI {LONG_ROLLING_WINDOW_BARS}-Bar Accum + Whales Buying.", "Ride the Trend. Enter Long on close.", "High Volatility", f"Filters: Price > +{cur.get('price_thresh',0):.2f}% | OI Accum > +{cur.get('oi_accum_long_thresh',0):.2f}% | Whale Raw < EMA"),
-        create_signal_card("🟪 LONG LIQUIDATION", cur['is_long_liq'], "rgb(170, 0, 255)", "Mean Reversion (Dip)", f"Cascade OI Drop + Extreme Sell Press + Whale Support.", "Fade the Flush. Enter Long.", "Low Volatility", f"Filters: Price < -{cur.get('price_thresh',0):.2f}% | OI < {cur.get('oi_thresh_lower',0):.2f}% | CVD Δ ≥ -{cur.get('cvd_noise_thresh',0.5):.2f}"),
-        create_signal_card("🔵 BOTTOM EXHAUSTION", cur['is_bottom_exhaust'], "rgb(0, 200, 255)", "Macro Reversal", f"Stretch Down + Stall + Danger Zone + Whale Trap.", "Catch the Knife. Enter Long.", "Parabolic Bear / Death Spiral", f"Filters: Sell Pressure > {cur.get('sp_thresh',0):.2f}x | Premium < ${cur.get('premium_thresh_lower', -5.0):.2f} | Div Confirmed")
+        create_signal_card("🟩 TRUE BREAKOUT", cur['is_breakout'], "rgb(0, 255, 0)", "Trend Continuation", "Price UP + OI UP + Whales Buying.", "Ride the Trend. Enter Long on close.", "High Volatility", f"Target: Price > +{cur['price_thresh']:.2f}% | OI > +{cur['oi_thresh_upper']:.2f}% | CVD Δ > {cur.get('cvd_noise_thresh',0.5):.2f}"),
+        create_signal_card("🟪 LONG LIQUIDATION", cur['is_long_liq'], "rgb(170, 0, 255)", "Mean Reversion (Dip)", "Price DOWN + OI DOWN rapidly.", "Fade the Flush. Enter Long.", "Low Volatility", f"Target: Price < -{cur['price_thresh']:.2f}% | OI < {cur['oi_thresh_lower']:.2f}% | CVD Δ ≥ -{cur.get('cvd_noise_thresh',0.5):.2f}"),
+        create_signal_card("🔵 BOTTOM EXHAUSTION", cur['is_bottom_exhaust'], "rgb(0, 200, 255)", "Macro Reversal", "Price DOWN + Extreme Sell Pressure + Whales Buying.", "Catch the Knife. Enter Long.", "Parabolic Bear / Death Spiral", f"Target: Sell Pressure > {cur['sp_thresh']:.2f}x | Premium < ${cur.get('premium_thresh_lower', -5.0):.2f} | Div Confirmed")
     ])
     down = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px'}, children=[
-        create_signal_card("🟥 TRUE BREAKDOWN", cur['is_breakdown'], "rgb(255, 0, 0)", "Trend Continuation", f"Price DOWN + OI {LONG_ROLLING_WINDOW_BARS}-Bar Accum + Whales Selling.", "Ride the Trend. Enter Short on close.", "High Volatility", f"Filters: Price < -{cur.get('price_thresh',0):.2f}% | OI Accum > +{cur.get('oi_accum_long_thresh',0):.2f}% | Whale Raw > EMA"),
-        create_signal_card("🟧 SHORT SQUEEZE", cur['is_fakeout'], "rgb(255, 165, 0)", "Mean Reversion (Top)", f"Cascade OI Drop + Extreme Buy Press + Whale Dist.", "Fade the Fakeout. Enter Short post-spike.", "Low Volatility", f"Filters: Price > +{cur.get('price_thresh',0):.2f}% | OI < {cur.get('oi_thresh_lower',0):.2f}% | CVD Δ ≤ {cur.get('cvd_noise_thresh',0.5):.2f}"),
-        create_signal_card("🔴 TOP EXHAUSTION", cur['is_exhaustion'], "rgb(255, 50, 50)", "Macro Reversal", f"Stretch Up + Stall + Danger Zone + Whale Trap.", "Top Tick. Enter Short.", "Parabolic Bull Run", f"Filters: Buy Pressure > {cur.get('bp_thresh',0):.2f}x | Premium > ${cur.get('premium_thresh', 5.0):.2f} | Div Confirmed")
+        create_signal_card("🟥 TRUE BREAKDOWN", cur['is_breakdown'], "rgb(255, 0, 0)", "Trend Continuation", "Price DOWN + OI UP + Whales Selling.", "Ride the Trend. Enter Short on close.", "High Volatility", f"Target: Price < -{cur['price_thresh']:.2f}% | OI > +{cur['oi_thresh_upper']:.2f}% | CVD Δ < -{cur.get('cvd_noise_thresh',0.5):.2f}"),
+        create_signal_card("🟧 SHORT SQUEEZE", cur['is_fakeout'], "rgb(255, 165, 0)", "Mean Reversion (Top)", "Price UP + OI DOWN rapidly.", "Fade the Fakeout. Enter Short post-spike.", "Low Volatility", f"Target: Price > +{cur['price_thresh']:.2f}% | OI < {cur['oi_thresh_lower']:.2f}% | CVD Δ ≤ {cur.get('cvd_noise_thresh',0.5):.2f}"),
+        create_signal_card("🔴 TOP EXHAUSTION", cur['is_exhaustion'], "rgb(255, 50, 50)", "Macro Reversal", "Price UP + Extreme Buy Pressure + Whales Selling.", "Top Tick. Enter Short.", "Parabolic Bull Run", f"Target: Buy Pressure > {cur['bp_thresh']:.2f}x | Premium > ${cur.get('premium_thresh', 5.0):.2f} | Div Confirmed")
     ])
     
     metrics = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(200px, 1fr))','gap':'10px'}, children=[
@@ -688,72 +672,27 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     ])
     logs=[]
     try:
-        # REMOVED: All duplicate 'CVD {} vs noise {}' strings inside the inline log generation.
-        for idx, row in df_eval.iloc[::-1].iterrows():
-            ts_str = row['timestamp'].strftime('%Y-%m-%d %H:%M')
-            price_str = f"${row['price']:,.2f}"
-            e_id = int(row['timestamp'].timestamp())
-            
-            if row['is_breakout']:
-                oi_text = generate_open_interest_change_comparison_text(row['oi_change'], row['oi_thresh_upper'], row['oi_thresh_lower'])
-                whale_text = generate_whale_delta_comparison_text(row['whale_delta'])
-                cvd_trend_val = float(row.get('cvd_trend',0)); cvd_noise_val = float(row.get('cvd_noise_thresh',0.5))
-                detailed_cvd = generate_detailed_cumulative_volume_delta_inference_description("TRUE_BREAKOUT", cvd_trend_val, cvd_noise_val, row.get('spot_cvd',0), row.get('spot_cvd',0), row['price_change'], row['oi_change'])
-                reason = f"UI {timeframe} | Price {row['price_change']:+.2f}% (> {row['price_thresh']:.2f}%) | {oi_text} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {row['whale_delta']:.3f} {whale_text} | {detailed_cvd}"
-                logs.append(html.Div([html.Span(f"[{ts_str}] 🟩 TRUE BREAKOUT Detected @ {price_str}", style={'fontWeight': 'bold'}), html.Br(), html.Span(f"↳ {reason}", style={'fontSize': '12px', 'color': '#888', 'marginLeft': '15px'})], style={'color': 'lime', 'marginBottom': '10px'}))
-                log_signal_to_csv(e_id, ts_str, timeframe, "TRUE_BREAKOUT", row['price'], reason, row)
-                
-            if row['is_fakeout']: 
-                oi_text = generate_open_interest_change_comparison_text(row['oi_change'], row['oi_thresh_upper'], row['oi_thresh_lower'])
-                cvd_trend_val = float(row.get('cvd_trend',0)); cvd_noise_val = float(row.get('cvd_noise_thresh',0.5))
-                detailed_cvd = generate_detailed_cumulative_volume_delta_inference_description("SHORT_SQUEEZE", cvd_trend_val, cvd_noise_val, row.get('spot_cvd',0), row.get('spot_cvd',0), row['price_change'], row['oi_change'])
-                reason = f"UI {timeframe} | Price {row['price_change']:+.2f}% (> {row['price_thresh']:.2f}%) | {oi_text} | {detailed_cvd}"
-                logs.append(html.Div([html.Span(f"[{ts_str}] 🟧 SHORT SQUEEZE Detected @ {price_str}", style={'fontWeight': 'bold'}), html.Br(), html.Span(f"↳ {reason}", style={'fontSize': '12px', 'color': '#888', 'marginLeft': '15px'})], style={'color': 'orange', 'marginBottom': '10px'}))
-                log_signal_to_csv(e_id, ts_str, timeframe, "SHORT_SQUEEZE", row['price'], reason, row)
-                
-            if row['is_exhaustion']: 
-                whale_text = generate_whale_delta_comparison_text(row['whale_delta'])
-                cvd_trend_val = float(row.get('cvd_trend',0)); cvd_noise_val = float(row.get('cvd_noise_thresh',0.5))
-                detailed_cvd = generate_detailed_cumulative_volume_delta_inference_description("TOP_EXHAUSTION", cvd_trend_val, cvd_noise_val, row.get('spot_cvd',0), row.get('spot_cvd',0), row['price_change'], row['oi_change'])
-                pb_text = generate_pressure_basis_comparison_text("TOP_EXHAUSTION", row['buy_pressure'], row['bp_thresh'], row['sell_pressure'], row['sp_thresh'], row['basis'], row['premium_thresh'], row['premium_thresh_lower'])
-                reason = f"UI {timeframe} | Price {row['price_change']:+.2f}% (> +0.02%) | {pb_text} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {row['whale_delta']:.3f} {whale_text} | {detailed_cvd}"
-                logs.append(html.Div([html.Span(f"[{ts_str}] 🔴 TOP EXHAUSTION Detected @ {price_str}", style={'fontWeight': 'bold'}), html.Br(), html.Span(f"↳ {reason}", style={'fontSize': '12px', 'color': '#888', 'marginLeft': '15px'})], style={'color': 'rgb(255, 50, 50)', 'marginBottom': '10px'}))
-                log_signal_to_csv(e_id, ts_str, timeframe, "TOP_EXHAUSTION", row['price'], reason, row)
-                
-            if row['is_breakdown']: 
-                oi_text = generate_open_interest_change_comparison_text(row['oi_change'], row['oi_thresh_upper'], row['oi_thresh_lower'])
-                whale_text = generate_whale_delta_comparison_text(row['whale_delta'])
-                cvd_trend_val = float(row.get('cvd_trend',0)); cvd_noise_val = float(row.get('cvd_noise_thresh',0.5))
-                detailed_cvd = generate_detailed_cumulative_volume_delta_inference_description("TRUE_BREAKDOWN", cvd_trend_val, cvd_noise_val, row.get('spot_cvd',0), row.get('spot_cvd',0), row['price_change'], row['oi_change'])
-                reason = f"UI {timeframe} | Price {row['price_change']:+.2f}% (< -{row['price_thresh']:.2f}%) | {oi_text} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {row['whale_delta']:.3f} {whale_text} | {detailed_cvd}"
-                logs.append(html.Div([html.Span(f"[{ts_str}] 🟥 TRUE BREAKDOWN Detected @ {price_str}", style={'fontWeight': 'bold'}), html.Br(), html.Span(f"↳ {reason}", style={'fontSize': '12px', 'color': '#888', 'marginLeft': '15px'})], style={'color': 'red', 'marginBottom': '10px'}))
-                log_signal_to_csv(e_id, ts_str, timeframe, "TRUE_BREAKDOWN", row['price'], reason, row)
-                
-            if row['is_long_liq']: 
-                oi_text = generate_open_interest_change_comparison_text(row['oi_change'], row['oi_thresh_upper'], row['oi_thresh_lower'])
-                cvd_trend_val = float(row.get('cvd_trend',0)); cvd_noise_val = float(row.get('cvd_noise_thresh',0.5))
-                detailed_cvd = generate_detailed_cumulative_volume_delta_inference_description("LONG_LIQUIDATION", cvd_trend_val, cvd_noise_val, row.get('spot_cvd',0), row.get('spot_cvd',0), row['price_change'], row['oi_change'])
-                reason = f"UI {timeframe} | Price {row['price_change']:+.2f}% (< -{row['price_thresh']:.2f}%) | {oi_text} | {detailed_cvd}"
-                logs.append(html.Div([html.Span(f"[{ts_str}] 🟪 LONG LIQUIDATION Detected @ {price_str}", style={'fontWeight': 'bold'}), html.Br(), html.Span(f"↳ {reason}", style={'fontSize': '12px', 'color': '#888', 'marginLeft': '15px'})], style={'color': 'rgb(170, 0, 255)', 'marginBottom': '10px'}))
-                log_signal_to_csv(e_id, ts_str, timeframe, "LONG_LIQUIDATION", row['price'], reason, row)
-                
-            if row['is_bottom_exhaust']: 
-                whale_text = generate_whale_delta_comparison_text(row['whale_delta'])
-                cvd_trend_val = float(row.get('cvd_trend',0)); cvd_noise_val = float(row.get('cvd_noise_thresh',0.5))
-                detailed_cvd = generate_detailed_cumulative_volume_delta_inference_description("BOTTOM_EXHAUSTION", cvd_trend_val, cvd_noise_val, row.get('spot_cvd',0), row.get('spot_cvd',0), row['price_change'], row['oi_change'])
-                pb_text = generate_pressure_basis_comparison_text("BOTTOM_EXHAUSTION", row['buy_pressure'], row['bp_thresh'], row['sell_pressure'], row['sp_thresh'], row['basis'], row['premium_thresh'], row['premium_thresh_lower'])
-                reason = f"UI {timeframe} | Price {row['price_change']:+.2f}% (< -0.02%) | {pb_text} | Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN} Δ {row['whale_delta']:.3f} {whale_text} | {detailed_cvd}"
-                logs.append(html.Div([html.Span(f"[{ts_str}] 🔵 BOTTOM EXHAUSTION Detected @ {price_str}", style={'fontWeight': 'bold'}), html.Br(), html.Span(f"↳ {reason}", style={'fontSize': '12px', 'color': '#888', 'marginLeft': '15px'})], style={'color': 'rgb(0, 200, 255)', 'marginBottom': '10px'}))
-                log_signal_to_csv(e_id, ts_str, timeframe, "BOTTOM_EXHAUSTION", row['price'], reason, row)
-                
-        if len(logs) > 30:
-            logs = logs[:30]
-            
+        if os.path.exists(SIGNAL_LOG_FILE):
+            ldf=pd.read_csv(SIGNAL_LOG_FILE, on_bad_lines='skip')
+            if not ldf.empty:
+                filt = ldf[ldf['timeframe']==timeframe].tail(20) if 'timeframe' in ldf.columns else ldf.tail(20)
+                if filt.empty: filt=ldf.tail(20)
+                for _, r in filt.iloc[::-1].iterrows():
+                    ts=r.get('timestamp',''); sig=r.get('signal',''); pr=r.get('price',0)
+                    pr = 0 if (isinstance(pr, float) and pd.isna(pr)) else pr
+                    sig = '' if (isinstance(sig, float) and pd.isna(sig)) else str(sig)
+                    rs=r.get('reason','')
+                    rs = '' if (isinstance(rs, float) and pd.isna(rs)) else str(rs)
+                    rs = rs[:500]
+                    col='lime' if 'BREAKOUT' in sig else 'red' if 'BREAKDOWN' in sig else 'orange'
+                    logs.append(html.Div([html.Span(f"[{ts}] {sig} @ ${pr:,.2f}", style={'fontWeight':'bold'}), html.Br(), html.Span(f"↳ {rs}", style={'fontSize':'11px','color':'#888','marginLeft':'10px'})], style={'color':col,'marginBottom':'8px'}))
+            else:
+                logs=[html.Div("Waiting for daemon closed candle", style={'color':'#555'})]
+        else:
+            logs=[html.Div("Log not yet created", style={'color':'#555'})]
     except Exception as e:
         logs=[html.Div(f"Log err {e}", style={'color':'#f55'})]
-    if not logs:
-        logs=[html.Div("No signals triggered in the current memory window.", style={'color':'#555'})]
-        
+    event_log = html.Div(style={'backgroundColor':'#1a1a1a','border':'1px solid #333','borderRadius':'8px','padding':'15px','height':'180px','overflowY':'auto','marginTop':'20px','fontFamily':'monospace'}, children=[html.H3("EVENT LOG - DAEMON EPOCH HASHED - PRIORITY HIERARCHY", style={'margin':'0 0 10px 0','fontSize':'14px','color':'#aaa'}), html.Div(logs)])
     chart = df_display.copy()
     try:
         eval_map = df_eval.set_index('timestamp')
@@ -800,13 +739,9 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['premium_thresh_lower'],name="10%",line=dict(color='rgba(0,200,255,0.3)',dash='dash')),row=5,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session UTC",line=dict(color='cyan'),fill='tozeroy'),row=6,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_cvd'],name="EMA",line=dict(color='white',dash='dot')),row=6,col=1)
-    
-    # FIXED: Updated legend layout (xanchor, yanchor) and top margin to prevent smushing and stretch full-width
-    fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=40,r=40,t=60,b=20),hovermode="x unified",legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0),height=1150,uirevision='locked')
+    fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=40,r=40,t=40,b=20),hovermode="x unified",legend=dict(orientation="h",y=1.05,x=1),height=1150,uirevision='locked')
     fig.update_xaxes(showgrid=True,gridcolor='#222')
-    
-    # FIXED: Return 'logs' directly to the nested 'children' of the layout row instead of replacing the entire container
-    return last_upd, up, down, metrics, logs, fig, last_signal_time, sound
+    return last_upd, up, down, metrics, event_log, fig, last_signal_time, sound
 
 if __name__ == '__main__':
     start_background_thread()

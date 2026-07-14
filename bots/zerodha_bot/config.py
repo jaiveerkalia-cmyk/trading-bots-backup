@@ -52,6 +52,11 @@ shared_state = {
     'pnl': {'realized': 0.0, 'unrealized': 0.0, 'trades_history': []},
     'sound_queue': [],
     'toast_queue': [],
+
+    # Live diagnostic snapshot for armed unified triggers, overwritten every check_triggers()
+    # tick (not appended/logged, so it can never grow or spam the activity log). Read by the
+    # Order Book UI to show exactly what's being compared for a pending Limit/Stop-Market order.
+    'unified_debug': {'Call': None, 'Put': None},
 }
 
 # --- UI REFERENCES ---
@@ -72,7 +77,8 @@ ui_refs = {
     'put_idx_open': None, 'put_idx_curr': None,
     'put_info': None, 'put_trigger': None,
 
-    'monitor_status': None, 'calc_qty': None, 'log_panel': None
+    'monitor_status': None, 'calc_qty': None, 'log_panel': None,
+    'call_orderbook_debug': None, 'put_orderbook_debug': None,
 }
 
 # --- UI CONFIGURATION ---
