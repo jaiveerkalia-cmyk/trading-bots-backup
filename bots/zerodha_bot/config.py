@@ -79,6 +79,16 @@ ui_refs = {
 
     'monitor_status': None, 'calc_qty': None, 'log_panel': None,
     'call_orderbook_debug': None, 'put_orderbook_debug': None,
+
+    # New "OPEN POSITIONS" table row refs (dark-themed section, separate from the banner
+    # CALL/PUT POSITION cards above; populated each tick in auto_run.py's update_ui()).
+    'open_positions_count': None,
+    'call_pos_row': None, 'call_pos_symbol': None, 'call_pos_mark': None, 'call_pos_size': None,
+    'call_pos_pnl': None, 'call_pos_entry': None, 'call_pos_qty': None,
+    'call_pos_maxloss': None, 'call_pos_maxprofit': None,
+    'put_pos_row': None, 'put_pos_symbol': None, 'put_pos_mark': None, 'put_pos_size': None,
+    'put_pos_pnl': None, 'put_pos_entry': None, 'put_pos_qty': None,
+    'put_pos_maxloss': None, 'put_pos_maxprofit': None,
 }
 
 # --- UI CONFIGURATION ---

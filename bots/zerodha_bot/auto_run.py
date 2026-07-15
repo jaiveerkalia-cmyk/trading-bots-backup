@@ -951,6 +951,56 @@ def update_ui():
         for k in ['put_idx_open','put_idx_curr']: ui_refs[k].set_text('0')
         ui_refs['put_pnl'].set_text('₹ 0')
 
+    # --- NEW: OPEN POSITIONS section (dark-themed, kept alongside the banner cards above) ---
+    open_count = 0
+    if tc and ui_refs.get('call_pos_symbol'):
+        open_count += 1
+        strike = tc['main']['strike']; mark = tc['main']['current_price']; entry = tc['main']['entry_price']
+        ui_refs['call_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} CE")
+        ui_refs['call_pos_mark'].set_text(f"{mark:.2f}")
+        ui_refs['call_pos_size'].set_text(f"{tc['qty']}")
+        ui_refs['call_pos_entry'].set_text(f"{entry:.2f}")
+        ui_refs['call_pos_qty'].set_text(f"{tc['qty']}")
+        c = 'text-green-400' if tc['pnl'] >= 0 else 'text-red-400'
+        ui_refs['call_pos_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
+        ui_refs['call_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
+        # Max Loss/Profit derived from the stop/target values, if active (points x qty)
+        if params.get('call_stop_active') and str(params.get('call_stop_val', '')).strip() not in ('', '0'):
+            try: ui_refs['call_pos_maxloss'].set_text(f"-₹{float(params['call_stop_val']):.0f}")
+            except (ValueError, TypeError): ui_refs['call_pos_maxloss'].set_text('-')
+        else:
+            ui_refs['call_pos_maxloss'].set_text('-')
+        if params.get('call_target_active') and str(params.get('call_target_val', '')).strip() not in ('', '0'):
+            try: ui_refs['call_pos_maxprofit'].set_text(f"+₹{float(params['call_target_val']):.0f}")
+            except (ValueError, TypeError): ui_refs['call_pos_maxprofit'].set_text('-')
+        else:
+            ui_refs['call_pos_maxprofit'].set_text('-')
+
+    if tp and ui_refs.get('put_pos_symbol'):
+        open_count += 1
+        strike = tp['main']['strike']; mark = tp['main']['current_price']; entry = tp['main']['entry_price']
+        ui_refs['put_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} PE")
+        ui_refs['put_pos_mark'].set_text(f"{mark:.2f}")
+        ui_refs['put_pos_size'].set_text(f"{tp['qty']}")
+        ui_refs['put_pos_entry'].set_text(f"{entry:.2f}")
+        ui_refs['put_pos_qty'].set_text(f"{tp['qty']}")
+        c = 'text-green-400' if tp['pnl'] >= 0 else 'text-red-400'
+        ui_refs['put_pos_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
+        ui_refs['put_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
+        if params.get('put_stop_active') and str(params.get('put_stop_val', '')).strip() not in ('', '0'):
+            try: ui_refs['put_pos_maxloss'].set_text(f"-₹{float(params['put_stop_val']):.0f}")
+            except (ValueError, TypeError): ui_refs['put_pos_maxloss'].set_text('-')
+        else:
+            ui_refs['put_pos_maxloss'].set_text('-')
+        if params.get('put_target_active') and str(params.get('put_target_val', '')).strip() not in ('', '0'):
+            try: ui_refs['put_pos_maxprofit'].set_text(f"+₹{float(params['put_target_val']):.0f}")
+            except (ValueError, TypeError): ui_refs['put_pos_maxprofit'].set_text('-')
+        else:
+            ui_refs['put_pos_maxprofit'].set_text('-')
+
+    if ui_refs.get('open_positions_count'):
+        ui_refs['open_positions_count'].set_text(f"{open_count} position{'s' if open_count != 1 else ''}")
+
 def custom_render_master_banner(update_lots_callback):
     with ui.column().classes('w-full gap-0 mb-4'):
         with ui.card().classes('w-full p-3 bg-orange-200 text-orange-900 rounded-t-xl rounded-b-none border-b border-orange-300') as card:
@@ -1298,7 +1348,10 @@ def index():
         with ui.column().classes('grow gap-4'): build_center_stack()
         with ui.column().classes('grow gap-4'): build_right_stack()
 
-    # Order Book (pending Limit/Stop-Market triggers) and Order History (full tradebook)
+    # NEW: Open Positions (dark-themed, kept alongside the banner CALL/PUT POSITION cards)
+    comp.render_open_positions(on_close_call=lambda: handle_close('Call'), on_close_put=lambda: handle_close('Put'))
+
+    # Order Book (pending Limit/Stop-Market triggers, table-styled) and Order History (full tradebook)
     comp.render_orderbook()
     comp.render_order_history()
 

@@ -556,14 +556,19 @@ class LogicEngine:
         check_upper = (upper_mode == 'Current') or (upper_mode == '1m' and fire_1m) or (upper_mode == '5m' and fire_5m)
         check_lower = (lower_mode == 'Current') or (lower_mode == '1m' and fire_1m) or (lower_mode == '5m' and fire_5m)
 
+        # NOTE: message text intentionally avoids the word "alert" (case-insensitive). The
+        # global ui.notify interceptor in auto_run.py auto-queues its own generic fallback
+        # sound (fixed sound, no duration limit) whenever a notification's text contains
+        # "alert", which was silently overriding/mixing with the user's chosen sound+duration
+        # from play_alert_sound() below. "Price Hit" conveys the same info without colliding.
         if check_upper and params['alert_upper_active'] and up > 0 and idx_ltp >= up:
-            ui.notify(f"ALERT: Price {idx_ltp} > {up}", type='warning', close_button=True)
+            ui.notify(f"Price Hit: {idx_ltp} > {up}", type='warning', close_button=True)
             params['alert_upper_active'] = False; params['alert_upper_input'] = 0
-            self.log_action(f"🔔 ALERT: {idx_ltp} >= {up}")
+            self.log_action(f"🔔 Price Hit (Upper): {idx_ltp} >= {up}")
             self.play_alert_sound(params.get('alert_upper_sound', 'Wood Plank'), params.get('alert_upper_duration', 5))
 
         if check_lower and params['alert_lower_active'] and low > 0 and idx_ltp <= low:
-            ui.notify(f"ALERT: Price {idx_ltp} < {low}", type='warning', close_button=True)
+            ui.notify(f"Price Hit: {idx_ltp} < {low}", type='warning', close_button=True)
             params['alert_lower_active'] = False; params['alert_lower_input'] = 0
-            self.log_action(f"🔔 ALERT: {idx_ltp} <= {low}")
+            self.log_action(f"🔔 Price Hit (Lower): {idx_ltp} <= {low}")
             self.play_alert_sound(params.get('alert_lower_sound', 'Wood Plank'), params.get('alert_lower_duration', 5))

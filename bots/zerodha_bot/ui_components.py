@@ -1,5 +1,5 @@
 from nicegui import ui
-from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE
+from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state
 import pandas as pd
 
 # --- CONTROL CARDS ---
@@ -264,48 +264,183 @@ def alerts_card_lower():
     _alert_side_card('Lower', 'alert_lower', 'alert_lower_input', 'alert_lower_active',
                       'alert_lower_period', 'alert_lower_sound', 'alert_lower_duration', ui.notify)
 
-# --- ORDER BOOK (pending / armed Limit & Stop-Market unified triggers) ---
+# --- OPEN POSITIONS (kept alongside the existing banner CALL/PUT POSITION cards) ---
 
-def _orderbook_row(side, prefix):
-    color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
-    armed_key = f'{prefix}_armed'
-    title = 'Open Short (Call)' if side == 'Call' else 'Open Long (Put)'
-    with ui.card().classes(f'w-full p-2 gap-2 {color_class} border rounded-lg') as card:
-        card.bind_visibility_from(params, armed_key)
-        ui.label(f'{title} - Pending').classes('font-bold text-xs uppercase text-gray-700')
+def _position_row(side, on_close=None):
+    """One row of the Open Positions section. Only visible while that side has an active
+    trade. Values (mark/size/pnl/entry/qty/symbol) are populated live each tick by
+    auto_run.py's update_ui(), the same pattern already used for the banner cards."""
+    prefix = 'call' if side == 'Call' else 'put'
+    accent = 'border-red-500' if side == 'Call' else 'border-green-500'
+    with ui.card().classes(f'w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
+        row.bind_visibility_from(shared_state['active_trades'], side, backward=lambda v: v is not None)
+        ui_refs[f'{prefix}_pos_row'] = row
 
-        with ui.row().classes('w-full gap-2'):
-            ui.radio(UI_OPTS['order_types'], value=params[f'{prefix}_order_type']).bind_value(params, f'{prefix}_order_type').props('inline dense')
+        with ui.row().classes('w-full justify-between items-center flex-wrap gap-2'):
+            with ui.row().classes('items-center gap-2'):
+                ui_refs[f'{prefix}_pos_symbol'] = ui.label('-').classes('text-gray-800 font-bold text-sm font-mono')
+                ui.label('SHORT').classes('bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
+            with ui.row().classes('items-center gap-6'):
+                with ui.column().classes('items-end gap-0'):
+                    ui.label('MARK').classes('text-gray-400 text-[9px] uppercase tracking-wider')
+                    ui_refs[f'{prefix}_pos_mark'] = ui.label('0.0').classes('text-orange-600 font-mono font-bold text-sm')
+                with ui.column().classes('items-end gap-0'):
+                    ui.label('SIZE').classes('text-gray-400 text-[9px] uppercase tracking-wider')
+                    ui_refs[f'{prefix}_pos_size'] = ui.label('0').classes('text-gray-800 font-mono text-sm')
+                with ui.column().classes('items-end gap-0'):
+                    ui.label('uPnL').classes('text-gray-400 text-[9px] uppercase tracking-wider')
+                    ui_refs[f'{prefix}_pos_pnl'] = ui.label('0').classes('font-mono font-bold text-sm text-gray-800')
 
-        with ui.row().classes('w-full gap-2'):
-            ui.input('Trigger Price').bind_value(params, f'{prefix}_trigger_price').props('outlined dense bg-color=white').classes('grow')
-            ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, f'{prefix}_strike_offset').props('outlined dense bg-color=white').classes('grow')
+        with ui.row().classes('w-full gap-6 text-[11px] text-gray-500 flex-wrap'):
+            with ui.row().classes('gap-1 items-baseline'):
+                ui.label('Entry')
+                ui_refs[f'{prefix}_pos_entry'] = ui.label('0.0').classes('text-gray-700 font-mono')
+            with ui.row().classes('gap-1 items-baseline'):
+                ui.label('Qty')
+                ui_refs[f'{prefix}_pos_qty'] = ui.label('0').classes('text-gray-700 font-mono')
 
-        with ui.row().classes('w-full gap-2'):
-            ui.input('Qty (Lots)').bind_value(params, f'{prefix}_qty').props('outlined dense bg-color=white').classes('grow')
-            ui.select(UI_OPTS['fire_on_opts'], value=params[f'{prefix}_fire_on']).bind_value(params, f'{prefix}_fire_on').props('outlined dense bg-color=white').classes('grow')
+        with ui.row().classes('w-full gap-3 items-center pt-2 border-t border-gray-200 flex-wrap'):
+            ui.label('Stop').classes('text-[10px] text-gray-500')
+            ui.switch().bind_value(params, f'{prefix}_stop_active').props('dense color=red size=sm')
+            ui.input().bind_value(params, f'{prefix}_stop_val').props('outlined dense bg-color=white').classes('w-24')
+            ui.label('Target').classes('text-[10px] text-gray-500')
+            ui.switch().bind_value(params, f'{prefix}_target_active').props('dense color=green size=sm')
+            ui.input().bind_value(params, f'{prefix}_target_val').props('outlined dense bg-color=white').classes('w-24')
+            ui.space()
+            ui.button('CLOSE', color='red', on_click=on_close).classes('h-7 text-xs px-4 rounded font-bold')
 
-        with ui.row().classes('w-full gap-2'):
-            ui.input('Stop (optional)').bind_value(params, f'{prefix}_new_stop').props('outlined dense bg-color=white').classes('grow')
-            ui.input('Target (optional)').bind_value(params, f'{prefix}_new_target').props('outlined dense bg-color=white').classes('grow')
+def render_open_positions(on_close_call=None, on_close_put=None):
+    """'OPEN POSITIONS' section, kept alongside the existing banner CALL/PUT POSITION cards
+    (not a replacement). White background, matching the rest of the app."""
+    with ui.card().classes('w-full bg-white p-3 gap-3 rounded-xl shadow-sm mb-4 border border-gray-200'):
+        with ui.row().classes('w-full justify-between items-center'):
+            ui.label('OPEN POSITIONS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
+            ui_refs['open_positions_count'] = ui.label('0 positions').classes('text-[10px] text-gray-400')
+        _position_row('Call', on_close=on_close_call)
+        _position_row('Put', on_close=on_close_put)
+        empty_lbl = ui.label('No open positions.').classes('w-full text-center text-xs text-gray-400 italic')
+        empty_lbl.bind_visibility_from(shared_state['active_trades'], 'Call',
+                                        backward=lambda v: v is None and shared_state['active_trades'].get('Put') is None)
 
-        def cancel_order():
-            _reset_unified_card_defaults(prefix)
-            ui.notify(f"{title} Order Cancelled", type='info')
+# --- ORDER BOOK (pending unified entry triggers + active exit orders, table-styled) ---
 
-        ui.button('Cancel Order', color='red', on_click=cancel_order).classes('w-full h-8 text-xs rounded-lg')
+def _toggle_expansion(exp):
+    exp.value = not exp.value
+
+def _orderbook_table_row(side, prefix):
+    """One expandable row for a pending unified Open Short/Long entry trigger (Limit/Stop-
+    Market only; Market fires immediately and never appears here). The header line stays
+    live-bound to the underlying params (no manual refresh needed). MODIFY toggles the
+    editable panel (trigger price, strike, qty, fire-on, stop, target); REMOVE fully resets
+    that side's card back to defaults."""
+    opt_type = 'CE' if side == 'Call' else 'PE'
+    with ui.column().classes('w-full') as wrapper:
+        wrapper.bind_visibility_from(params, f'{prefix}_armed')
+        with ui.expansion('', icon='tune').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
+            with exp.add_slot('header'):
+                with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
+                    ui.label().bind_text_from(params, 'trading_index', backward=lambda v: INDICES.get(v, {}).get('segment', v)).classes('w-16 text-gray-400 font-mono')
+                    ui.label().bind_text_from(params, 'trading_index', backward=lambda v: f"{v} {opt_type}").classes('w-28 font-bold text-gray-800 font-mono')
+                    ui.label('SELL').classes('w-14 text-red-600 font-bold')
+                    ui.label().bind_text_from(params, f'{prefix}_order_type').classes('w-24 text-purple-700')
+                    ui.label().bind_text_from(params, f'{prefix}_trigger_price', backward=lambda v: f"{v}").classes('w-24 text-right font-mono text-gray-800')
+                    ui.label().bind_text_from(params, f'{prefix}_fire_on').classes('w-16 text-gray-500')
+                    ui.label().bind_text_from(params, f'{prefix}_new_stop', backward=lambda v: (str(v) if str(v).strip() != '' else '-')).classes('w-20 text-orange-600 text-right font-mono')
+                    ui.label().bind_text_from(params, f'{prefix}_new_target', backward=lambda v: (str(v) if str(v).strip() != '' else '-')).classes('w-20 text-blue-600 text-right font-mono')
+                    ui.label().bind_text_from(params, f'{prefix}_qty').classes('w-14 text-right font-mono text-gray-800')
+                    ui.label('WORKING').classes('bg-blue-600 text-white px-2 py-0.5 rounded text-[10px] font-bold')
+                    ui.space()
+
+                    def cancel_order():
+                        _reset_unified_card_defaults(prefix)
+                        ui.notify(f"{side} Order Removed", type='info')
+
+                    # click.stop so these don't also trigger the header's own expand/collapse
+                    ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', lambda: _toggle_expansion(exp))
+                    ui.button('REMOVE').props('flat dense size=sm no-caps').classes('text-[10px] text-red-600').on('click.stop', cancel_order)
+
+            with ui.column().classes('w-full p-3 gap-2 bg-gray-50'):
+                with ui.row().classes('w-full gap-2'):
+                    ui.radio(UI_OPTS['order_types'], value=params[f'{prefix}_order_type']).bind_value(params, f'{prefix}_order_type').props('inline dense')
+                with ui.row().classes('w-full gap-2'):
+                    ui.input('Trigger Price').bind_value(params, f'{prefix}_trigger_price').props('outlined dense bg-color=white').classes('grow')
+                    ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, f'{prefix}_strike_offset').props('outlined dense bg-color=white').classes('grow')
+                with ui.row().classes('w-full gap-2'):
+                    ui.input('Qty (Lots)').bind_value(params, f'{prefix}_qty').props('outlined dense bg-color=white').classes('grow')
+                    ui.select(UI_OPTS['fire_on_opts'], value=params[f'{prefix}_fire_on']).bind_value(params, f'{prefix}_fire_on').props('outlined dense bg-color=white').classes('grow')
+                with ui.row().classes('w-full gap-2'):
+                    ui.input('Stop (optional)').bind_value(params, f'{prefix}_new_stop').props('outlined dense bg-color=white').classes('grow')
+                    ui.input('Target (optional)').bind_value(params, f'{prefix}_new_target').props('outlined dense bg-color=white').classes('grow')
+
+def _exit_order_row(side, order_label, value_key, active_key, time_key=None):
+    """One expandable row for an active conditional EXIT order tied to an open position
+    (from the Premium-based or Index-based exit cards). Visible only while active. MODIFY
+    edits the value/period inline; REMOVE deactivates and clears the value, mirroring the
+    Reset behavior already in premium_exit_card/index_exit_component."""
+    with ui.column().classes('w-full') as wrapper:
+        wrapper.bind_visibility_from(params, active_key)
+        with ui.expansion('', icon='tune').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
+            with exp.add_slot('header'):
+                with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
+                    ui.label(side.upper()).classes('w-14 font-bold text-gray-700')
+                    ui.label(order_label).classes('w-28 text-purple-700 font-semibold')
+                    ui.label().bind_text_from(params, value_key, backward=lambda v: str(v) if str(v).strip() != '' else '-').classes('w-24 text-right font-mono text-gray-800')
+                    if time_key:
+                        ui.label().bind_text_from(params, time_key).classes('w-16 text-gray-500')
+                    else:
+                        ui.label('-').classes('w-16 text-gray-400')
+                    ui.label('EXIT ORDER').classes('bg-orange-500 text-white px-2 py-0.5 rounded text-[10px] font-bold')
+                    ui.space()
+
+                    def remove_order():
+                        params[active_key] = False
+                        params[value_key] = 0
+                        ui.notify(f"{side} {order_label} Removed", type='info')
+
+                    ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', lambda: _toggle_expansion(exp))
+                    ui.button('REMOVE').props('flat dense size=sm no-caps').classes('text-[10px] text-red-600').on('click.stop', remove_order)
+
+            with ui.column().classes('w-full p-3 gap-2 bg-gray-50'):
+                with ui.row().classes('w-full gap-2 items-center'):
+                    ui.input('Value').bind_value(params, value_key).props('outlined dense bg-color=white').classes('grow')
+                    if time_key:
+                        ui.radio(UI_OPTS['index_times'], value=params[time_key]).bind_value(params, time_key).props('inline dense')
 
 def render_orderbook():
-    """Full-width Order Book: shows only armed-but-unfired Limit/Stop-Market unified
-    triggers (Market fires immediately, so it never appears here). Editable in place;
-    Cancel fully resets that side's card back to defaults."""
-    with ui.card().classes('w-full p-3 gap-2 border border-gray-300 rounded-xl shadow-sm mb-4'):
-        ui.label('ORDER BOOK (Pending Triggers)').classes('font-bold text-sm text-gray-700')
-        with ui.row().classes('w-full gap-2 items-start'):
-            _orderbook_row('Call', 'call')
-            _orderbook_row('Put', 'put')
+    """Full-width Open Orders table (white background, matching the rest of the app): pending
+    unified entry triggers (Limit/Stop-Market; Market fires immediately so never appears here)
+    plus every active conditional exit order (Premium-based and Index-based stop/target)."""
+    with ui.card().classes('w-full bg-white p-3 gap-2 rounded-xl shadow-sm mb-4 border border-gray-200'):
+        ui.label('OPEN ORDERS').classes('font-bold text-xs uppercase tracking-widest text-gray-500 mb-1')
+        with ui.row().classes('w-full items-center gap-3 text-[10px] text-gray-400 uppercase px-2'):
+            ui.label('Exch').classes('w-16'); ui.label('Symbol').classes('w-28'); ui.label('Side').classes('w-14')
+            ui.label('Type').classes('w-24'); ui.label('Trigger Price').classes('w-24 text-right'); ui.label('Fire On').classes('w-16')
+            ui.label('Stop').classes('w-20 text-right'); ui.label('Target').classes('w-20 text-right'); ui.label('Qty').classes('w-14 text-right'); ui.label('Status').classes('')
+
+        _orderbook_table_row('Call', 'call')
+        _orderbook_table_row('Put', 'put')
+
+        # Exit orders from "Exit based on Option Premium" and "Exit based on Index" cards
+        _exit_order_row('Call', 'Prem Stop', 'call_prem_stop_val', 'call_prem_stop_active', 'call_prem_stop_time')
+        _exit_order_row('Call', 'Prem Target', 'call_prem_target_val', 'call_prem_tgt_active', 'call_prem_target_time')
+        _exit_order_row('Call', 'Idx Stop', 'call_index_stop_val', 'call_index_stop_active', 'call_index_stop_time')
+        _exit_order_row('Call', 'Idx Target', 'call_index_target_val', 'call_index_tgt_active', 'call_index_target_time')
+        _exit_order_row('Put', 'Prem Stop', 'put_prem_stop_val', 'put_prem_stop_active', 'put_prem_stop_time')
+        _exit_order_row('Put', 'Prem Target', 'put_prem_target_val', 'put_prem_tgt_active', 'put_prem_target_time')
+        _exit_order_row('Put', 'Idx Stop', 'put_index_stop_val', 'put_index_stop_active', 'put_index_stop_time')
+        _exit_order_row('Put', 'Idx Target', 'put_index_target_val', 'put_index_tgt_active', 'put_index_target_time')
+
         empty_lbl = ui.label('No pending orders.').classes('w-full text-center text-xs text-gray-400 italic')
-        empty_lbl.bind_visibility_from(params, 'call_armed', backward=lambda v: not v and not params.get('put_armed'))
+
+        def _nothing_active(_v=None):
+            return not (
+                params.get('call_armed') or params.get('put_armed') or
+                params.get('call_prem_stop_active') or params.get('call_prem_tgt_active') or
+                params.get('call_index_stop_active') or params.get('call_index_tgt_active') or
+                params.get('put_prem_stop_active') or params.get('put_prem_tgt_active') or
+                params.get('put_index_stop_active') or params.get('put_index_tgt_active')
+            )
+        empty_lbl.bind_visibility_from(params, 'call_armed', backward=_nothing_active)
         ui_refs['orderbook_empty'] = empty_lbl
 
 # --- ORDER HISTORY (full options_tradebook.csv) ---
