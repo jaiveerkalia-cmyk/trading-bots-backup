@@ -269,9 +269,20 @@ def alerts_card_lower():
 def _position_row(side, on_close=None):
     """One row of the Open Positions section. Only visible while that side has an active
     trade. Values (mark/size/pnl/entry/qty/symbol) are populated live each tick by
-    auto_run.py's update_ui(), the same pattern already used for the banner cards."""
+    auto_run.py's update_ui(), the same pattern already used for the banner cards.
+
+    Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
+    call_index_stop_active etc, the same params the 'Exit based on Index' cards use) rather
+    than the PnL-based Auto Close values, and always check on live price: toggling either
+    switch forces the corresponding *_index_stop_time/*_index_target_time to 'Current'."""
     prefix = 'call' if side == 'Call' else 'put'
     accent = 'border-red-500' if side == 'Call' else 'border-green-500'
+    stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
+    tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
+
+    def force_live(_e=None, key=None):
+        params[key] = 'Current'
+
     with ui.card().classes(f'w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         row.bind_visibility_from(shared_state['active_trades'], side, backward=lambda v: v is not None)
         ui_refs[f'{prefix}_pos_row'] = row
@@ -300,12 +311,12 @@ def _position_row(side, on_close=None):
                 ui_refs[f'{prefix}_pos_qty'] = ui.label('0').classes('text-gray-700 font-mono')
 
         with ui.row().classes('w-full gap-3 items-center pt-2 border-t border-gray-200 flex-wrap'):
-            ui.label('Stop').classes('text-[10px] text-gray-500')
-            ui.switch().bind_value(params, f'{prefix}_stop_active').props('dense color=red size=sm')
-            ui.input().bind_value(params, f'{prefix}_stop_val').props('outlined dense bg-color=white').classes('w-24')
-            ui.label('Target').classes('text-[10px] text-gray-500')
-            ui.switch().bind_value(params, f'{prefix}_target_active').props('dense color=green size=sm')
-            ui.input().bind_value(params, f'{prefix}_target_val').props('outlined dense bg-color=white').classes('w-24')
+            ui.label('Idx Stop').classes('text-[10px] text-gray-500')
+            ui.switch(on_change=lambda e, k=stop_time_key: force_live(e, k)).bind_value(params, stop_active_key).props('dense color=red size=sm')
+            ui.input().bind_value(params, stop_val_key).props('outlined dense bg-color=white').classes('w-24')
+            ui.label('Idx Target').classes('text-[10px] text-gray-500')
+            ui.switch(on_change=lambda e, k=tgt_time_key: force_live(e, k)).bind_value(params, tgt_active_key).props('dense color=green size=sm')
+            ui.input().bind_value(params, tgt_val_key).props('outlined dense bg-color=white').classes('w-24')
             ui.space()
             ui.button('CLOSE', color='red', on_click=on_close).classes('h-7 text-xs px-4 rounded font-bold')
 

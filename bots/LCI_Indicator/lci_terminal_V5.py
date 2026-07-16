@@ -14,7 +14,6 @@ import os
 import logging
 import time
 import tempfile  # BUG 2 FIX: Added missing import for CSV compaction
-import json  # AUDIO FIX: Added for reading/writing the server-side audio settings file
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -64,87 +63,6 @@ def ist_from_epoch(epoch_seconds):
 DATA_FILE = "data/lci_history.csv"
 SIGNAL_LOG_FILE = "data/signal_events.csv"
 os.makedirs("data", exist_ok=True)
-
-# ==========================================
-# AUDIO FIX: SERVER-SIDE AUDIO SETTINGS PERSISTENCE
-# ==========================================
-# Previously the chosen alert sound and alarm duration lived in the BROWSER's
-# localStorage (dcc.Store storage_type='local' / dcc.Input persistence_type='local').
-# That ties the setting to one specific browser on one specific machine, so it doesn't
-# survive switching browsers or devices. We now persist these settings to a small JSON
-# file on the server itself (right alongside the CSV data files), so the exact same
-# setting is loaded no matter which browser/device connects, and it survives full
-# server restarts too.
-AUDIO_SETTINGS_FILE = "data/audio_settings.json"
-# SOUND FIX: Old alarm/siren catalog (Sonar Ping, Beep, Digital Watch, Fire Alarm, Nuclear
-# Siren, Siren Noise, Bugle Tune, Mechanical Clock) has been removed entirely and replaced
-# with a short, crisp, high-impact chime/ping/bell catalog below (see VALID_SOUND_URLS and
-# the sound-dropdown options in the layout). Default updated to match the new catalog.
-DEFAULT_AUDIO_SETTINGS = {
-    "sound_url": "https://actions.google.com/sounds/v1/cartoon/cartoon_ringing_hit.ogg",
-    "duration": 6
-}
-# SOUND FIX: The full set of currently valid sound URLs (must match sound-dropdown options
-# in the layout exactly). Used by load_audio_settings() below to detect a settings file left
-# over from before this catalog change (pointing at a now-removed sound) and safely fall back
-# to the new default instead of leaving the dropdown pointed at a sound that's no longer listed.
-VALID_SOUND_URLS = {
-    "https://actions.google.com/sounds/v1/cartoon/tympani_bing.ogg",
-    "https://actions.google.com/sounds/v1/alarms/medium_bell_ringing_near.ogg",
-    "https://actions.google.com/sounds/v1/alarms/dinner_bell_triangle.ogg",
-    "https://actions.google.com/sounds/v1/cartoon/crazy_dinner_bell.ogg",
-    "https://actions.google.com/sounds/v1/cartoon/cartoon_ringing_hit.ogg",
-    "https://actions.google.com/sounds/v1/cartoon/cartoon_cowbell.ogg",
-    "none"
-}
-audio_settings_lock = threading.Lock()
-
-def load_audio_settings():
-    # AUDIO FIX: Reads persisted settings at startup. Falls back to the original
-    # hardcoded defaults if the file doesn't exist yet or is corrupt, so a bad/missing
-    # settings file can never prevent the app from starting.
-    with audio_settings_lock:
-        if os.path.exists(AUDIO_SETTINGS_FILE):
-            try:
-                with open(AUDIO_SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                settings = DEFAULT_AUDIO_SETTINGS.copy()
-                settings.update({k: v for k, v in loaded.items() if k in DEFAULT_AUDIO_SETTINGS})
-                if settings.get('sound_url') not in VALID_SOUND_URLS:  # SOUND FIX: stale sound from the old removed catalog - fall back to new default
-                    settings['sound_url'] = DEFAULT_AUDIO_SETTINGS['sound_url']
-                return settings
-            except Exception as e:
-                print(f"Audio settings load failed, using defaults: {e}", flush=True)
-                return DEFAULT_AUDIO_SETTINGS.copy()
-        return DEFAULT_AUDIO_SETTINGS.copy()
-
-def save_audio_settings(sound_url=None, duration=None):
-    # AUDIO FIX: Merge-and-save (only overwrites the keys passed in) so, e.g., changing
-    # just the duration never wipes out the previously saved sound choice, and vice versa.
-    with audio_settings_lock:
-        current = DEFAULT_AUDIO_SETTINGS.copy()
-        if os.path.exists(AUDIO_SETTINGS_FILE):
-            try:
-                with open(AUDIO_SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    current.update(json.load(f))
-            except Exception:
-                pass
-        if sound_url is not None:
-            current['sound_url'] = sound_url
-        if duration is not None:
-            current['duration'] = duration
-        try:
-            with open(AUDIO_SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(current, f)
-        except Exception as e:
-            print(f"Audio settings save failed: {e}", flush=True)
-
-# SOUND FIX (bug): current_audio_settings used to be computed exactly ONCE here, at process
-# startup, and app.layout was a static object built from it. That meant every browser reload
-# re-served that same frozen snapshot forever - Set Tone clicks WERE saving to disk correctly,
-# but no reload would ever reflect it until the whole server process was restarted. The
-# one-time load has been removed; it's now loaded fresh inside serve_layout() below, which
-# Dash calls on every single page load/reload.
 
 if os.path.exists(DATA_FILE):
     global_df = pd.read_csv(DATA_FILE)
@@ -332,7 +250,7 @@ def build_resampled_view(base_df, timeframe):
     df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
     df.set_index('timestamp', inplace=True)
     if timeframe != '1min':
-        agg = {'price':'last','basis':'last','oi':'last','taker_imbalance':'last','whale_div':'last','spot_delta':'sum'}  # ALIGNMENT FIX: was 'first' - switched to 'last' to match price/basis/OI (value as of bar close) and avoid a stale carry-over reading when Binance's 5m bucket boundary doesn't line up exactly with our resample boundary
+        agg = {'price':'last','basis':'last','oi':'last','taker_imbalance':'first','whale_div':'first','spot_delta':'sum'}
         res = df.resample(timeframe, closed='left', label='left').agg(agg)
         res[['taker_imbalance','whale_div']] = res[['taker_imbalance','whale_div']].ffill()
         res = res.dropna(subset=['price','basis','oi'])
@@ -479,9 +397,9 @@ def generate_signal_reason_v2(row, tf, name, active_cvd_filter):
     elif name == "LONG_LIQUIDATION":
         return f"Daemon {tf} | Cascade: OI {SHORT_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_short',0):+.2f}% < -{row.get('oi_accum_short_thresh',0):.2f}% | Force: SellPress {row.get('sell_pressure',0):.2f}x > {row.get('sp_thresh',0):.2f}x | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     elif name == "TOP_EXHAUSTION":
-        return f"Daemon {tf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar High | Danger: BuyPress 3-Bar Max > {row.get('bp_thresh',0):.2f}x | Overext: Basis Max > ${row.get('premium_thresh',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'} | Action: Trim longs / avoid chasing highs"
+        return f"Daemon {tf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar High | Danger: BuyPress 3-Bar Max > {row.get('bp_thresh',0):.2f}x | Overext: Basis Max > ${row.get('premium_thresh',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     elif name == "BOTTOM_EXHAUSTION":
-        return f"Daemon {tf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar Low | Danger: SellPress 3-Bar Max > {row.get('sp_thresh',0):.2f}x | Overext: Basis Min < ${row.get('premium_thresh_lower',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'} | Action: Watch for bounce / cover shorts"
+        return f"Daemon {tf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar Low | Danger: SellPress 3-Bar Max > {row.get('sp_thresh',0):.2f}x | Overext: Basis Min < ${row.get('premium_thresh_lower',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     return ""
 
 async def clock_sync_daemon():
@@ -595,178 +513,98 @@ def create_signal_card(title, active, col, env, data, strat, regime, thr):
 app = dash.Dash(__name__)
 app.index_string = """<!DOCTYPE html><html><head>{%metas%}<title>{%title%}</title>{%favicon%} {%css%}<style>.Select-control { background-color: #222 !important; border-color: #444 !important; color: white !important; } .Select-menu-outer { background-color: #222 !important; color: white !important; } .Select-value-label { color: white !important; }</style></head><body>{%app_entry%}<footer>{%config%} {%scripts%} {%renderer%}</footer></body></html>"""
 app.title = "Order Flow Terminal v3 Bulletproof"
-
-def serve_layout():
-    # SOUND FIX: Wrapping the layout in a function (instead of a static object) makes Dash
-    # call this fresh on every single page load/reload, so it always reflects whatever was
-    # most recently saved via Set Tone / duration change - this is the actual fix for
-    # "settings don't persist on reload".
-    current_audio_settings = load_audio_settings()
-    return html.Div(style={'backgroundColor':'#111','color':'white','fontFamily':'Arial, sans-serif','padding':'20px','minHeight':'100vh','boxSizing':'border-box'}, children=[
-        dcc.Store(id='last-signal-time', data=None),
-        dcc.Store(id='sound-trigger', data=None),
-        dcc.Store(id='active-sound-url', data=current_audio_settings['sound_url']),  # AUDIO FIX: seeded from the server-side settings file, not browser localStorage
-        html.Div(id='audio-dummy', style={'display':'none'}),
-        html.Div(id='preview-dummy', style={'display':'none'}),
-        html.Div(id='duration-save-dummy', style={'display':'none'}),  # AUDIO FIX: dummy Output target for the duration-persist callback below
-        # AUDIO FIX: The "Enable Audio" button has been removed entirely (it's no longer needed
-        # or possible to click, by design). In its place, two persistent, hidden <audio> elements
-        # autoplay MUTED and LOOPED from the instant the page loads. Every browser unconditionally
-        # allows muted autoplay with zero user interaction. When a signal fires (or Preview is
-        # clicked), the matching element is pointed at the chosen sound and restarted WHILE STILL
-        # MUTED (also always allowed), then unmuted a moment later. Unmuting an element that is
-        # already playing is not treated as "starting new audible autoplay" by browser autoplay
-        # policy, so sound plays with zero clicks required - on every page load, forever, with no
-        # manual browser permission step. Two separate elements (daemon vs. preview) mean a live
-        # signal alert and a manual Preview can never cut each other off.
-        html.Audio(id='daemon-audio-element', src=current_audio_settings['sound_url'], autoPlay=True, loop=True, muted=True, style={'display':'none'}),
-        html.Audio(id='preview-audio-element', src=current_audio_settings['sound_url'], autoPlay=True, loop=True, muted=True, style={'display':'none'}),
-        html.H1("QUANTITATIVE ORDER FLOW TERMINAL v3 - BULLETPROOF", style={'textAlign':'center','letterSpacing':'2px','marginBottom':'5px'}),
-        html.Div(id='last-updated-label', style={'textAlign':'center','color':'#888','fontSize':'14px','marginBottom':'20px','fontStyle':'italic'}),
-        html.Div(style={'display':'flex','flexWrap':'wrap','justifyContent':'center','alignItems':'center','marginBottom':'20px','gap':'20px','backgroundColor':'#1a1a1a','padding':'15px','borderRadius':'8px','border':'1px solid #333','boxSizing':'border-box'}, children=[
-            html.Div([html.Label("Timeframe: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='timeframe-dropdown', options=[{'label':'1 Minute','value':'1min'},{'label':'5 Minutes','value':'5min'},{'label':'15 Minutes','value':'15min'},{'label':'30 Minutes','value':'30min'}], value='5min', clearable=False, style={'width':'120px','display':'inline-block','color':'black','textAlign':'left'})]),
-            html.Div([html.Label("History Range: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='range-dropdown', options=[{'label':'Last 1 Hour','value':'1h'},{'label':'Last 6 Hours','value':'6h'},{'label':'Last 24 Hours','value':'24h'},{'label':'Last 1 Week','value':'7d'},{'label':'All Time','value':'all'}], value='24h', clearable=False, style={'width':'140px','display':'inline-block','color':'black','textAlign':'left'})]),
-            html.Div([html.Label("EMA Window: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='ema-window', type='number', value=20, min=2, max=200, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'})]),
-            html.Div([html.Label("CVD Filter: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Checklist(id='cvd-toggle', options=[{'label':' ON (Adaptive Noise + Divergence)','value':'on'}], value=[], style={'display':'inline-block','color':'white'})], style={'display':'none'}),
-            html.Div([html.Label("Alert Sound: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='sound-dropdown', options=[
-                # SOUND FIX: Old alarm/siren catalog removed entirely per request. Replaced with
-                # short, sharp, high-impact chime/ping/bell tones - punchier onset than the old
-                # "Sonar Ping" default, and mastered louder in the source files themselves since
-                # (per the earlier audio-fix conversation) a plain <audio> element is capped at its
-                # own 100% volume - there's no gain/amplification available without reintroducing
-                # a user-gesture requirement, so loudness now comes from picking louder source
-                # files rather than software boosting.
-                {'label':'Sharp Ping','value':'https://actions.google.com/sounds/v1/cartoon/tympani_bing.ogg'},
-                {'label':'Bell Chime','value':'https://actions.google.com/sounds/v1/alarms/medium_bell_ringing_near.ogg'},
-                {'label':'Triangle Ding','value':'https://actions.google.com/sounds/v1/alarms/dinner_bell_triangle.ogg'},
-                {'label':'Urgent Chime (LOUD)','value':'https://actions.google.com/sounds/v1/cartoon/crazy_dinner_bell.ogg'},
-                {'label':'Ringing Hit (LOUD)','value':'https://actions.google.com/sounds/v1/cartoon/cartoon_ringing_hit.ogg'},
-                {'label':'Loud Clang (LOUD)','value':'https://actions.google.com/sounds/v1/cartoon/cartoon_cowbell.ogg'},
-                {'label':'Mute','value':'none'}], value=current_audio_settings['sound_url'], clearable=False, style={'width':'150px','display':'inline-block','color':'black','textAlign':'left'})]),  # AUDIO FIX: value now seeded server-side; persistence=local removed since the JSON settings file is now the source of truth
-            html.Div([html.Label("Duration (s): ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='sound-duration', type='number', value=current_audio_settings['duration'], min=1, max=60, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'})]),  # AUDIO FIX: value now seeded server-side; persistence=local removed since the JSON settings file is now the source of truth
-            html.Div([html.Button("🔊 Preview", id='preview-sound-btn', n_clicks=0, style={'backgroundColor':'#222','color':'#00ffcc','border':'1px solid #00ffcc','borderRadius':'4px','padding':'8px 12px','fontWeight':'bold','cursor':'pointer','marginLeft':'10px'})]),
-            html.Div([html.Button("✅ Set Tone", id='set-sound-btn', n_clicks=0, style={'backgroundColor':'#222','color':'#00ff00','border':'1px solid #00ff00','borderRadius':'4px','padding':'8px 12px','fontWeight':'bold','cursor':'pointer','marginLeft':'10px'}), html.Span(id='tone-save-status', style={'marginLeft':'8px','color':'#00ff00','fontSize':'12px','fontWeight':'bold'})])  # SOUND FIX: added a visible save confirmation - previously clicking Set Tone gave no feedback at all
-        ]),
-        html.Div(id='signal-row-up', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
-        html.Div(id='signal-row-down', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
-        html.Div(id='metrics-row', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(200px, 1fr))','gap':'10px','marginTop':'10px','boxSizing':'border-box'}),
-        html.Div(style={'backgroundColor':'#1a1a1a','border':'1px solid #333','borderRadius':'8px','padding':'15px','height':'180px','overflowY':'auto','marginTop':'20px','fontFamily':'monospace'}, children=[html.H3("EVENT LOG - DAEMON EPOCH HASHED - PRIORITY HIERARCHY", style={'margin':'0 0 10px 0','fontSize':'14px','color':'#aaa'}), html.Div(id='event-log-row')]),
-        html.Div(dcc.Graph(id='main-chart', config={'displayModeBar':False}), style={'marginTop':'20px','border':'1px solid #333','borderRadius':'8px'}),
-        dcc.Interval(id='interval-component', interval=UI_REFRESH_INTERVAL, n_intervals=0)
-    ])
-
-app.layout = serve_layout
-
-# AUDIO FIX: "Set Tone" is now a real Python (server-side) callback instead of a trivial
-# clientside passthrough, because it needs to write the chosen sound to the server-side
-# settings JSON file (data/audio_settings.json) so the choice is remembered no matter which
-# browser/device/machine loads the dashboard next - not just the browser that clicked it.
-@app.callback(
-    Output('active-sound-url', 'data'),
-    Output('tone-save-status', 'children'),
-    Input('set-sound-btn', 'n_clicks'),
-    State('sound-dropdown', 'value'),
-    prevent_initial_call=True
-)
-def set_tone_and_persist(n_clicks, sound_val):
-    save_audio_settings(sound_url=sound_val)
-    return sound_val, "✓ Saved"
-
-# AUDIO FIX: Duration was never gated behind the "Set Tone" button - it always applied live
-# via State in the trigger callbacks below, and we keep that exact behavior unchanged. We
-# additionally mirror every change to the server-side settings file here, purely for
-# persistence, so it's remembered across reloads/restarts/browsers too.
-@app.callback(
-    Output('duration-save-dummy', 'children'),
-    Input('sound-duration', 'value'),
-    prevent_initial_call=True
-)
-def persist_duration_change(duration_val):
-    if duration_val:
-        save_audio_settings(duration=duration_val)
-    return dash.no_update
-
-# AUDIO FIX: The old "Enable Audio" clientside callback (which created/unlocked an
-# AudioContext only on a manual button click) has been removed along with the button itself.
-# It is no longer needed: see the new daemon/preview callbacks below, which rely on the
-# always-playing muted <audio> elements defined in the layout instead of a gesture-gated
-# AudioContext.
+app.layout = html.Div(style={'backgroundColor':'#111','color':'white','fontFamily':'Arial, sans-serif','padding':'20px','minHeight':'100vh','boxSizing':'border-box'}, children=[
+    dcc.Store(id='last-signal-time', data=None),
+    dcc.Store(id='sound-trigger', data=None),
+    dcc.Store(id='audio-enabled', data=False),
+    dcc.Store(id='active-sound-url', data='https://actions.google.com/sounds/v1/alarms/sonar_ping.ogg', storage_type='local'),
+    html.Div(id='audio-dummy', style={'display':'none'}),
+    html.Div(id='preview-dummy', style={'display':'none'}),
+    html.Div(style={'display':'none','justifyContent':'center','marginBottom':'15px'}, children=[html.Button("🔇 Click to Enable Audio", id='audio-enable-btn', n_clicks=0, style={'backgroundColor':'#111','color':'#ffaa00','border':'2px solid #ffaa00','borderRadius':'20px','padding':'8px 18px','fontWeight':'bold','cursor':'pointer','boxShadow':'0 0 10px rgba(255,170,0,0.3)'})]),
+    html.H1("QUANTITATIVE ORDER FLOW TERMINAL v3 - BULLETPROOF", style={'textAlign':'center','letterSpacing':'2px','marginBottom':'5px'}),
+    html.Div(id='last-updated-label', style={'textAlign':'center','color':'#888','fontSize':'14px','marginBottom':'20px','fontStyle':'italic'}),
+    html.Div(style={'display':'flex','flexWrap':'wrap','justifyContent':'center','alignItems':'center','marginBottom':'20px','gap':'20px','backgroundColor':'#1a1a1a','padding':'15px','borderRadius':'8px','border':'1px solid #333','boxSizing':'border-box'}, children=[
+        html.Div([html.Label("Timeframe: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='timeframe-dropdown', options=[{'label':'1 Minute','value':'1min'},{'label':'5 Minutes','value':'5min'},{'label':'15 Minutes','value':'15min'},{'label':'30 Minutes','value':'30min'}], value='5min', clearable=False, style={'width':'120px','display':'inline-block','color':'black','textAlign':'left'})]),
+        html.Div([html.Label("History Range: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='range-dropdown', options=[{'label':'Last 1 Hour','value':'1h'},{'label':'Last 6 Hours','value':'6h'},{'label':'Last 24 Hours','value':'24h'},{'label':'Last 1 Week','value':'7d'},{'label':'All Time','value':'all'}], value='24h', clearable=False, style={'width':'140px','display':'inline-block','color':'black','textAlign':'left'})]),
+        html.Div([html.Label("EMA Window: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='ema-window', type='number', value=20, min=2, max=200, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'})]),
+        html.Div([html.Label("CVD Filter: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Checklist(id='cvd-toggle', options=[{'label':' ON (Adaptive Noise + Divergence)','value':'on'}], value=[], style={'display':'inline-block','color':'white'})], style={'display':'none'}),
+        html.Div([html.Label("Alert Sound: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='sound-dropdown', options=[{'label':'Sonar Ping','value':'https://actions.google.com/sounds/v1/alarms/sonar_ping.ogg'},{'label':'Beep','value':'https://actions.google.com/sounds/v1/alarms/beep_short.ogg'},{'label':'Digital Watch','value':'https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg'},{'label':'Fire Alarm (LOUD)','value':'https://actions.google.com/sounds/v1/alarms/fire_alarm_bell_and_siren.ogg'},{'label':'Nuclear Siren (LOUD)','value':'https://actions.google.com/sounds/v1/alarms/radiation_meter.ogg'},{'label':'Siren Noise (LOUD)','value':'https://actions.google.com/sounds/v1/alarms/siren_noise.ogg'},{'label':'Bugle Tune (LOUD)','value':'https://actions.google.com/sounds/v1/alarms/bugle_tune.ogg'},{'label':'Mechanical Clock (LOUD)','value':'https://actions.google.com/sounds/v1/alarms/mechanical_clock_ring.ogg'},{'label':'Mute','value':'none'}], value='https://actions.google.com/sounds/v1/alarms/sonar_ping.ogg', clearable=False, style={'width':'150px','display':'inline-block','color':'black','textAlign':'left'}, persistence=True, persistence_type='local')]),
+        html.Div([html.Label("Duration (s): ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='sound-duration', type='number', value=6, min=1, max=60, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'}, persistence=True, persistence_type='local')]),
+        html.Div([html.Button("🔊 Preview", id='preview-sound-btn', n_clicks=0, style={'backgroundColor':'#222','color':'#00ffcc','border':'1px solid #00ffcc','borderRadius':'4px','padding':'8px 12px','fontWeight':'bold','cursor':'pointer','marginLeft':'10px'})]),
+        html.Div([html.Button("✅ Set Tone", id='set-sound-btn', n_clicks=0, style={'backgroundColor':'#222','color':'#00ff00','border':'1px solid #00ff00','borderRadius':'4px','padding':'8px 12px','fontWeight':'bold','cursor':'pointer','marginLeft':'10px'})])
+    ]),
+    html.Div(id='signal-row-up', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
+    html.Div(id='signal-row-down', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
+    html.Div(id='metrics-row', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(200px, 1fr))','gap':'10px','marginTop':'10px','boxSizing':'border-box'}),
+    html.Div(style={'backgroundColor':'#1a1a1a','border':'1px solid #333','borderRadius':'8px','padding':'15px','height':'180px','overflowY':'auto','marginTop':'20px','fontFamily':'monospace'}, children=[html.H3("EVENT LOG - DAEMON EPOCH HASHED - PRIORITY HIERARCHY", style={'margin':'0 0 10px 0','fontSize':'14px','color':'#aaa'}), html.Div(id='event-log-row')]),
+    html.Div(dcc.Graph(id='main-chart', config={'displayModeBar':False}), style={'marginTop':'20px','border':'1px solid #333','borderRadius':'8px'}),
+    dcc.Interval(id='interval-component', interval=UI_REFRESH_INTERVAL, n_intervals=0)
+])
 
 app.clientside_callback(
-    """function(trigger, sound_url, duration) {
-        // AUDIO FIX: Replaces the old AudioContext + GainNode approach (which required the
-        // "Enable Audio" button to be clicked first, and reset every page load) with the
-        // muted-autoplay-then-unmute technique. The <audio id="daemon-audio-element"> tag is
-        // already looping, muted, in the background from the moment the page loaded (browsers
-        // always allow muted autoplay with zero user interaction). To fire an alert, we point
-        // it at the chosen sound and restart it from the top WHILE STILL MUTED (also always
-        // allowed), then unmute a moment later - unmuting an element that is already playing
-        // is not classified as "starting new audible autoplay", so it's allowed with no click,
-        // ever, on every page load. We re-mute (never pause) once the duration elapses, so the
-        // element stays "already playing" and is instantly ready to fire again next time.
-        if (trigger && sound_url && sound_url !== 'none') {
-            var el = document.getElementById('daemon-audio-element');
-            if (el) {
-                try {
-                    if (window.daemonMuteTimeout) { clearTimeout(window.daemonMuteTimeout); }
-                    el.muted = true;
-                    if (el.src !== sound_url) { el.src = sound_url; }
-                    el.volume = 1.0; // Max volume the plain <audio> element supports without a gesture-gated AudioContext
-                    el.currentTime = 0;
-                    el.loop = true;
-                    var playPromise = el.play();
-                    var unmuteAndArm = function() {
-                        el.muted = false;
-                        window.daemonMuteTimeout = setTimeout(function () {
-                            el.muted = true; // re-mute, don't pause, so it's instantly ready for the next alert
-                        }, (duration || 6) * 1000);
-                    };
-                    if (playPromise !== undefined) {
-                        playPromise.then(unmuteAndArm).catch(function(e) { console.log('Daemon audio play was blocked:', e); });
-                    } else {
-                        unmuteAndArm();
-                    }
-                } catch(err) { console.log('Audio routing err', err); }
-            }
+    """function(n_clicks, sound_val) { return sound_val; }""",
+    Output('active-sound-url', 'data'),
+    Input('set-sound-btn', 'n_clicks'),
+    State('sound-dropdown', 'value')
+)
+
+app.clientside_callback(
+    """function(n_clicks) { if(n_clicks && n_clicks>0) { try { window.audioCtxBypass = new (window.AudioContext || window.webkitAudioContext)(); if(window.audioCtxBypass.state === 'suspended') { window.audioCtxBypass.resume(); } } catch(e) { } return [true, "🔊 Audio Active - Alerts Enabled"]; } return [false, "🔇 Click to Enable Audio"]; }""",
+    [Output('audio-enabled','data'), Output('audio-enable-btn','children')], Input('audio-enable-btn','n_clicks')
+)
+
+app.clientside_callback(
+    """function(trigger, sound_url, duration, audio_enabled) {
+        if(trigger && sound_url && sound_url !== 'none') {
+            try {
+                if (!window.audioCtxBypass) { window.audioCtxBypass = new (window.AudioContext || window.webkitAudioContext)(); }
+                if (window.audioCtxBypass.state === 'suspended') { window.audioCtxBypass.resume(); }
+                fetch(sound_url).then(function(res) { return res.arrayBuffer(); }).then(function(buf) { return window.audioCtxBypass.decodeAudioData(buf); }).then(function(decoded) {
+                    if (window.daemonSource) { try { window.daemonSource.stop(); } catch(e){} }
+                    var source = window.audioCtxBypass.createBufferSource();
+                    source.buffer = decoded;
+                    source.loop = true;
+                    var gainNode = window.audioCtxBypass.createGain();
+                    gainNode.gain.value = 4.0; // Force maximum piercing volume (400%)
+                    source.connect(gainNode);
+                    gainNode.connect(window.audioCtxBypass.destination);
+                    source.start(0);
+                    window.daemonSource = source;
+                    if (window.daemonTimeout) { clearTimeout(window.daemonTimeout); }
+                    window.daemonTimeout = setTimeout(function(){
+                        if (window.daemonSource) { try { window.daemonSource.stop(); } catch(e){} }
+                    }, (duration || 6) * 1000);
+                }).catch(function(e) { console.log('Firefox blocked autoplay or network failed. Please whitelist 127.0.0.1', e); });
+            } catch(err) { console.log('Audio routing err', err); }
         }
         return window.dash_clientside.no_update;
     }""",
-    Output('audio-dummy','children'), Input('sound-trigger','data'), State('active-sound-url','data'), State('sound-duration','value')
+    Output('audio-dummy','children'), Input('sound-trigger','data'), State('active-sound-url','data'), State('sound-duration','value'), State('audio-enabled','data')
 )
 
 app.clientside_callback(
     """function(n_clicks, sound_url, duration) {
-        // AUDIO FIX: Preview uses the same persistent muted <audio id="preview-audio-element">
-        // element and the same restart-while-muted-then-unmute pattern as the daemon alert
-        // above, instead of a separate Web Audio AudioContext. Because it's a completely
-        // separate DOM element from the daemon one, previewing a sound can never collide with
-        // or get cut off by a live signal alert firing at the same time, and it is unaffected
-        // by the dashboard's 10-second interval re-render since this element isn't touched by
-        // any Dash Output.
-        if (n_clicks && n_clicks > 0 && sound_url && sound_url !== 'none') {
-            var el = document.getElementById('preview-audio-element');
-            if (el) {
-                try {
-                    if (window.previewMuteTimeout) { clearTimeout(window.previewMuteTimeout); }
-                    el.muted = true;
-                    if (el.src !== sound_url) { el.src = sound_url; }
-                    el.volume = 1.0; // Max volume the plain <audio> element supports without a gesture-gated AudioContext
-                    el.currentTime = 0;
-                    el.loop = true;
-                    var playPromise = el.play();
-                    var unmuteAndArm = function() {
-                        el.muted = false;
-                        window.previewMuteTimeout = setTimeout(function () {
-                            el.muted = true; // re-mute, don't pause, so it's instantly ready for the next preview
-                        }, (duration || 6) * 1000);
-                    };
-                    if (playPromise !== undefined) {
-                        playPromise.then(unmuteAndArm).catch(function(e) { console.log('Preview playback failed:', e); });
-                    } else {
-                        unmuteAndArm();
-                    }
-                } catch(err) { console.log('Preview routing err', err); }
-            }
+        if(n_clicks && n_clicks > 0 && sound_url && sound_url !== 'none') {
+            try {
+                if (!window.audioCtxBypass) { window.audioCtxBypass = new (window.AudioContext || window.webkitAudioContext)(); }
+                if (window.audioCtxBypass.state === 'suspended') { window.audioCtxBypass.resume(); }
+                fetch(sound_url).then(function(res) { return res.arrayBuffer(); }).then(function(buf) { return window.audioCtxBypass.decodeAudioData(buf); }).then(function(decoded) {
+                    if (window.previewSource) { try { window.previewSource.stop(); } catch(e){} }
+                    var source = window.audioCtxBypass.createBufferSource();
+                    source.buffer = decoded;
+                    source.loop = true;
+                    var gainNode = window.audioCtxBypass.createGain();
+                    gainNode.gain.value = 4.0; // Force maximum piercing volume (400%)
+                    source.connect(gainNode);
+                    gainNode.connect(window.audioCtxBypass.destination);
+                    source.start(0);
+                    window.previewSource = source;
+                    if (window.previewTimeout) { clearTimeout(window.previewTimeout); }
+                    window.previewTimeout = setTimeout(function(){
+                        if (window.previewSource) { try { window.previewSource.stop(); } catch(e){} }
+                    }, (duration || 6) * 1000);
+                }).catch(function(e) { console.log('Preview playback failed:', e); });
+            } catch(err) { console.log('Preview routing err', err); }
         }
         return window.dash_clientside.no_update;
     }""",

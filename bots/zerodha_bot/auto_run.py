@@ -824,6 +824,9 @@ def update_ui():
 
         # NEW: user-selectable alert sound + duration, from the split Upper/Lower alert cards.
         # Distinct tuple shape, so it can't collide with the legacy string entries below.
+        # Looped (a.loop = true) for the full requested duration then stopped -- otherwise a
+        # short clip just plays once and goes silent well before the duration elapses, which
+        # looked like "the duration isn't respected".
         if isinstance(snd, tuple) and len(snd) == 3 and snd[0] == 'alert_custom':
             _, sound_name, duration = snd
             url = ALERT_SOUND_URLS.get(sound_name, ALERT_SOUND_URLS['Wood Plank'])
@@ -831,7 +834,7 @@ def update_ui():
             except (ValueError, TypeError): dur_ms = 5000
             if dur_ms <= 0: dur_ms = 5000
             ui.run_javascript(
-                f'const a = new Audio("{url}"); a.play().catch(()=>{{}});'
+                f'const a = new Audio("{url}"); a.loop = true; a.play().catch(()=>{{}});'
                 f'setTimeout(() => {{ a.pause(); a.currentTime = 0; }}, {dur_ms});'
             )
             continue
@@ -951,7 +954,7 @@ def update_ui():
         for k in ['put_idx_open','put_idx_curr']: ui_refs[k].set_text('0')
         ui_refs['put_pnl'].set_text('₹ 0')
 
-    # --- NEW: OPEN POSITIONS section (dark-themed, kept alongside the banner cards above) ---
+    # --- OPEN POSITIONS section (kept alongside the banner cards above) ---
     open_count = 0
     if tc and ui_refs.get('call_pos_symbol'):
         open_count += 1
@@ -961,20 +964,9 @@ def update_ui():
         ui_refs['call_pos_size'].set_text(f"{tc['qty']}")
         ui_refs['call_pos_entry'].set_text(f"{entry:.2f}")
         ui_refs['call_pos_qty'].set_text(f"{tc['qty']}")
-        c = 'text-green-400' if tc['pnl'] >= 0 else 'text-red-400'
+        c = 'text-green-600' if tc['pnl'] >= 0 else 'text-red-600'
         ui_refs['call_pos_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
         ui_refs['call_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
-        # Max Loss/Profit derived from the stop/target values, if active (points x qty)
-        if params.get('call_stop_active') and str(params.get('call_stop_val', '')).strip() not in ('', '0'):
-            try: ui_refs['call_pos_maxloss'].set_text(f"-₹{float(params['call_stop_val']):.0f}")
-            except (ValueError, TypeError): ui_refs['call_pos_maxloss'].set_text('-')
-        else:
-            ui_refs['call_pos_maxloss'].set_text('-')
-        if params.get('call_target_active') and str(params.get('call_target_val', '')).strip() not in ('', '0'):
-            try: ui_refs['call_pos_maxprofit'].set_text(f"+₹{float(params['call_target_val']):.0f}")
-            except (ValueError, TypeError): ui_refs['call_pos_maxprofit'].set_text('-')
-        else:
-            ui_refs['call_pos_maxprofit'].set_text('-')
 
     if tp and ui_refs.get('put_pos_symbol'):
         open_count += 1
@@ -984,19 +976,9 @@ def update_ui():
         ui_refs['put_pos_size'].set_text(f"{tp['qty']}")
         ui_refs['put_pos_entry'].set_text(f"{entry:.2f}")
         ui_refs['put_pos_qty'].set_text(f"{tp['qty']}")
-        c = 'text-green-400' if tp['pnl'] >= 0 else 'text-red-400'
+        c = 'text-green-600' if tp['pnl'] >= 0 else 'text-red-600'
         ui_refs['put_pos_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
         ui_refs['put_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
-        if params.get('put_stop_active') and str(params.get('put_stop_val', '')).strip() not in ('', '0'):
-            try: ui_refs['put_pos_maxloss'].set_text(f"-₹{float(params['put_stop_val']):.0f}")
-            except (ValueError, TypeError): ui_refs['put_pos_maxloss'].set_text('-')
-        else:
-            ui_refs['put_pos_maxloss'].set_text('-')
-        if params.get('put_target_active') and str(params.get('put_target_val', '')).strip() not in ('', '0'):
-            try: ui_refs['put_pos_maxprofit'].set_text(f"+₹{float(params['put_target_val']):.0f}")
-            except (ValueError, TypeError): ui_refs['put_pos_maxprofit'].set_text('-')
-        else:
-            ui_refs['put_pos_maxprofit'].set_text('-')
 
     if ui_refs.get('open_positions_count'):
         ui_refs['open_positions_count'].set_text(f"{open_count} position{'s' if open_count != 1 else ''}")
@@ -1348,7 +1330,7 @@ def index():
         with ui.column().classes('grow gap-4'): build_center_stack()
         with ui.column().classes('grow gap-4'): build_right_stack()
 
-    # NEW: Open Positions (dark-themed, kept alongside the banner CALL/PUT POSITION cards)
+    # Open Positions (kept alongside the banner CALL/PUT POSITION cards)
     comp.render_open_positions(on_close_call=lambda: handle_close('Call'), on_close_put=lambda: handle_close('Put'))
 
     # Order Book (pending Limit/Stop-Market triggers, table-styled) and Order History (full tradebook)
