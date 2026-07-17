@@ -32,10 +32,6 @@ USE_SPOT_CVD_FILTER_DEFAULT = False
 PRESSURE_CLIP_MAX = 10.0
 PRESSURE_CLIP_MIN = 0.1
 WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN = 10
-# CHART FIX: Whale panel display-only constants below. Not read by compute_signals_for_view -
-# used purely to size the divergence marker/threshold on the redesigned chart panel.
-WHALE_DIVERGENCE_STD_LOOKBACK_BARS = 30  # how many bars of whale_delta volatility to measure for the display threshold
-WHALE_DIVERGENCE_STD_MULTIPLIER = 1.5    # same multiplier style as PRICE_THRESHOLD_MULTIPLIER_STANDARD_DEVIATIONS
 CVD_NOISE_THRESHOLD_MINIMUM_VALUE = 0.5
 CVD_NOISE_THRESHOLD_FACTOR_MULTIPLIER = 0.2
 VOLATILITY_SCALER_ENABLED = False
@@ -907,19 +903,6 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     chart['clip_marker_y'] = chart['net_pressure'].where(chart['bp_clipped'] | chart['sp_clipped'])
     chart['buy_signal_marker_y'] = chart['net_pressure'].where(chart.get('is_fakeout', False) | chart.get('is_exhaustion', False))  # CHART FIX: marks bars where a buy-pressure-driven signal (Short Squeeze / Top Exhaustion) actually fired
     chart['sell_signal_marker_y'] = chart['net_pressure'].where(chart.get('is_long_liq', False) | chart.get('is_bottom_exhaust', False))  # CHART FIX: marks bars where a sell-pressure-driven signal (Long Liquidation / Bottom Exhaustion) actually fired
-    # CHART FIX: Whale panel prep - purely presentational, does NOT touch signal computation.
-    # Confirmed sign convention: whale_div = (top-trader account long/short ratio) / (top-trader
-    # position long/short ratio). whale_delta = whale_div - its EMA. whale_delta > 0 means the
-    # ratio is trending toward "whales relatively more short/selling". We flip the sign here
-    # ONLY for display, so positive/green consistently means "whales trending long/buying" and
-    # negative/red means "whales trending short/selling" - matching the color convention already
-    # used on the pressure panel. This does not change is_exhaustion/is_bottom_exhaust logic at all.
-    chart['whale_bias'] = -chart['whale_delta']
-    chart['whale_bias_pos'] = chart['whale_bias'].clip(lower=0)
-    chart['whale_bias_neg'] = chart['whale_bias'].clip(upper=0)
-    chart['whale_delta_std'] = chart['whale_delta'].ewm(span=WHALE_DIVERGENCE_STD_LOOKBACK_BARS,adjust=False).std().fillna(0)
-    chart['whale_divergence_thresh'] = (chart['whale_delta_std']*WHALE_DIVERGENCE_STD_MULTIPLIER).clip(lower=1e-6)  # CHART FIX: data-driven display threshold, not a fixed guess - whale_delta's scale is tiny and varies, so this sizes to its own recent volatility (same EWM-std-multiplier style as the signal thresholds elsewhere in the file)
-    chart['whale_divergence_marker_y'] = chart['whale_bias'].where(chart['whale_bias'].abs() >= chart['whale_divergence_thresh'])
     
     if time_range!='all':
         mt=chart['timestamp'].max()
@@ -938,13 +921,7 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     pressure_range_max = float(_pressure_vals.max()) if len(_pressure_vals) else 1.0
     pressure_range_max = max(pressure_range_max * 1.35, 1.0)
     pressure_range_max = min(pressure_range_max, PRESSURE_CLIP_MAX)
-    # CHART FIX: Same dynamic-range idea for the whale bias axis. No fixed floor like pressure's
-    # "1.0" makes sense here since whale_delta's scale is tiny and data-dependent - floored only
-    # by a small epsilon so the axis never collapses to a zero-width range on a dead-flat view.
-    _whale_vals = pd.concat([chart['whale_bias'].abs(), chart['whale_divergence_thresh']]).dropna()
-    whale_bias_range_max = float(_whale_vals.max()) if len(_whale_vals) else 0.0
-    whale_bias_range_max = max(whale_bias_range_max * 1.35, 1e-4)
-    fig=make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.26,0.26,0.14,0.14,0.20],subplot_titles=("Price & Open Interest (Forming)","Taker Buy/Sell Pressure (Net)","Whale Positioning Bias","Basis Premium","Spot Cumulative Volume Delta (CVD)"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}]])
+    fig=make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.26,0.26,0.14,0.14,0.20],subplot_titles=("Price & Open Interest (Forming)","Taker Buy/Sell Pressure (Net)","Whale Ratio","Basis Premium","Spot Cumulative Volume Delta (CVD)"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}],[{"secondary_y":False}]])
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['price'],name="Price",line=dict(color='white',width=2)),row=1,col=1,secondary_y=False)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['oi'],name="OI",line=dict(color='cyan',dash='dot')),row=1,col=1,secondary_y=True)
     # CHART FIX: Merged Buy/Sell Pressure panel (was two separate panels, row 2 + row 3). Green
@@ -960,16 +937,8 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['clip_marker_y'],name="Clipped Reading",mode='markers',marker=dict(color='yellow',size=7,symbol='triangle-up',line=dict(color='black',width=1))),row=2,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['buy_signal_marker_y'],name="Buy Signal Fired",mode='markers',marker=dict(color='lime',size=10,symbol='star',line=dict(color='black',width=1))),row=2,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['sell_signal_marker_y'],name="Sell Signal Fired",mode='markers',marker=dict(color='red',size=10,symbol='star',line=dict(color='black',width=1))),row=2,col=1)
-    # CHART FIX: Redesigned Whale panel. Green/red fill = whale_bias (sign-flipped whale_delta,
-    # see comment above) - positive/green means whale positioning trending long, negative/red
-    # trending short. Orange diamonds mark bars where |whale_bias| cleared its own dynamic
-    # divergence threshold. Raw ratio moved to a secondary axis as a thin dotted reference line
-    # (own scale, own 1.0 balance line) instead of competing for the same axis as the EMA.
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_bias_pos'],name="Whale Long-Leaning",line=dict(color='rgba(0,255,150,0.9)',width=1.5),fill='tozeroy',fillcolor='rgba(0,255,150,0.20)'),row=3,col=1,secondary_y=False)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_bias_neg'],name="Whale Short-Leaning",line=dict(color='rgba(255,80,80,0.9)',width=1.5),fill='tozeroy',fillcolor='rgba(255,80,80,0.20)'),row=3,col=1,secondary_y=False)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_divergence_marker_y'],name="Whale Divergence",mode='markers',marker=dict(color='orange',size=8,symbol='diamond',line=dict(color='black',width=1))),row=3,col=1,secondary_y=False)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw Ratio",line=dict(color='rgba(255,255,0,0.5)',width=1,dash='dot')),row=3,col=1,secondary_y=True)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=[1.0]*len(chart),name="Raw Ratio = 1.0",line=dict(color='rgba(255,255,255,0.3)',width=1,dash='dot')),row=3,col=1,secondary_y=True)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw",line=dict(color='rgba(255,255,0,0.3)')),row=3,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_whale'],name=f"Whale EMA{WHALE_RATIO_EXPONENTIAL_MOVING_AVERAGE_SPAN}",line=dict(color='yellow',width=2)),row=3,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart.get('premium_thresh', np.nan),name="90%",line=dict(color='rgba(255,165,0,0.3)',dash='dash')),row=4,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis'],name="Basis",line=dict(color='orange'),fill='tonexty'),row=4,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart.get('premium_thresh_lower', np.nan),name="10%",line=dict(color='rgba(0,200,255,0.3)',dash='dash')),row=4,col=1)
@@ -978,24 +947,6 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=40,r=40,t=60,b=20),hovermode="x unified",legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0),height=1150,uirevision='locked')
     fig.update_xaxes(showgrid=True,gridcolor='#222')
     fig.update_yaxes(range=[-pressure_range_max,pressure_range_max],zeroline=True,zerolinecolor='rgba(255,255,255,0.5)',zerolinewidth=1.5,row=2,col=1)  # CHART FIX: now uses the dynamic pressure_range_max computed above instead of a fixed ±PRESSURE_CLIP_MAX, so the real movement fills the panel instead of looking sandwiched
-    fig.update_yaxes(range=[-whale_bias_range_max,whale_bias_range_max],zeroline=True,zerolinecolor='rgba(255,255,255,0.5)',zerolinewidth=1.5,row=3,col=1,secondary_y=False)  # CHART FIX: dynamic range for the new whale bias axis
-    # CHART FIX: Cross-panel divergence highlight - your "retail frenzy vs whale opposite
-    # direction" thesis, made visible before the (still unchanged) exhaustion signal logic even
-    # fires. Marks bars where retail pressure crossed its real danger-zone threshold AND whale
-    # bias cleared its own divergence threshold AND they point opposite ways. Drawn as a subtle
-    # band across the full figure height (all panels) so you can see price's reaction right there.
-    retail_dir = np.sign(chart['net_pressure'])
-    whale_dir = np.sign(chart['whale_bias'])
-    retail_meaningful = (chart['net_pressure'] >= chart['bp_thresh']) | (chart['net_pressure'] <= -chart['sp_thresh'])
-    whale_meaningful = chart['whale_bias'].abs() >= chart['whale_divergence_thresh']
-    cross_divergence = retail_meaningful & whale_meaningful & (retail_dir != whale_dir) & (retail_dir != 0) & (whale_dir != 0)
-    divergence_bars = chart[cross_divergence]
-    if len(divergence_bars):
-        bar_width = chart['timestamp'].diff().median()
-        if pd.isna(bar_width) or bar_width <= pd.Timedelta(0):
-            bar_width = pd.Timedelta(minutes=5)
-        for _, drow in divergence_bars.head(200).iterrows():  # safety cap on shape count, not expected to matter in normal use
-            fig.add_vrect(x0=drow['timestamp']-bar_width/2, x1=drow['timestamp']+bar_width/2, fillcolor='rgba(255,255,255,0.07)', line_width=0, layer='below')
     return last_upd, up, down, metrics, logs, fig, last_signal_time, sound
 
 if __name__ == '__main__':
