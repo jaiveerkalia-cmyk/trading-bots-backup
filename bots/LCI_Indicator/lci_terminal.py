@@ -47,6 +47,17 @@ BASIS_PREMIUM_THRESHOLD_LOOKBACK_BARS = 100
 TAKER_BUY_PRESSURE_THRESHOLD_LOOKBACK_BARS = 25  # SESSION FIX: was 100 - was barely adapting within a session at all (~8.3h), cut to ~2h
 TAKER_SELL_PRESSURE_THRESHOLD_LOOKBACK_BARS = 25  # SESSION FIX: was 100 - same reasoning as buy pressure
 SPOT_DELTA_VOLATILITY_LOOKBACK_BARS = 20
+# CONFLUENCE FIX: Real-data testing showed requiring ALL conditions simultaneously can zero out
+# signals during periods with genuine-but-moderate movement (e.g. one rare condition vetoing two
+# others that did confirm). Each signal now requires at least this many of its conditions to be
+# true, instead of strictly all of them. Kept as separate variables per signal so each can be
+# tuned independently later without affecting the others.
+BREAKOUT_MIN_CONDITIONS_REQUIRED = 2       # out of 3: price, OI, whale
+BREAKDOWN_MIN_CONDITIONS_REQUIRED = 2      # out of 3: price, OI, whale
+SQUEEZE_MIN_CONDITIONS_REQUIRED = 2        # out of 3: OI, buy pressure, whale
+LONG_LIQ_MIN_CONDITIONS_REQUIRED = 2       # out of 3: OI, sell pressure, whale
+EXHAUSTION_MIN_CONDITIONS_REQUIRED = 4     # out of 5: stretch, stall, buy pressure, premium, whale - raised from 3, real-data test showed 3/5 fired ~29 times in 24h (too loose for a reversal signal)
+BOTTOM_EXHAUST_MIN_CONDITIONS_REQUIRED = 4 # out of 5: stretch, stall, sell pressure, premium, whale - same reasoning
 
 # NEW: ROLLING ACCUMULATION WINDOWS
 SHORT_ROLLING_WINDOW_BARS = 3
@@ -217,7 +228,14 @@ async def fetch_binance_data():
     async with aiohttp.ClientSession() as session:
         # BUG 1 FIX: Concurrently fetch native 15m and 30m API data from Binance
         urls = {
-            "spot": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+            # PRICE SOURCE FIX: main chart price now sourced from the FUTURES last-traded price
+            # (matches what TradingView's futures candles show) instead of the spot ticker. This
+            # is safe/consistent because: OI, taker pressure, whale ratio, and basis were already
+            # all futures-derived - spot price was the one mismatched piece. Basis itself is
+            # computed from mark/index (both futures-side), so it's unaffected by this change.
+            # Spot CVD is untouched too - it deliberately stays spot-sourced (via spot_kline
+            # below) as the "real money" cross-check against futures/derivatives froth.
+            "futures_price": "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT",
             "spot_kline": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1",
             "premium": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT",
             "oi": "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT",
@@ -234,10 +252,10 @@ async def fetch_binance_data():
         tasks = {k: fetch_json(session, u) for k,u in urls.items()}
         results = await asyncio.gather(*tasks.values())
         data = dict(zip(tasks.keys(), results))
-        if not data.get("spot") or not data.get("premium") or not data.get("oi"): return None
+        if not data.get("futures_price") or not data.get("premium") or not data.get("oi"): return None
         ts = now_ist().replace(second=0, microsecond=0)
         try:
-            spot_price = float(data["spot"]["price"])
+            futures_price = float(data["futures_price"]["price"])
             mark = float(data["premium"]["markPrice"])
             index = float(data["premium"]["indexPrice"])
             oi = float(data["oi"]["openInterest"])
@@ -263,7 +281,7 @@ async def fetch_binance_data():
                 tot = float(k[5]); tb = float(k[9]); spot_delta = tb - (tot - tb)
                 spot_delta = float(np.clip(spot_delta, -100, 100))
             
-            return {'timestamp':ts,'price':spot_price,'basis':basis,'oi':oi,
+            return {'timestamp':ts,'price':futures_price,'basis':basis,'oi':oi,
                     'taker_imbalance':taker_imb,'whale_div':whale,
                     'taker_imbalance_15m':taker_imb_15m,'whale_div_15m':whale_15m,
                     'taker_imbalance_30m':taker_imb_30m,'whale_div_30m':whale_30m,
@@ -424,17 +442,54 @@ def compute_signals_for_view(df_input, timeframe, use_cvd_filter=False):
         df[col] = df[col].fillna({'price_thresh':0.15,'price_stretch_thresh':0.4,'oi_accum_long_thresh':0.8,'oi_accum_short_thresh':0.4,'premium_thresh':8.0,'premium_thresh_lower':-8.0,'bp_thresh':1.3,'sp_thresh':1.3}.get(col,0))
 
     # --- LOGIC RULES ---
+    # CONFLUENCE FIX: Each signal used to require ALL of its conditions true on the identical
+    # bar (strict AND). Testing against real data showed this can produce zero signals across a
+    # full day even when there was genuine (if moderate) movement, because one rarely-met
+    # condition vetoes the others even when they clearly confirmed. Each condition is now
+    # computed as its own named column, counted, and compared against a MIN_CONDITIONS_REQUIRED
+    # constant (see top of file) - "at least N of M agree" instead of "all M must agree".
     # 1. Breakouts/Breakdowns (Spark + Fuel + Trap)
-    raw_breakout = (df['price_change'] > df['price_thresh']) & (df['oi_accum_long'] > df['oi_accum_long_thresh']) & (df['whale_delta'] < 0)
-    raw_breakdown = (df['price_change'] < -df['price_thresh']) & (df['oi_accum_long'] > df['oi_accum_long_thresh']) & (df['whale_delta'] > 0)
+    df['brk_up_price_ok'] = df['price_change'] > df['price_thresh']
+    df['brk_up_oi_ok'] = df['oi_accum_long'] > df['oi_accum_long_thresh']
+    df['brk_up_whale_ok'] = df['whale_delta'] < 0
+    df['brk_up_count'] = df['brk_up_price_ok'].astype(int) + df['brk_up_oi_ok'].astype(int) + df['brk_up_whale_ok'].astype(int)
+    raw_breakout = df['brk_up_count'] >= BREAKOUT_MIN_CONDITIONS_REQUIRED
+
+    df['brk_down_price_ok'] = df['price_change'] < -df['price_thresh']
+    df['brk_down_oi_ok'] = df['oi_accum_long'] > df['oi_accum_long_thresh']
+    df['brk_down_whale_ok'] = df['whale_delta'] > 0
+    df['brk_down_count'] = df['brk_down_price_ok'].astype(int) + df['brk_down_oi_ok'].astype(int) + df['brk_down_whale_ok'].astype(int)
+    raw_breakdown = df['brk_down_count'] >= BREAKDOWN_MIN_CONDITIONS_REQUIRED
     
     # 2. Squeeze/Liquidation (Cascade + Force + Trap)
-    raw_fakeout = (df['oi_accum_short'] < -df['oi_accum_short_thresh']) & (df['buy_pressure'] > df['bp_thresh']) & (df['whale_delta'] > 0)
-    raw_liq = (df['oi_accum_short'] < -df['oi_accum_short_thresh']) & (df['sell_pressure'] > df['sp_thresh']) & (df['whale_delta'] < 0)
+    df['sqz_oi_ok'] = df['oi_accum_short'] < -df['oi_accum_short_thresh']
+    df['sqz_bp_ok'] = df['buy_pressure'] > df['bp_thresh']
+    df['sqz_whale_ok'] = df['whale_delta'] > 0
+    df['sqz_count'] = df['sqz_oi_ok'].astype(int) + df['sqz_bp_ok'].astype(int) + df['sqz_whale_ok'].astype(int)
+    raw_fakeout = df['sqz_count'] >= SQUEEZE_MIN_CONDITIONS_REQUIRED
+
+    df['liq_oi_ok'] = df['oi_accum_short'] < -df['oi_accum_short_thresh']
+    df['liq_sp_ok'] = df['sell_pressure'] > df['sp_thresh']
+    df['liq_whale_ok'] = df['whale_delta'] < 0
+    df['liq_count'] = df['liq_oi_ok'].astype(int) + df['liq_sp_ok'].astype(int) + df['liq_whale_ok'].astype(int)
+    raw_liq = df['liq_count'] >= LONG_LIQ_MIN_CONDITIONS_REQUIRED
     
     # 3. Exhaustion (Stretch + Stall + Danger Zone + Overext + Trap)
-    raw_exhaust = (df['price_stretch'] > df['price_stretch_thresh']) & (df['price'] <= df['price_max_short'].shift(1)) & (df['bp_max_short'] > df['bp_thresh']) & (df['premium_max_short'] > df['premium_thresh']) & (df['whale_delta'] > 0)
-    raw_bottom = (df['price_stretch'] < -df['price_stretch_thresh']) & (df['price'] >= df['price_min_short'].shift(1)) & (df['sp_max_short'] > df['sp_thresh']) & (df['premium_min_short'] < df['premium_thresh_lower']) & (df['whale_delta'] < 0)
+    df['exh_stretch_ok'] = df['price_stretch'] > df['price_stretch_thresh']
+    df['exh_stall_ok'] = df['price'] <= df['price_max_short'].shift(1)
+    df['exh_bp_ok'] = df['bp_max_short'] > df['bp_thresh']
+    df['exh_premium_ok'] = df['premium_max_short'] > df['premium_thresh']
+    df['exh_whale_ok'] = df['whale_delta'] > 0
+    df['exh_count'] = df['exh_stretch_ok'].astype(int) + df['exh_stall_ok'].astype(int) + df['exh_bp_ok'].astype(int) + df['exh_premium_ok'].astype(int) + df['exh_whale_ok'].astype(int)
+    raw_exhaust = df['exh_count'] >= EXHAUSTION_MIN_CONDITIONS_REQUIRED
+
+    df['bot_stretch_ok'] = df['price_stretch'] < -df['price_stretch_thresh']
+    df['bot_stall_ok'] = df['price'] >= df['price_min_short'].shift(1)
+    df['bot_sp_ok'] = df['sp_max_short'] > df['sp_thresh']
+    df['bot_premium_ok'] = df['premium_min_short'] < df['premium_thresh_lower']
+    df['bot_whale_ok'] = df['whale_delta'] < 0
+    df['bot_count'] = df['bot_stretch_ok'].astype(int) + df['bot_stall_ok'].astype(int) + df['bot_sp_ok'].astype(int) + df['bot_premium_ok'].astype(int) + df['bot_whale_ok'].astype(int)
+    raw_bottom = df['bot_count'] >= BOTTOM_EXHAUST_MIN_CONDITIONS_REQUIRED
 
     df['cvd_noise_thresh'] = np.maximum(CVD_NOISE_THRESHOLD_MINIMUM_VALUE, CVD_NOISE_THRESHOLD_FACTOR_MULTIPLIER * df['spot_delta'].rolling(SPOT_DELTA_VOLATILITY_LOOKBACK_BARS).std().fillna(0))
 
@@ -458,6 +513,15 @@ def compute_signals_for_view(df_input, timeframe, use_cvd_filter=False):
     df['is_breakdown'] = df['is_breakdown'] & ~df['is_exhaustion'] & ~df['is_bottom_exhaust'] & ~df['is_fakeout'] & ~df['is_long_liq']
     return df, False
 
+def _confluence_str(row, items, count_key, required):
+    # CONFLUENCE FIX: builds the "what met, what didn't" checklist for the signal reason text.
+    # items is a list of (label, column_key) pairs matching the *_ok columns computed in
+    # compute_signals_for_view. Works for a fired signal (shows why it cleared the bar) equally
+    # well as for near-miss inspection later, since it just reflects whatever's in the row.
+    parts = [f"{'✓' if bool(row.get(key, False)) else '✗'}{label}" for label, key in items]
+    count = int(row.get(count_key, 0))
+    return f"Confluence {count}/{len(items)} (need {required}) [{' '.join(parts)}]"
+
 def generate_signal_reason_v2(row, tf, name, active_cvd_filter):
     cvd_trend = float(row.get('cvd_trend', 0))
     cvd_noise = float(row.get('cvd_noise_thresh', 0.5))
@@ -475,17 +539,23 @@ def generate_signal_reason_v2(row, tf, name, active_cvd_filter):
     whale_str = f"Raw < EMA (Δ {whale_delta:.3f})" if whale_delta < 0 else f"Raw > EMA (Δ {whale_delta:.3f})"
     
     if name == "TRUE_BREAKOUT":
-        return f"Daemon {tf} | Spark: Price {row.get('price_change',0):+.2f}% > {row.get('price_thresh',0):.2f}% | Fuel: OI {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_long',0):+.2f}% > {row.get('oi_accum_long_thresh',0):.2f}% | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
+        conf = _confluence_str(row, [("Price","brk_up_price_ok"),("OI","brk_up_oi_ok"),("Whale","brk_up_whale_ok")], "brk_up_count", BREAKOUT_MIN_CONDITIONS_REQUIRED)
+        return f"Daemon {tf} | {conf} | Spark: Price {row.get('price_change',0):+.2f}% > {row.get('price_thresh',0):.2f}% | Fuel: OI {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_long',0):+.2f}% > {row.get('oi_accum_long_thresh',0):.2f}% | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     elif name == "TRUE_BREAKDOWN":
-        return f"Daemon {tf} | Spark: Price {row.get('price_change',0):+.2f}% < -{row.get('price_thresh',0):.2f}% | Fuel: OI {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_long',0):+.2f}% > {row.get('oi_accum_long_thresh',0):.2f}% | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
+        conf = _confluence_str(row, [("Price","brk_down_price_ok"),("OI","brk_down_oi_ok"),("Whale","brk_down_whale_ok")], "brk_down_count", BREAKDOWN_MIN_CONDITIONS_REQUIRED)
+        return f"Daemon {tf} | {conf} | Spark: Price {row.get('price_change',0):+.2f}% < -{row.get('price_thresh',0):.2f}% | Fuel: OI {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_long',0):+.2f}% > {row.get('oi_accum_long_thresh',0):.2f}% | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     elif name == "SHORT_SQUEEZE":
-        return f"Daemon {tf} | Cascade: OI {SHORT_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_short',0):+.2f}% < -{row.get('oi_accum_short_thresh',0):.2f}% | Force: BuyPress {row.get('buy_pressure',0):.2f}x > {row.get('bp_thresh',0):.2f}x | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
+        conf = _confluence_str(row, [("OI","sqz_oi_ok"),("BuyPress","sqz_bp_ok"),("Whale","sqz_whale_ok")], "sqz_count", SQUEEZE_MIN_CONDITIONS_REQUIRED)
+        return f"Daemon {tf} | {conf} | Cascade: OI {SHORT_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_short',0):+.2f}% < -{row.get('oi_accum_short_thresh',0):.2f}% | Force: BuyPress {row.get('buy_pressure',0):.2f}x > {row.get('bp_thresh',0):.2f}x | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     elif name == "LONG_LIQUIDATION":
-        return f"Daemon {tf} | Cascade: OI {SHORT_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_short',0):+.2f}% < -{row.get('oi_accum_short_thresh',0):.2f}% | Force: SellPress {row.get('sell_pressure',0):.2f}x > {row.get('sp_thresh',0):.2f}x | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
+        conf = _confluence_str(row, [("OI","liq_oi_ok"),("SellPress","liq_sp_ok"),("Whale","liq_whale_ok")], "liq_count", LONG_LIQ_MIN_CONDITIONS_REQUIRED)
+        return f"Daemon {tf} | {conf} | Cascade: OI {SHORT_ROLLING_WINDOW_BARS}-Bar {row.get('oi_accum_short',0):+.2f}% < -{row.get('oi_accum_short_thresh',0):.2f}% | Force: SellPress {row.get('sell_pressure',0):.2f}x > {row.get('sp_thresh',0):.2f}x | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'}"
     elif name == "TOP_EXHAUSTION":
-        return f"Daemon {tf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar High | Danger: BuyPress 3-Bar Max > {row.get('bp_thresh',0):.2f}x | Overext: Basis Max > ${row.get('premium_thresh',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'} | Action: Trim longs / avoid chasing highs"
+        conf = _confluence_str(row, [("Stretch","exh_stretch_ok"),("Stall","exh_stall_ok"),("BuyPress","exh_bp_ok"),("Premium","exh_premium_ok"),("Whale","exh_whale_ok")], "exh_count", EXHAUSTION_MIN_CONDITIONS_REQUIRED)
+        return f"Daemon {tf} | {conf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar High | Danger: BuyPress 3-Bar Max > {row.get('bp_thresh',0):.2f}x | Overext: Basis Max > ${row.get('premium_thresh',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'} | Action: Trim longs / avoid chasing highs"
     elif name == "BOTTOM_EXHAUSTION":
-        return f"Daemon {tf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar Low | Danger: SellPress 3-Bar Max > {row.get('sp_thresh',0):.2f}x | Overext: Basis Min < ${row.get('premium_thresh_lower',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'} | Action: Watch for bounce / cover shorts"
+        conf = _confluence_str(row, [("Stretch","bot_stretch_ok"),("Stall","bot_stall_ok"),("SellPress","bot_sp_ok"),("Premium","bot_premium_ok"),("Whale","bot_whale_ok")], "bot_count", BOTTOM_EXHAUST_MIN_CONDITIONS_REQUIRED)
+        return f"Daemon {tf} | {conf} | Stretch: Price {LONG_ROLLING_WINDOW_BARS}-Bar {row.get('price_stretch',0):+.2f}% | Stall: Failed to break {SHORT_ROLLING_WINDOW_BARS}-Bar Low | Danger: SellPress 3-Bar Max > {row.get('sp_thresh',0):.2f}x | Overext: Basis Min < ${row.get('premium_thresh_lower',0):.2f} | {cvd_str} | Whale Trap: {whale_str} | Filter {'ON' if active_cvd_filter else 'OFF'} | Action: Watch for bounce / cover shorts"
     return ""
 
 async def clock_sync_daemon():
@@ -629,7 +699,7 @@ def serve_layout():
         html.Div(id='last-updated-label', style={'textAlign':'center','color':'#888','fontSize':'14px','marginBottom':'20px','fontStyle':'italic'}),
         html.Div(style={'display':'flex','flexWrap':'wrap','justifyContent':'center','alignItems':'center','marginBottom':'20px','gap':'20px','backgroundColor':'#1a1a1a','padding':'15px','borderRadius':'8px','border':'1px solid #333','boxSizing':'border-box'}, children=[
             html.Div([html.Label("Timeframe: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='timeframe-dropdown', options=[{'label':'1 Minute','value':'1min'},{'label':'5 Minutes','value':'5min'},{'label':'15 Minutes','value':'15min'},{'label':'30 Minutes','value':'30min'}], value='5min', clearable=False, style={'width':'120px','display':'inline-block','color':'black','textAlign':'left'})]),
-            html.Div([html.Label("History Range: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='range-dropdown', options=[{'label':'Last 1 Hour','value':'1h'},{'label':'Last 6 Hours','value':'6h'},{'label':'Last 24 Hours','value':'24h'},{'label':'Last 1 Week','value':'7d'},{'label':'All Time','value':'all'}], value='24h', clearable=False, style={'width':'140px','display':'inline-block','color':'black','textAlign':'left'})]),
+            html.Div([html.Label("History Range: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='range-dropdown', options=[{'label':'Last 1 Hour','value':'1h'},{'label':'Last 2 Hours','value':'2h'},{'label':'Last 4 Hours','value':'4h'},{'label':'Last 6 Hours','value':'6h'},{'label':'Last 24 Hours','value':'24h'},{'label':'Last 1 Week','value':'7d'},{'label':'All Time','value':'all'}], value='24h', clearable=False, style={'width':'140px','display':'inline-block','color':'black','textAlign':'left'})]),
             html.Div([html.Label("EMA Window: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Input(id='ema-window', type='number', value=20, min=2, max=200, style={'width':'60px','borderRadius':'4px','border':'none','padding':'8px','backgroundColor':'#fff','color':'#000'})]),
             html.Div([html.Label("CVD Filter: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Checklist(id='cvd-toggle', options=[{'label':' ON (Adaptive Noise + Divergence)','value':'on'}], value=[], style={'display':'inline-block','color':'white'})], style={'display':'none'}),
             html.Div([html.Label("Alert Sound: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='sound-dropdown', options=[
@@ -869,17 +939,27 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
                 if 'epoch' in ldf.columns:
                     ldf = ldf.sort_values('epoch')
                 
+                # TIMEFRAME FIX: previously fell back to ldf.tail(20) (ANY timeframe) when the
+                # selected timeframe had no recent signals - this silently mixed in e.g. 1min
+                # entries while viewing 5min, which is almost certainly why it looked like sound
+                # was firing on 1min signals. The actual sound-trigger logic was already correctly
+                # scoped to the selected timeframe (computed fresh from it, not from this log) -
+                # but showing a different timeframe's entries here without saying so was
+                # misleading. Now it just says so instead of silently substituting.
                 filt = ldf[ldf['timeframe']==timeframe].tail(20) if 'timeframe' in ldf.columns else ldf.tail(20)
-                if filt.empty: filt=ldf.tail(20)
-                for _, r in filt.iloc[::-1].iterrows():
-                    ts=r.get('timestamp',''); sig=r.get('signal',''); pr=r.get('price',0)
-                    pr = 0 if (isinstance(pr, float) and pd.isna(pr)) else pr
-                    sig = '' if (isinstance(sig, float) and pd.isna(sig)) else str(sig)
-                    rs=r.get('reason','')
-                    rs = '' if (isinstance(rs, float) and pd.isna(rs)) else str(rs)
-                    col = 'lime' if 'BREAKOUT' in sig else 'red' if 'BREAKDOWN' in sig else 'orange' if 'SQUEEZE' in sig else 'rgb(170, 0, 255)' if 'LIQ' in sig else 'rgb(255, 50, 50)' if 'TOP' in sig else 'rgb(0, 200, 255)'
-                    emoji = '🟩' if 'BREAKOUT' in sig else '🟥' if 'BREAKDOWN' in sig else '🟧' if 'SQUEEZE' in sig else '🟪' if 'LIQ' in sig else '🔴' if 'TOP' in sig else '🔵'
-                    logs.append(html.Div([html.Span(f"[{ts}] {emoji} {sig} @ ${pr:,.2f}", style={'fontWeight':'bold'}), html.Br(), html.Span(f"↳ {rs}", style={'fontSize':'11px','color':'#888','marginLeft':'10px'})], style={'color':col,'marginBottom':'8px'}))
+                if filt.empty:
+                    logs=[html.Div(f"No {timeframe} signals logged yet", style={'color':'#555'})]
+                    filt = None
+                if filt is not None:
+                    for _, r in filt.iloc[::-1].iterrows():
+                        ts=r.get('timestamp',''); sig=r.get('signal',''); pr=r.get('price',0)
+                        pr = 0 if (isinstance(pr, float) and pd.isna(pr)) else pr
+                        sig = '' if (isinstance(sig, float) and pd.isna(sig)) else str(sig)
+                        rs=r.get('reason','')
+                        rs = '' if (isinstance(rs, float) and pd.isna(rs)) else str(rs)
+                        col = 'lime' if 'BREAKOUT' in sig else 'red' if 'BREAKDOWN' in sig else 'orange' if 'SQUEEZE' in sig else 'rgb(170, 0, 255)' if 'LIQ' in sig else 'rgb(255, 50, 50)' if 'TOP' in sig else 'rgb(0, 200, 255)'
+                        emoji = '🟩' if 'BREAKOUT' in sig else '🟥' if 'BREAKDOWN' in sig else '🟧' if 'SQUEEZE' in sig else '🟪' if 'LIQ' in sig else '🔴' if 'TOP' in sig else '🔵'
+                        logs.append(html.Div([html.Span(f"[{ts}] {emoji} {sig} @ ${pr:,.2f}", style={'fontWeight':'bold'}), html.Br(), html.Span(f"↳ {rs}", style={'fontSize':'11px','color':'#888','marginLeft':'10px'})], style={'color':col,'marginBottom':'8px'}))
             else: logs=[html.Div("Waiting for daemon signal", style={'color':'#555'})]
         else: logs=[html.Div("Log not yet created", style={'color':'#555'})]
     except Exception as e: logs=[html.Div(f"Log err {e}", style={'color':'#f55'})]
@@ -920,10 +1000,31 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     chart['whale_delta_std'] = chart['whale_delta'].ewm(span=WHALE_DIVERGENCE_STD_LOOKBACK_BARS,adjust=False).std().fillna(0)
     chart['whale_divergence_thresh'] = (chart['whale_delta_std']*WHALE_DIVERGENCE_STD_MULTIPLIER).clip(lower=1e-6)  # CHART FIX: data-driven display threshold, not a fixed guess - whale_delta's scale is tiny and varies, so this sizes to its own recent volatility (same EWM-std-multiplier style as the signal thresholds elsewhere in the file)
     chart['whale_divergence_marker_y'] = chart['whale_bias'].where(chart['whale_bias'].abs() >= chart['whale_divergence_thresh'])
+    # CHART FIX: Basis Premium panel prep - purely presentational. Marks bars where basis actually
+    # cleared the 90th/10th percentile threshold (the real "overheated/panicked" line, not just
+    # any wobble), so those moments stand out from routine noise.
+    chart['basis_upper_cross'] = chart['basis'] > chart['premium_thresh']
+    chart['basis_lower_cross'] = chart['basis'] < chart['premium_thresh_lower']
+    chart['basis_cross_marker_y'] = chart['basis'].where(chart['basis_upper_cross'] | chart['basis_lower_cross'])
+    # CHART FIX: Spot CVD panel prep - purely presentational. Reuses the EXACT same divergence
+    # check compute_signals_for_view already uses when the CVD filter is on (price at a
+    # DIVERGENCE_LOOKBACK_BARS-bar high/low while CVD fails to confirm) so the chart shows what
+    # the filter actually looks for, instead of leaving it invisible. Also flags each day's
+    # session-reset boundary so the daily drop-to-zero reads as "new day", not "crash".
+    chart['price_roll_max_div'] = chart['price'].rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).max()
+    chart['price_roll_min_div'] = chart['price'].rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).min()
+    chart['cvd_roll_mean_div'] = chart['spot_cvd'].rolling(DIVERGENCE_LOOKBACK_BARS, min_periods=5).mean()
+    chart['cvd_bear_div'] = (chart['price'] >= chart['price_roll_max_div']) & (chart['spot_cvd'] < chart['cvd_roll_mean_div'])  # price new high, CVD not confirming
+    chart['cvd_bull_div'] = (chart['price'] <= chart['price_roll_min_div']) & (chart['spot_cvd'] > chart['cvd_roll_mean_div'])  # price new low, CVD not confirming
+    chart['cvd_bear_div_y'] = chart['spot_cvd'].where(chart['cvd_bear_div'])
+    chart['cvd_bull_div_y'] = chart['spot_cvd'].where(chart['cvd_bull_div'])
+    chart['session_boundary'] = chart['session_date'] != chart['session_date'].shift(1)
     
     if time_range!='all':
         mt=chart['timestamp'].max()
         if time_range=='1h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=1)]
+        elif time_range=='2h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=2)]
+        elif time_range=='4h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=4)]
         elif time_range=='6h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=6)]
         elif time_range=='24h': chart=chart[chart['timestamp']>=mt-pd.Timedelta(hours=24)]
         elif time_range=='7d': chart=chart[chart['timestamp']>=mt-pd.Timedelta(days=7)]
@@ -944,7 +1045,24 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     _whale_vals = pd.concat([chart['whale_bias'].abs(), chart['whale_divergence_thresh']]).dropna()
     whale_bias_range_max = float(_whale_vals.max()) if len(_whale_vals) else 0.0
     whale_bias_range_max = max(whale_bias_range_max * 1.35, 1e-4)
-    fig=make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.26,0.26,0.14,0.14,0.20],subplot_titles=("Price & Open Interest (Forming)","Taker Buy/Sell Pressure (Net)","Whale Positioning Bias","Basis Premium","Spot Cumulative Volume Delta (CVD)"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}]])
+    # CHART FIX: Basis and CVD both trend/skew rather than sitting centered on zero (e.g. basis
+    # can run persistently negative for stretches), so unlike pressure/whale these use a genuine
+    # min/max range with headroom rather than forcing symmetry around zero.
+    _basis_vals = pd.concat([chart['basis'], chart['premium_thresh'], chart['premium_thresh_lower']]).dropna()
+    if len(_basis_vals):
+        _bmin, _bmax = float(_basis_vals.min()), float(_basis_vals.max())
+        _bpad = max((_bmax-_bmin)*0.15, 1.0)
+        basis_range = [_bmin-_bpad, _bmax+_bpad]
+    else:
+        basis_range = [-10, 10]
+    _cvd_vals = pd.concat([chart['spot_cvd'], chart['ema_cvd']]).dropna()
+    if len(_cvd_vals):
+        _cmin, _cmax = float(_cvd_vals.min()), float(_cvd_vals.max())
+        _cpad = max((_cmax-_cmin)*0.15, 1.0)
+        cvd_range = [_cmin-_cpad, _cmax+_cpad]
+    else:
+        cvd_range = [-10, 10]
+    fig=make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.26,0.26,0.28,0.28,0.40],subplot_titles=("Price & Open Interest (Forming)","Taker Buy/Sell Pressure (Net)","Whale Positioning Bias","Basis Premium","Spot Cumulative Volume Delta (CVD)"),specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}]])
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['price'],name="Price",line=dict(color='white',width=2)),row=1,col=1,secondary_y=False)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['oi'],name="OI",line=dict(color='cyan',dash='dot')),row=1,col=1,secondary_y=True)
     # CHART FIX: Merged Buy/Sell Pressure panel (was two separate panels, row 2 + row 3). Green
@@ -970,15 +1088,40 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_divergence_marker_y'],name="Whale Divergence",mode='markers',marker=dict(color='orange',size=8,symbol='diamond',line=dict(color='black',width=1))),row=3,col=1,secondary_y=False)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['whale_div'],name="Whale Raw Ratio",line=dict(color='rgba(255,255,0,0.5)',width=1,dash='dot')),row=3,col=1,secondary_y=True)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=[1.0]*len(chart),name="Raw Ratio = 1.0",line=dict(color='rgba(255,255,255,0.3)',width=1,dash='dot')),row=3,col=1,secondary_y=True)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart.get('premium_thresh', np.nan),name="90%",line=dict(color='rgba(255,165,0,0.3)',dash='dash')),row=4,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis'],name="Basis",line=dict(color='orange'),fill='tonexty'),row=4,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart.get('premium_thresh_lower', np.nan),name="10%",line=dict(color='rgba(0,200,255,0.3)',dash='dash')),row=4,col=1)
-    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session UTC",line=dict(color='cyan'),fill='tozeroy'),row=5,col=1)
+    # CHART FIX: Redesigned Basis Premium panel. Fills to a ZERO baseline now (was filling to the
+    # 90% threshold line, which emphasized distance-to-danger-line instead of bullish/bearish
+    # leverage). Green above zero = positive premium (greed/leveraged longs paying up), red below
+    # = negative premium (fear). Threshold lines made bold; diamonds mark bars that actually
+    # cleared one of them.
+    chart['basis_pos'] = chart['basis'].clip(lower=0)
+    chart['basis_neg'] = chart['basis'].clip(upper=0)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis_pos'],name="Premium (Bullish Leverage)",line=dict(color='rgba(0,255,150,0.9)',width=1.5),fill='tozeroy',fillcolor='rgba(0,255,150,0.20)'),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis_neg'],name="Discount (Bearish Leverage)",line=dict(color='rgba(255,80,80,0.9)',width=1.5),fill='tozeroy',fillcolor='rgba(255,80,80,0.20)'),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart.get('premium_thresh', np.nan),name="90% Danger Zone",line=dict(color='rgba(0,255,150,1)',width=2,dash='dash')),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart.get('premium_thresh_lower', np.nan),name="10% Danger Zone",line=dict(color='rgba(255,80,80,1)',width=2,dash='dash')),row=4,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['basis_cross_marker_y'],name="Threshold Cleared",mode='markers',marker=dict(color='yellow',size=7,symbol='diamond',line=dict(color='black',width=1))),row=4,col=1)
+    # CHART FIX: Redesigned Spot CVD panel. Same line/EMA as before, plus: markers for the exact
+    # divergence condition the CVD filter itself checks (price at a fresh high/low while CVD
+    # fails to confirm), and session-boundary lines so the daily reset-to-zero clearly reads as a
+    # new day starting rather than a crash.
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['spot_cvd'],name="CVD Session",line=dict(color='cyan'),fill='tozeroy'),row=5,col=1)
     fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['ema_cvd'],name="EMA",line=dict(color='white',dash='dot')),row=5,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['cvd_bear_div_y'],name="Bearish Divergence",mode='markers',marker=dict(color='red',size=9,symbol='triangle-down',line=dict(color='black',width=1))),row=5,col=1)
+    fig.add_trace(go.Scatter(x=chart['timestamp'],y=chart['cvd_bull_div_y'],name="Bullish Divergence",mode='markers',marker=dict(color='lime',size=9,symbol='triangle-up',line=dict(color='black',width=1))),row=5,col=1)
     fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',margin=dict(l=40,r=40,t=60,b=20),hovermode="x unified",legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0),height=1150,uirevision='locked')
     fig.update_xaxes(showgrid=True,gridcolor='#222')
     fig.update_yaxes(range=[-pressure_range_max,pressure_range_max],zeroline=True,zerolinecolor='rgba(255,255,255,0.5)',zerolinewidth=1.5,row=2,col=1)  # CHART FIX: now uses the dynamic pressure_range_max computed above instead of a fixed ±PRESSURE_CLIP_MAX, so the real movement fills the panel instead of looking sandwiched
     fig.update_yaxes(range=[-whale_bias_range_max,whale_bias_range_max],zeroline=True,zerolinecolor='rgba(255,255,255,0.5)',zerolinewidth=1.5,row=3,col=1,secondary_y=False)  # CHART FIX: dynamic range for the new whale bias axis
+    fig.update_yaxes(range=basis_range,zeroline=True,zerolinecolor='rgba(255,255,255,0.5)',zerolinewidth=1.5,row=4,col=1)  # CHART FIX: dynamic min/max range for basis (not forced symmetric - basis can skew persistently positive or negative)
+    fig.update_yaxes(range=cvd_range,zeroline=True,zerolinecolor='rgba(255,255,255,0.5)',zerolinewidth=1.5,row=5,col=1)  # CHART FIX: dynamic min/max range for CVD, same reasoning
+    # CHART FIX: mark each session/day boundary on the CVD panel so the daily reset-to-zero reads
+    # as "new day starting" instead of looking like a crash. Skips the very first row (that's just
+    # the start of the visible window, not a real boundary crossing).
+    _session_marks = chart[chart['session_boundary']]['timestamp']
+    if len(chart) and len(_session_marks):
+        _session_marks = _session_marks[_session_marks != chart['timestamp'].iloc[0]]
+    for _sts in _session_marks:
+        fig.add_vline(x=_sts, line=dict(color='rgba(255,255,255,0.25)',dash='dot',width=1), row=5, col=1)
     # CHART FIX: Cross-panel divergence highlight - your "retail frenzy vs whale opposite
     # direction" thesis, made visible before the (still unchanged) exhaustion signal logic even
     # fires. Marks bars where retail pressure crossed its real danger-zone threshold AND whale
