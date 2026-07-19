@@ -278,6 +278,31 @@ class LogicEngine:
         else:
             self.log_action("ℹ️ All Positions Closed", f"{reason}")
 
+    def _cancel_opposite_pending(self, side, reason=""):
+        """Called after a TARGET-triggered close (PnL/Index/Premium). Cancels any pending
+        entry order and any active conditional exit orders on the OPPOSITE side -- i.e. every
+        row that would show up in the Open Orders section for that side. Additive/defensive
+        only: harmless no-op for flags that are already off, and doesn't touch anything on the
+        side that just hit its target."""
+        opp_side = 'Put' if side == 'Call' else 'Call'
+        opp_prefix = 'put' if side == 'Call' else 'call'
+        cancelled = []
+
+        if params.get(f'{opp_prefix}_armed'):
+            params[f'{opp_prefix}_armed'] = False
+            cancelled.append('pending entry')
+
+        for label, key in [
+            ('prem stop', f'{opp_prefix}_prem_stop_active'), ('prem target', f'{opp_prefix}_prem_tgt_active'),
+            ('index stop', f'{opp_prefix}_index_stop_active'), ('index target', f'{opp_prefix}_index_tgt_active'),
+        ]:
+            if params.get(key):
+                params[key] = False
+                cancelled.append(label)
+
+        if cancelled:
+            self.log_action(f"🚫 Target hit on {side}{(' (' + reason + ')') if reason else ''}: cancelled {opp_side} orders", ', '.join(cancelled))
+
     def update_pnl(self):
         unrealized = 0.0
         idx_ltp = shared_state[params['trading_index']]['ltp']
@@ -478,6 +503,7 @@ class LogicEngine:
 
             if params[f'{side.lower()}_target_active'] and tgt > 0 and trade['pnl'] >= tgt:
                 self.close_position(side, f"Auto Profit {tgt}")
+                self._cancel_opposite_pending(side, f"PnL Target {tgt}")
             if params[f'{side.lower()}_stop_active'] and stp > 0 and trade['pnl'] <= -stp:
                 self.close_position(side, f"Auto Loss {stp}")
 
@@ -497,10 +523,14 @@ class LogicEngine:
 
             if side == 'Call':
                 if check_stop and s_active and s_val > 0 and idx_ltp >= s_val: self.close_position(side, f"Idx Stop {s_val}")
-                if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val: self.close_position(side, f"Idx Target {t_val}")
+                if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
+                    self.close_position(side, f"Idx Target {t_val}")
+                    self._cancel_opposite_pending(side, f"Idx Target {t_val}")
             else:
                 if check_stop and s_active and s_val > 0 and idx_ltp <= s_val: self.close_position(side, f"Idx Stop {s_val}")
-                if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val: self.close_position(side, f"Idx Target {t_val}")
+                if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
+                    self.close_position(side, f"Idx Target {t_val}")
+                    self._cancel_opposite_pending(side, f"Idx Target {t_val}")
 
             # Re-check if position still open after index exits
             trade = shared_state['active_trades'][side]
@@ -530,6 +560,7 @@ class LogicEngine:
             # Target: premium falls below target value (profit on short)
             if check_pt and params[f'{side.lower()}_prem_tgt_active'] and pt_val > 0 and main_ltp <= pt_val:
                 self.close_position(side, f"Prem Target {pt_val}")
+                self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
 
     def _check_global_limits(self):
         total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']

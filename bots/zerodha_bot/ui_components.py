@@ -1,6 +1,24 @@
 from nicegui import ui
-from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state
+from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state, ALERT_SOUND_URLS, save_alert_profile
 import pandas as pd
+
+# --- SHARED HELPERS ---
+
+def _num_stepper(target, key, step=1, label=''):
+    """A small -/+ stepper wrapping a text input bound to target[key]. 'target' is any
+    dict-like object (params, or a local per-row 'pending' dict for staged edits), so this
+    works both for live-bound fields and for the Order Book's confirm-before-apply panel."""
+    def _current():
+        try: return float(target[key])
+        except (ValueError, TypeError): return 0.0
+    def _apply(v):
+        target[key] = int(v) if float(v).is_integer() else round(v, 4)
+    def dec(): _apply(_current() - step)
+    def inc(): _apply(_current() + step)
+    with ui.row().classes('grow items-center gap-1 no-wrap'):
+        ui.button(icon='remove', on_click=dec).props('flat dense round size=sm').classes('text-gray-600 bg-gray-100')
+        ui.input(label).bind_value(target, key).props('outlined dense bg-color=white').classes('grow text-center')
+        ui.button(icon='add', on_click=inc).props('flat dense round size=sm').classes('text-gray-600 bg-gray-100')
 
 # --- CONTROL CARDS ---
 
@@ -30,10 +48,11 @@ def _reset_unified_card_defaults(prefix):
 
 def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
-    Stop-Market), trigger price, strike offset (0=ATM, 1=ITM, -1=OTM), optional stop/target,
-    a fire-on timeframe, and its own qty. Market fires immediately via on_fire_market.
-    Limit/Stop-Market arm the trade; index conditions are then checked and fired by
-    LogicEngine._check_unified_open in logic_engine.py."""
+    Stop-Market), trigger price, strike offset (0=ATM, 1=ITM, -1=OTM, with -/+ steppers),
+    optional stop/target, a fire-on timeframe, and its own qty (also with -/+ steppers).
+    Market fires immediately via on_fire_market. Limit/Stop-Market arm the trade; index
+    conditions are then checked and fired by LogicEngine._check_unified_open in
+    logic_engine.py."""
     color_class = 'bg-red-100 border-red-300' if side == 'Call' else 'bg-green-100 border-green-300'
     btn_color = 'red' if side == 'Call' else 'green'
     title = 'Open Short' if side == 'Call' else 'Open Long'
@@ -54,10 +73,10 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             # NiceGUI/Quasar versions). Always-editable avoids that class of binding bug; the
             # value is simply ignored by the firing logic when order type is Market.
             ui.input('Trigger Price').bind_value(params, trig_key).props('outlined dense bg-color=white').classes('grow')
-            ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, strike_key).props('outlined dense bg-color=white').classes('grow')
+            _num_stepper(params, strike_key, step=1, label='Strike (0=ATM,1=ITM,-1=OTM)')
 
         with ui.row().classes('w-full gap-2'):
-            ui.input('Qty (Lots)').bind_value(params, qty_key).props('outlined dense bg-color=white').classes('grow')
+            _num_stepper(params, qty_key, step=1, label='Qty (Lots)')
             ui.select(UI_OPTS['fire_on_opts'], value=params[fire_key]).bind_value(params, fire_key).props('outlined dense bg-color=white').classes('grow')
 
         with ui.row().classes('w-full gap-2'):
@@ -222,8 +241,9 @@ def premium_exit_card(side):
                     ui.button('Set', color='black', on_click=act_t).props('outline').classes('grow h-6 text-[10px] rounded')
                     ui.button('Reset', on_click=rst_t).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
 
-def _alert_side_card(side_label, threshold_key, threshold_input_key, active_key, period_key, sound_key, duration_key, notify_fn):
-    """Shared builder for a single-sided (Upper or Lower) price alert card."""
+def _alert_side_card(side_label, threshold_key, threshold_input_key, active_key, period_key, notify_fn):
+    """Shared builder for a single-sided (Upper or Lower) price alert card. Sound + duration
+    now live in the separate shared Alert Sound Profile panel (render_alert_sound_panel)."""
     with ui.card().classes('w-full p-3 gap-2 bg-yellow-50 shadow-md border-l-4 border-yellow-400 rounded-xl'):
         ui.label(f'{side_label} Price Alert').classes('font-bold text-gray-800')
 
@@ -232,10 +252,6 @@ def _alert_side_card(side_label, threshold_key, threshold_input_key, active_key,
             ui.radio(UI_OPTS['alert_periods'], value=params[period_key]).bind_value(params, period_key).props('inline dense')
 
         ui.input(side_label).bind_value(params, threshold_input_key).props('outlined dense bg-color=white').classes('w-full')
-
-        with ui.row().classes('w-full gap-2'):
-            ui.select(UI_OPTS['alert_sounds'], value=params[sound_key], label='Sound').bind_value(params, sound_key).props('outlined dense bg-color=white').classes('grow')
-            ui.input('Duration (s)').bind_value(params, duration_key).props('outlined dense bg-color=white').classes('w-28')
 
         status = ui.label().classes('w-full text-center text-xs font-bold text-white bg-orange-500 rounded p-1 shadow-sm')
         status.bind_visibility_from(params, active_key)
@@ -257,12 +273,49 @@ def _alert_side_card(side_label, threshold_key, threshold_input_key, active_key,
             ui.button('Reset', color='grey', on_click=reset_alert).props('flat').classes('grow h-8 rounded-lg')
 
 def alerts_card_upper():
-    _alert_side_card('Upper', 'alert_upper', 'alert_upper_input', 'alert_upper_active',
-                      'alert_upper_period', 'alert_upper_sound', 'alert_upper_duration', ui.notify)
+    _alert_side_card('Upper', 'alert_upper', 'alert_upper_input', 'alert_upper_active', 'alert_upper_period', ui.notify)
 
 def alerts_card_lower():
-    _alert_side_card('Lower', 'alert_lower', 'alert_lower_input', 'alert_lower_active',
-                      'alert_lower_period', 'alert_lower_sound', 'alert_lower_duration', ui.notify)
+    _alert_side_card('Lower', 'alert_lower', 'alert_lower_input', 'alert_lower_active', 'alert_lower_period', ui.notify)
+
+def _preview_sound(sound_name, duration):
+    url = ALERT_SOUND_URLS.get(sound_name, ALERT_SOUND_URLS['Wood Plank'])
+    try: dur_ms = int(float(duration) * 1000)
+    except (ValueError, TypeError): dur_ms = 3000
+    if dur_ms <= 0: dur_ms = 3000
+    dur_ms = min(dur_ms, 8000)  # cap preview length so trying several sounds isn't tedious
+    ui.run_javascript(
+        f'const a = new Audio("{url}"); a.loop = true; a.play().catch(()=>{{}});'
+        f'setTimeout(() => {{ a.pause(); a.currentTime = 0; }}, {dur_ms});'
+    )
+
+def render_alert_sound_panel():
+    """Shared sound + duration profile used by BOTH Upper and Lower price alerts, separated
+    from the alert cards themselves. Preview plays the selected sound without committing it;
+    Set applies it to both alerts AND persists it to disk (alert_sound_profile.json) via
+    config.save_alert_profile, so it survives page reloads and worker/script restarts."""
+    with ui.card().classes('w-full p-3 gap-2 bg-yellow-50 shadow-md border-l-4 border-yellow-400 rounded-xl'):
+        ui.label('Alert Sound Profile').classes('font-bold text-gray-800')
+        ui.label('Applies to both Upper and Lower price alerts.').classes('text-[10px] text-gray-500 -mt-1 mb-1')
+
+        draft = {'sound': params.get('alert_upper_sound', 'Wood Plank'), 'duration': params.get('alert_upper_duration', 5)}
+
+        with ui.row().classes('w-full gap-2'):
+            ui.select(UI_OPTS['alert_sounds'], value=draft['sound'], label='Sound').bind_value(draft, 'sound').props('outlined dense bg-color=white').classes('grow')
+            ui.input('Duration (s)').bind_value(draft, 'duration').props('outlined dense bg-color=white').classes('w-28')
+
+        def preview():
+            _preview_sound(draft['sound'], draft['duration'])
+
+        def set_profile():
+            params['alert_upper_sound'] = draft['sound']; params['alert_upper_duration'] = draft['duration']
+            params['alert_lower_sound'] = draft['sound']; params['alert_lower_duration'] = draft['duration']
+            save_alert_profile(draft['sound'], draft['duration'])
+            ui.notify(f"Alert sound set: {draft['sound']} ({draft['duration']}s)", type='positive')
+
+        with ui.row().classes('w-full gap-2'):
+            ui.button('▶ Preview', on_click=preview).classes('grow h-8 rounded-lg')
+            ui.button('Set', color='orange', on_click=set_profile).classes('grow h-8 rounded-lg')
 
 # --- OPEN POSITIONS (kept alongside the existing banner CALL/PUT POSITION cards) ---
 
@@ -341,10 +394,25 @@ def _toggle_expansion(exp):
 def _orderbook_table_row(side, prefix):
     """One expandable row for a pending unified Open Short/Long entry trigger (Limit/Stop-
     Market only; Market fires immediately and never appears here). The header line stays
-    live-bound to the underlying params (no manual refresh needed). MODIFY toggles the
-    editable panel (trigger price, strike, qty, fire-on, stop, target); REMOVE fully resets
-    that side's card back to defaults."""
+    live-bound to the underlying params (no manual refresh needed). MODIFY opens a staged
+    edit panel (trigger price, strike/qty with -/+ steppers, fire-on, stop, target) bound to
+    a local draft, not the live params directly -- edits only take effect after CONFIRM.
+    REMOVE fully resets that side's card back to defaults immediately (no confirm needed,
+    matching the existing Cancel behavior elsewhere)."""
     opt_type = 'CE' if side == 'Call' else 'PE'
+    draft = {}
+
+    def sync_draft():
+        draft['order_type'] = params[f'{prefix}_order_type']
+        draft['trigger_price'] = params[f'{prefix}_trigger_price']
+        draft['strike_offset'] = params[f'{prefix}_strike_offset']
+        draft['qty'] = params[f'{prefix}_qty']
+        draft['fire_on'] = params[f'{prefix}_fire_on']
+        draft['new_stop'] = params[f'{prefix}_new_stop']
+        draft['new_target'] = params[f'{prefix}_new_target']
+
+    sync_draft()
+
     with ui.column().classes('w-full') as wrapper:
         wrapper.bind_visibility_from(params, f'{prefix}_armed')
         with ui.expansion('', icon='tune').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
@@ -366,41 +434,85 @@ def _orderbook_table_row(side, prefix):
                         _reset_unified_card_defaults(prefix)
                         ui.notify(f"{side} Order Removed", type='info')
 
+                    def open_modify():
+                        sync_draft()  # always start the edit from the current committed values
+                        exp.value = True
+
                     # click.stop so these don't also trigger the header's own expand/collapse
-                    ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', lambda: _toggle_expansion(exp))
+                    ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', open_modify)
                     ui.button('REMOVE').props('flat dense size=sm no-caps').classes('text-[10px] text-red-600').on('click.stop', cancel_order)
 
             with ui.column().classes('w-full p-3 gap-2 bg-gray-50'):
                 with ui.row().classes('w-full gap-2'):
-                    ui.radio(UI_OPTS['order_types'], value=params[f'{prefix}_order_type']).bind_value(params, f'{prefix}_order_type').props('inline dense')
+                    ui.radio(UI_OPTS['order_types'], value=draft['order_type']).bind_value(draft, 'order_type').props('inline dense')
                 with ui.row().classes('w-full gap-2'):
-                    ui.input('Trigger Price').bind_value(params, f'{prefix}_trigger_price').props('outlined dense bg-color=white').classes('grow')
-                    ui.input('Strike (0=ATM,1=ITM,-1=OTM)').bind_value(params, f'{prefix}_strike_offset').props('outlined dense bg-color=white').classes('grow')
+                    ui.input('Trigger Price').bind_value(draft, 'trigger_price').props('outlined dense bg-color=white').classes('grow')
+                    _num_stepper(draft, 'strike_offset', step=1, label='Strike (0=ATM,1=ITM,-1=OTM)')
                 with ui.row().classes('w-full gap-2'):
-                    ui.input('Qty (Lots)').bind_value(params, f'{prefix}_qty').props('outlined dense bg-color=white').classes('grow')
-                    ui.select(UI_OPTS['fire_on_opts'], value=params[f'{prefix}_fire_on']).bind_value(params, f'{prefix}_fire_on').props('outlined dense bg-color=white').classes('grow')
+                    _num_stepper(draft, 'qty', step=1, label='Qty (Lots)')
+                    ui.select(UI_OPTS['fire_on_opts'], value=draft['fire_on']).bind_value(draft, 'fire_on').props('outlined dense bg-color=white').classes('grow')
                 with ui.row().classes('w-full gap-2'):
-                    ui.input('Stop (optional)').bind_value(params, f'{prefix}_new_stop').props('outlined dense bg-color=white').classes('grow')
-                    ui.input('Target (optional)').bind_value(params, f'{prefix}_new_target').props('outlined dense bg-color=white').classes('grow')
+                    ui.input('Stop (optional)').bind_value(draft, 'new_stop').props('outlined dense bg-color=white').classes('grow')
+                    ui.input('Target (optional)').bind_value(draft, 'new_target').props('outlined dense bg-color=white').classes('grow')
 
-def _exit_order_row(side, order_label, value_key, active_key, time_key=None):
-    """One expandable row for an active conditional EXIT order tied to an open position
-    (from the Premium-based or Index-based exit cards). Visible only while active. MODIFY
-    edits the value/period inline; REMOVE deactivates and clears the value, mirroring the
-    Reset behavior already in premium_exit_card/index_exit_component."""
+                def confirm_changes():
+                    params[f'{prefix}_order_type'] = draft['order_type']
+                    params[f'{prefix}_trigger_price'] = draft['trigger_price']
+                    params[f'{prefix}_strike_offset'] = draft['strike_offset']
+                    params[f'{prefix}_qty'] = draft['qty']
+                    params[f'{prefix}_fire_on'] = draft['fire_on']
+                    params[f'{prefix}_new_stop'] = draft['new_stop']
+                    params[f'{prefix}_new_target'] = draft['new_target']
+                    ui.notify(f"{side} Order Updated", type='positive')
+                    exp.value = False
+
+                def discard_changes():
+                    exp.value = False  # just close; draft is resynced next time MODIFY is clicked
+
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('CONFIRM', color='green', on_click=confirm_changes).classes('grow h-8 text-xs rounded-lg font-bold')
+                    ui.button('Cancel', on_click=discard_changes).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
+
+def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_target=False):
+    """One expandable row for an active conditional EXIT order tied to an open position --
+    from the Open Positions Idx Stop/Target quick controls, or the Premium/Index-based exit
+    cards. Visible only while active. Columns match the SAME layout as the entry-order rows
+    above (Exch/Symbol/Side/Type/Trigger Price/Fire On/Stop/Target/Qty/Status). Side is
+    always BUY: these orders close/cover an existing SHORT position. Symbol and Qty are read
+    from the live open position itself (not guessed), so they always match the real trade.
+    MODIFY edits the value/period inline; REMOVE deactivates and clears the value, mirroring
+    the Reset behavior already in premium_exit_card/index_exit_component."""
+    opt_type = 'CE' if side == 'Call' else 'PE'
+
+    def _symbol(_v=None):
+        trade = shared_state['active_trades'].get(side)
+        if trade: return f"{params['trading_index']} {int(trade['main']['strike'])} {opt_type}"
+        return f"{params['trading_index']} {opt_type}"
+
+    def _qty(_v=None):
+        trade = shared_state['active_trades'].get(side)
+        if trade: return str(trade['qty'])
+        prefix = 'call' if side == 'Call' else 'put'
+        return str(params.get(f'{prefix}_qty', '-'))
+
     with ui.column().classes('w-full') as wrapper:
         wrapper.bind_visibility_from(params, active_key)
         with ui.expansion('', icon='tune').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
             with exp.add_slot('header'):
                 with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
-                    ui.label(side.upper()).classes('w-14 font-bold text-gray-700')
-                    ui.label(order_label).classes('w-28 text-purple-700 font-semibold')
-                    ui.label().bind_text_from(params, value_key, backward=lambda v: str(v) if str(v).strip() != '' else '-').classes('w-24 text-right font-mono text-gray-800')
+                    ui.label().bind_text_from(params, 'trading_index', backward=lambda v: INDICES.get(v, {}).get('segment', v)).classes('w-16 text-gray-400 font-mono')
+                    ui.label().bind_text_from(params, active_key, backward=_symbol).classes('w-28 font-bold text-gray-800 font-mono')
+                    ui.label('BUY').classes('w-14 text-green-600 font-bold')
+                    ui.label(order_label).classes('w-24 text-purple-700 font-semibold')
+                    ui.label('-').classes('w-24 text-right font-mono text-gray-400')  # Trigger Price: n/a for exit orders
                     if time_key:
                         ui.label().bind_text_from(params, time_key).classes('w-16 text-gray-500')
                     else:
-                        ui.label('-').classes('w-16 text-gray-400')
-                    ui.label('EXIT ORDER').classes('bg-orange-500 text-white px-2 py-0.5 rounded text-[10px] font-bold')
+                        ui.label('Live').classes('w-16 text-gray-400')
+                    ui.label().bind_text_from(params, value_key, backward=lambda v: (str(v) if (not is_target and str(v).strip() not in ('', '0')) else '-')).classes('w-20 text-orange-600 text-right font-mono')
+                    ui.label().bind_text_from(params, value_key, backward=lambda v: (str(v) if (is_target and str(v).strip() not in ('', '0')) else '-')).classes('w-20 text-blue-600 text-right font-mono')
+                    ui.label().bind_text_from(params, active_key, backward=_qty).classes('w-14 text-right font-mono text-gray-800')
+                    ui.label('WORKING').classes('bg-blue-600 text-white px-2 py-0.5 rounded text-[10px] font-bold')
                     ui.space()
 
                     def remove_order():
@@ -420,7 +532,9 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None):
 def render_orderbook():
     """Full-width Open Orders table (white background, matching the rest of the app): pending
     unified entry triggers (Limit/Stop-Market; Market fires immediately so never appears here)
-    plus every active conditional exit order (Premium-based and Index-based stop/target)."""
+    plus every active conditional exit order (Premium-based and Index-based stop/target,
+    including the Open Positions quick Idx Stop/Target controls, since they share the same
+    underlying params)."""
     with ui.card().classes('w-full bg-white p-3 gap-2 rounded-xl shadow-sm mb-4 border border-gray-200'):
         ui.label('OPEN ORDERS').classes('font-bold text-xs uppercase tracking-widest text-gray-500 mb-1')
         with ui.row().classes('w-full items-center gap-3 text-[10px] text-gray-400 uppercase px-2'):
@@ -431,15 +545,17 @@ def render_orderbook():
         _orderbook_table_row('Call', 'call')
         _orderbook_table_row('Put', 'put')
 
-        # Exit orders from "Exit based on Option Premium" and "Exit based on Index" cards
-        _exit_order_row('Call', 'Prem Stop', 'call_prem_stop_val', 'call_prem_stop_active', 'call_prem_stop_time')
-        _exit_order_row('Call', 'Prem Target', 'call_prem_target_val', 'call_prem_tgt_active', 'call_prem_target_time')
-        _exit_order_row('Call', 'Idx Stop', 'call_index_stop_val', 'call_index_stop_active', 'call_index_stop_time')
-        _exit_order_row('Call', 'Idx Target', 'call_index_target_val', 'call_index_tgt_active', 'call_index_target_time')
-        _exit_order_row('Put', 'Prem Stop', 'put_prem_stop_val', 'put_prem_stop_active', 'put_prem_stop_time')
-        _exit_order_row('Put', 'Prem Target', 'put_prem_target_val', 'put_prem_tgt_active', 'put_prem_target_time')
-        _exit_order_row('Put', 'Idx Stop', 'put_index_stop_val', 'put_index_stop_active', 'put_index_stop_time')
-        _exit_order_row('Put', 'Idx Target', 'put_index_target_val', 'put_index_tgt_active', 'put_index_target_time')
+        # Exit orders: Premium-based, Index-based (this also covers the Open Positions'
+        # quick Idx Stop/Target controls, since those write to the same call_index_*/
+        # put_index_* params).
+        _exit_order_row('Call', 'Prem Stop', 'call_prem_stop_val', 'call_prem_stop_active', 'call_prem_stop_time', is_target=False)
+        _exit_order_row('Call', 'Prem Target', 'call_prem_target_val', 'call_prem_tgt_active', 'call_prem_target_time', is_target=True)
+        _exit_order_row('Call', 'Idx Stop', 'call_index_stop_val', 'call_index_stop_active', 'call_index_stop_time', is_target=False)
+        _exit_order_row('Call', 'Idx Target', 'call_index_target_val', 'call_index_tgt_active', 'call_index_target_time', is_target=True)
+        _exit_order_row('Put', 'Prem Stop', 'put_prem_stop_val', 'put_prem_stop_active', 'put_prem_stop_time', is_target=False)
+        _exit_order_row('Put', 'Prem Target', 'put_prem_target_val', 'put_prem_tgt_active', 'put_prem_target_time', is_target=True)
+        _exit_order_row('Put', 'Idx Stop', 'put_index_stop_val', 'put_index_stop_active', 'put_index_stop_time', is_target=False)
+        _exit_order_row('Put', 'Idx Target', 'put_index_target_val', 'put_index_tgt_active', 'put_index_target_time', is_target=True)
 
         empty_lbl = ui.label('No pending orders.').classes('w-full text-center text-xs text-gray-400 italic')
 

@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import time as dtime
 
 # --- PATHS ---
@@ -9,6 +10,7 @@ NIFTY_OPT_FILE = os.path.join(PROJECT_ROOT, 'nifty_options.csv')
 SENSEX_OPT_FILE = os.path.join(PROJECT_ROOT, 'sensex_options.csv')
 TRADEBOOK_FILE = os.path.join(PROJECT_ROOT, 'options_tradebook.csv')
 DAILY_PNL_FILE = os.path.join(PROJECT_ROOT, 'final_daily_pnl.csv')
+ALERT_PROFILE_FILE = os.path.join(PROJECT_ROOT, 'alert_sound_profile.json')
 
 # --- TRADING CONSTANTS ---
 INDICES = {
@@ -22,13 +24,41 @@ AUTO_SQUAREOFF_TIME = dtime(15, 19)
 
 # --- ALERT SOUND LIBRARY ---
 # Reuses the same known-good sound URLs already used elsewhere in the app (open/close/error),
-# just exposed as user-selectable named options for the Upper/Lower price alert cards.
+# plus a few louder alarm-style additions, exposed as user-selectable named options for the
+# shared Alert Sound Profile panel.
 ALERT_SOUND_URLS = {
     'Wood Plank': 'https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg',
     'Pop': 'https://actions.google.com/sounds/v1/cartoon/pop.ogg',
     'Boing': 'https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg',
     'Crash': 'https://actions.google.com/sounds/v1/cartoon/clank_car_crash.ogg',
+    'Alarm Clock (Loud)': 'https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg',
+    'Digital Watch Alarm (Loud)': 'https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg',
+    'Beep Alert (Loud)': 'https://actions.google.com/sounds/v1/alarms/beep_short.ogg',
 }
+
+# --- ALERT SOUND PROFILE PERSISTENCE ---
+# Saved to disk (not just in-memory params) so the chosen sound+duration survives page
+# reloads, worker restarts, and full script restarts.
+def load_alert_profile():
+    try:
+        with open(ALERT_PROFILE_FILE, 'r') as f:
+            data = json.load(f)
+        sound = data.get('sound', 'Wood Plank')
+        duration = data.get('duration', 5)
+        if sound not in ALERT_SOUND_URLS:
+            sound = 'Wood Plank'
+        return sound, duration
+    except Exception:
+        return 'Wood Plank', 5
+
+def save_alert_profile(sound_name, duration):
+    try:
+        with open(ALERT_PROFILE_FILE, 'w') as f:
+            json.dump({'sound': sound_name, 'duration': duration}, f)
+    except Exception:
+        pass
+
+_saved_alert_sound, _saved_alert_duration = load_alert_profile()
 
 # --- SHARED STATE ---
 shared_state = {
@@ -103,7 +133,7 @@ UI_OPTS = {
     # Unified Open Short/Long card options (order type + fire-on timeframe)
     'order_types': ['Market', 'Limit', 'Stop-Market'],
     'fire_on_opts': ['Live', '1m', '5m', '15m', '60m'],
-    # Alert sound options (Upper/Lower alert cards)
+    # Alert sound options (shared Alert Sound Profile panel)
     'alert_sounds': list(ALERT_SOUND_URLS.keys()),
 }
 
@@ -131,10 +161,12 @@ params = {
     'alert_upper': 0, 'alert_lower': 0,
     'alert_upper_active': False, 'alert_lower_active': False,
 
-    # Split Upper/Lower alert cards: independent period, sound choice, and sound duration (secs)
+    # Upper/Lower alert cards: independent threshold + period. Sound + duration are now a
+    # single shared profile (see render_alert_sound_panel in ui_components.py), loaded here
+    # from disk so it survives reloads/restarts; both sides start out identical.
     'alert_upper_period': 'Current', 'alert_lower_period': 'Current',
-    'alert_upper_sound': 'Wood Plank', 'alert_lower_sound': 'Wood Plank',
-    'alert_upper_duration': 5, 'alert_lower_duration': 5,
+    'alert_upper_sound': _saved_alert_sound, 'alert_lower_sound': _saved_alert_sound,
+    'alert_upper_duration': _saved_alert_duration, 'alert_lower_duration': _saved_alert_duration,
 
     'global_stop_value': 0, 'global_target_value': 0, 'global_stop_active': False, 'global_tgt_active': False,
 

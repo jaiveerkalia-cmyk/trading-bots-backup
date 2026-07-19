@@ -235,7 +235,7 @@ async def fetch_binance_data():
             # computed from mark/index (both futures-side), so it's unaffected by this change.
             # Spot CVD is untouched too - it deliberately stays spot-sourced (via spot_kline
             # below) as the "real money" cross-check against futures/derivatives froth.
-            "futures_price": "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT",
+            "futures_price": "https://fapi.binance.com/fapi/v2/ticker/price?symbol=BTCUSDT",  # ALERT FIX: v1 of this endpoint is deprecated by Binance and may be failing silently, which would starve the daemon of real data (see synthetic-fallback note further down) and explain signals going quiet. v2 has an identical response format.
             "spot_kline": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1",
             "premium": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT",
             "oi": "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT",
@@ -695,6 +695,7 @@ def serve_layout():
         # signal alert and a manual Preview can never cut each other off.
         html.Audio(id='daemon-audio-element', src=current_audio_settings['sound_url'], autoPlay=True, loop=True, muted=True, style={'display':'none'}),
         html.Audio(id='preview-audio-element', src=current_audio_settings['sound_url'], autoPlay=True, loop=True, muted=True, style={'display':'none'}),
+        html.Div(id='keepalive-dummy', style={'display':'none'}),  # THROTTLE FIX: dummy Output target for the audible-keepalive init callback below
         html.H1("QUANTITATIVE ORDER FLOW TERMINAL v3 - BULLETPROOF", style={'textAlign':'center','letterSpacing':'2px','marginBottom':'5px'}),
         html.Div(id='last-updated-label', style={'textAlign':'center','color':'#888','fontSize':'14px','marginBottom':'20px','fontStyle':'italic'}),
         html.Div(style={'display':'flex','flexWrap':'wrap','justifyContent':'center','alignItems':'center','marginBottom':'20px','gap':'20px','backgroundColor':'#1a1a1a','padding':'15px','borderRadius':'8px','border':'1px solid #333','boxSizing':'border-box'}, children=[
@@ -767,23 +768,54 @@ def persist_duration_change(duration_val):
 # AudioContext.
 
 app.clientside_callback(
+    """function(n) {
+        // THROTTLE FIX: Chrome only exempts a tab from background/inactive-tab JS timer
+        // throttling if the tab is AUDIBLY playing sound (silent/muted audio does not count -
+        // this is documented Chrome behavior, not a guess). Without this, dcc.Interval - which
+        // is what ultimately detects a fired signal and triggers the alert - gets throttled
+        // while the tab is backgrounded or another app has focus, so alerts can silently stop
+        // being detected at all, not just fail to play. Fix: once the daemon audio element is
+        // actually playing (already muted-autoplaying from page load, which is unconditionally
+        // allowed), unmute it to a very low but genuinely non-zero "keep-alive" volume and leave
+        // it there permanently. This keeps the tab flagged audible (small speaker icon), which
+        // keeps Chrome from throttling this tab's timers at all. Runs once per page load via the
+        // window flag guard; safe to fire on every interval tick regardless.
+        if (!window.audioKeepAliveInit) {
+            window.audioKeepAliveInit = true;
+            window.audioKeepAliveVolume = 0.02;
+            var el = document.getElementById('daemon-audio-element');
+            if (el) {
+                var arm = function() {
+                    try { el.muted = false; el.volume = window.audioKeepAliveVolume; } catch(e) { console.log('Keepalive arm err', e); }
+                };
+                if (!el.paused) { arm(); } else { el.addEventListener('playing', arm, {once:true}); }
+            }
+        }
+        return window.dash_clientside.no_update;
+    }""",
+    Output('keepalive-dummy','children'), Input('interval-component','n_intervals')
+)
+
+app.clientside_callback(
     """function(trigger, sound_url, duration) {
         // AUDIO FIX: Replaces the old AudioContext + GainNode approach (which required the
         // "Enable Audio" button to be clicked first, and reset every page load) with the
         // muted-autoplay-then-unmute technique. The <audio id="daemon-audio-element"> tag is
         // already looping, muted, in the background from the moment the page loaded (browsers
         // always allow muted autoplay with zero user interaction). To fire an alert, we point
-        // it at the chosen sound and restart it from the top WHILE STILL MUTED (also always
-        // allowed), then unmute a moment later - unmuting an element that is already playing
-        // is not classified as "starting new audible autoplay", so it's allowed with no click,
-        // ever, on every page load. We re-mute (never pause) once the duration elapses, so the
-        // element stays "already playing" and is instantly ready to fire again next time.
+        // it at the chosen sound and restart it from the top, then bring it up to full volume -
+        // unmuting/raising the volume of an element that is already playing is not classified as
+        // "starting new audible autoplay", so it's allowed with no click, ever, on every page
+        // load. THROTTLE FIX: after the duration elapses we now drop back to the low
+        // audioKeepAliveVolume baseline instead of re-muting, since staying genuinely (if
+        // quietly) audible is what keeps this tab exempt from Chrome's background timer
+        // throttling - see the keepalive init callback above for the full explanation.
         if (trigger && sound_url && sound_url !== 'none') {
             var el = document.getElementById('daemon-audio-element');
             if (el) {
                 try {
                     if (window.daemonMuteTimeout) { clearTimeout(window.daemonMuteTimeout); }
-                    el.muted = true;
+                    el.muted = false; // safe even if already unmuted by the keepalive init - unmuting an already-playing element never requires a fresh gesture
                     if (el.src !== sound_url) { el.src = sound_url; }
                     el.volume = 1.0; // Max volume the plain <audio> element supports without a gesture-gated AudioContext
                     el.currentTime = 0;
@@ -792,7 +824,7 @@ app.clientside_callback(
                     var unmuteAndArm = function() {
                         el.muted = false;
                         window.daemonMuteTimeout = setTimeout(function () {
-                            el.muted = true; // re-mute, don't pause, so it's instantly ready for the next alert
+                            el.volume = window.audioKeepAliveVolume || 0.02; // drop back to the near-silent keep-alive baseline, NOT muted
                         }, (duration || 6) * 1000);
                     };
                     if (playPromise !== undefined) {
