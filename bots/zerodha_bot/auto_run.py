@@ -1216,6 +1216,7 @@ def build_center_stack():
     ui.button('Run 9 AM Daily Scan', on_click=run_daily_scan).classes('bg-orange-200 text-orange-900 w-full shadow-md rounded-xl h-12 font-bold')
     comp.global_control_card('Global Stop Loss', 'global_stop_value', 'global_stop_active')
     comp.global_control_card('Global Target', 'global_target_value', 'global_tgt_active')
+    comp.render_alert_sound_panel()
     comp.alerts_card_upper()
     comp.alerts_card_lower()
     
