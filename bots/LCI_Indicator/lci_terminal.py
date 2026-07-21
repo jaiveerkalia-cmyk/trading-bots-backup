@@ -27,7 +27,9 @@ if sys.platform == 'win32':
 # 1. CONSTANTS - PRODUCTION GRADE - FULL DESCRIPTIVE NAMES
 # ==========================================
 MAX_HISTORY_ROWS = 10080
-UI_REFRESH_INTERVAL = 10000
+# Charts redraw once per minute; alert delivery uses a separate lightweight one-second path.
+UI_REFRESH_INTERVAL = 60000
+ALERT_POLL_INTERVAL = 1000
 USE_SPOT_CVD_FILTER_DEFAULT = False
 PRESSURE_CLIP_MAX = 10.0
 PRESSURE_CLIP_MIN = 0.1
@@ -69,12 +71,18 @@ SIGNAL_CSV_COLUMN_ORDER = ['epoch','timestamp','timeframe','signal','price','rea
 
 # --- IST wall-clock helpers -----------------------------------------------
 IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+TIMEFRAME_MINUTES = {'1min': 1, '5min': 5, '15min': 15, '30min': 30}
 
 def now_ist():
     return datetime.datetime.now(datetime.timezone.utc).astimezone(IST_TZ).replace(tzinfo=None)
 
 def ist_from_epoch(epoch_seconds):
     return datetime.datetime.fromtimestamp(epoch_seconds, datetime.timezone.utc).astimezone(IST_TZ).replace(tzinfo=None)
+
+def timeframes_closing_at(boundary_epoch):
+    """Timeframes whose candle closes at this exact minute boundary."""
+    minute = ist_from_epoch(boundary_epoch).minute
+    return [tf for tf, minutes in TIMEFRAME_MINUTES.items() if minute % minutes == 0]
 
 DATA_FILE = "data/lci_history.csv"
 SIGNAL_LOG_FILE = "data/signal_events.csv"
@@ -203,6 +211,26 @@ current_cvd_filter_setting = USE_SPOT_CVD_FILTER_DEFAULT
 # only actually compact once every COMPACT_CHECK_INTERVAL_ROWS polls past that point instead.
 COMPACT_CHECK_INTERVAL_ROWS = 60
 rows_since_last_compact = 0
+
+# One latest event per timeframe: fixed-size daemon-to-UI handoff, no CSV/DF work for alerts.
+signal_event_lock = threading.Lock()
+latest_signal_events = {}
+signal_event_sequence = 0
+
+def publish_signal_event(record, signal_id):
+    global signal_event_sequence
+    with signal_event_lock:
+        signal_event_sequence += 1
+        latest_signal_events[record['timeframe']] = {
+            'sequence': signal_event_sequence, 'signal_id': signal_id,
+            'timestamp': record['timestamp'], 'timeframe': record['timeframe'],
+            'signal': record['signal'], 'price': record['price'], 'reason': record['reason'],
+            'fired_at': now_ist().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+def signal_event_sequences():
+    with signal_event_lock:
+        return {tf: event['sequence'] for tf, event in latest_signal_events.items()}
 
 def migrate_signal_log_epochs():
     # IST FIX: recomputes the 'epoch' column for every row in the signal log from its 'timestamp'
@@ -366,21 +394,23 @@ def compact_csv_if_needed():
         except: pass
 
 def log_signal_to_csv(epoch_int, ts_str, timeframe, sig_name, price, reason, row):
+    """Commit a signal before publishing that exact committed event to the UI."""
     sig_id = f"{epoch_int}_{timeframe}_{sig_name}"
     with file_lock:
-        if sig_id not in logged_signals:
-            logged_signals.add(sig_id)
-            d = {'epoch': epoch_int, 'timestamp': ts_str, 'timeframe': timeframe, 'signal': sig_name, 'price': float(price), 'reason': str(reason),
-                 'price_change':0.0,'price_thresh':0.0,'oi_change':0.0,'oi_thresh_upper':0.0,'oi_thresh_lower':0.0,'buy_pressure':0.0,'bp_thresh':0.0,'sell_pressure':0.0,'sp_thresh':0.0,'basis':0.0,'premium_thresh':0.0,'premium_thresh_lower':0.0}
-            try:
-                for k in ['price_change','price_thresh','oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure','sp_thresh','basis','premium_thresh','premium_thresh_lower']:
-                    if k in row: d[k]=float(row[k])
-            except: pass
-            df_out = pd.DataFrame([d], columns=SIGNAL_CSV_COLUMN_ORDER)[SIGNAL_CSV_COLUMN_ORDER]
-            if not os.path.exists(SIGNAL_LOG_FILE):
-                df_out.to_csv(SIGNAL_LOG_FILE, index=False)
-                return
-            df_out.to_csv(SIGNAL_LOG_FILE, mode='a', header=False, index=False)
+        if sig_id in logged_signals:
+            return False
+        d = {'epoch': epoch_int, 'timestamp': ts_str, 'timeframe': timeframe, 'signal': sig_name, 'price': float(price), 'reason': str(reason),
+             'price_change':0.0,'price_thresh':0.0,'oi_change':0.0,'oi_thresh_upper':0.0,'oi_thresh_lower':0.0,'buy_pressure':0.0,'bp_thresh':0.0,'sell_pressure':0.0,'sp_thresh':0.0,'basis':0.0,'premium_thresh':0.0,'premium_thresh_lower':0.0}
+        try:
+            for k in ['price_change','price_thresh','oi_change','oi_thresh_upper','oi_thresh_lower','buy_pressure','bp_thresh','sell_pressure','sp_thresh','basis','premium_thresh','premium_thresh_lower']:
+                if k in row: d[k]=float(row[k])
+        except: pass
+        df_out = pd.DataFrame([d], columns=SIGNAL_CSV_COLUMN_ORDER)[SIGNAL_CSV_COLUMN_ORDER]
+        if not os.path.exists(SIGNAL_LOG_FILE): df_out.to_csv(SIGNAL_LOG_FILE, index=False)
+        else: df_out.to_csv(SIGNAL_LOG_FILE, mode='a', header=False, index=False)
+        logged_signals.add(sig_id)
+    publish_signal_event(d, sig_id)
+    return True
 
 def build_resampled_view(base_df, timeframe):
     if base_df.empty: return pd.DataFrame()
@@ -649,21 +679,8 @@ async def clock_sync_daemon():
         if need_compact: compact_csv_if_needed()
         try:
             with df_lock: base = global_df.copy()
-            dt = ist_from_epoch(next_epoch)
-            minute = dt.minute
-            # LOG/SOUND CONSISTENCY FIX: previously only evaluated 5min/15min/30min at their
-            # exact aligned bar-close minute (e.g. 5min only at :00/:05/:10...), taking a single
-            # one-shot snapshot of the bar that just closed and never re-checking it again. The
-            # UI (update_dashboard), by contrast, re-evaluates the same closed bar continuously
-            # every 10s until the next bar closes - so if the bar's own aggregated data changed
-            # slightly after the daemon's one-shot check (e.g. a late-arriving data correction),
-            # the UI could see and alert on a signal the daemon's log never captured, since the
-            # daemon had already permanently moved on. Now every timeframe is re-checked on every
-            # 1-min poll, so the same closed bar gets multiple chances to be logged, matching the
-            # UI's continuous re-evaluation. This is safe/idempotent: log_signal_to_csv already
-            # dedupes via the logged_signals set (epoch+timeframe+signal), so re-checking a bar
-            # that was already logged is just a no-op, not a duplicate row.
-            tfs=['1min','5min','15min','30min']
+            # A bar is evaluated once at its true close; later rechecks caused stale alerts.
+            tfs = timeframes_closing_at(next_epoch)
             with cvd_setting_lock: active_cvd_filter = current_cvd_filter_setting
             for tf in tfs:
                 view = build_resampled_view(base, tf)
@@ -671,8 +688,7 @@ async def clock_sync_daemon():
                 sig_df, warm = compute_signals_for_view(view, tf, use_cvd_filter=active_cvd_filter)
                 if warm or sig_df.empty: continue
                 
-                tf_map={'1min':1,'5min':5,'15min':15,'30min':30}
-                tf_min=tf_map.get(tf,5)
+                tf_min=TIMEFRAME_MINUTES.get(tf, 5)
                 tf_delta=pd.Timedelta(minutes=tf_min)
                 last_ts = sig_df['timestamp'].iloc[-1]
                 is_forming = (last_ts + tf_delta) > now_ist()
@@ -744,7 +760,9 @@ def serve_layout():
     # "settings don't persist on reload".
     current_audio_settings = load_audio_settings()
     return html.Div(style={'backgroundColor':'#111','color':'white','fontFamily':'Arial, sans-serif','padding':'20px','minHeight':'100vh','boxSizing':'border-box'}, children=[
-        dcc.Store(id='last-signal-time', data=None),
+        dcc.Store(id='last-daemon-event-seq', data=signal_event_sequences()),
+        dcc.Store(id='displayed-daemon-event-id', data=None),
+        dcc.Store(id='committed-event-refresh', data=None),
         dcc.Store(id='sound-trigger', data=None),
         dcc.Store(id='active-sound-url', data=current_audio_settings['sound_url']),  # AUDIO FIX: seeded from the server-side settings file, not browser localStorage
         html.Div(id='audio-dummy', style={'display':'none'}),
@@ -764,7 +782,8 @@ def serve_layout():
         html.Audio(id='preview-audio-element', src=current_audio_settings['sound_url'], autoPlay=True, loop=True, muted=True, style={'display':'none'}),
         html.Div(id='keepalive-dummy', style={'display':'none'}),  # THROTTLE FIX: dummy Output target for the audible-keepalive init callback below
         html.H1("QUANTITATIVE ORDER FLOW TERMINAL v3 - BULLETPROOF", style={'textAlign':'center','letterSpacing':'2px','marginBottom':'5px'}),
-        html.Div(id='last-updated-label', style={'textAlign':'center','color':'#888','fontSize':'14px','marginBottom':'20px','fontStyle':'italic'}),
+        html.Div(id='last-updated-label', style={'textAlign':'center','color':'#888','fontSize':'14px','marginBottom':'12px','fontStyle':'italic'}),
+        html.Div(id='live-signal-notice', style={'margin':'0 auto 12px auto','maxWidth':'1100px'}),
         html.Div(style={'display':'flex','flexWrap':'wrap','justifyContent':'center','alignItems':'center','marginBottom':'20px','gap':'20px','backgroundColor':'#1a1a1a','padding':'15px','borderRadius':'8px','border':'1px solid #333','boxSizing':'border-box'}, children=[
             html.Div([html.Label("Timeframe: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='timeframe-dropdown', options=[{'label':'1 Minute','value':'1min'},{'label':'5 Minutes','value':'5min'},{'label':'15 Minutes','value':'15min'},{'label':'30 Minutes','value':'30min'}], value='5min', clearable=False, style={'width':'120px','display':'inline-block','color':'black','textAlign':'left'})]),
             html.Div([html.Label("History Range: ", style={'fontWeight':'bold','marginRight':'8px'}), dcc.Dropdown(id='range-dropdown', options=[{'label':'Last 1 Hour','value':'1h'},{'label':'Last 2 Hours','value':'2h'},{'label':'Last 4 Hours','value':'4h'},{'label':'Last 6 Hours','value':'6h'},{'label':'Last 24 Hours','value':'24h'},{'label':'Last 1 Week','value':'7d'},{'label':'All Time','value':'all'}], value='24h', clearable=False, style={'width':'140px','display':'inline-block','color':'black','textAlign':'left'})]),
@@ -792,9 +811,10 @@ def serve_layout():
         html.Div(id='signal-row-up', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
         html.Div(id='signal-row-down', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px','marginBottom':'15px','boxSizing':'border-box'}),
         html.Div(id='metrics-row', className='grid-cards', style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(200px, 1fr))','gap':'10px','marginTop':'10px','boxSizing':'border-box'}),
-        html.Div(style={'backgroundColor':'#1a1a1a','border':'1px solid #333','borderRadius':'8px','padding':'15px','height':'180px','overflowY':'auto','marginTop':'20px','fontFamily':'monospace'}, children=[html.H3("EVENT LOG - DAEMON EPOCH HASHED - PRIORITY HIERARCHY", style={'margin':'0 0 10px 0','fontSize':'14px','color':'#aaa'}), html.Div(id='event-log-row')]),
+        html.Div(style={'backgroundColor':'#1a1a1a','border':'1px solid #333','borderRadius':'8px','padding':'15px','height':'180px','overflowY':'auto','marginTop':'20px','fontFamily':'monospace'}, children=[html.H3("EVENT LOG - DAEMON EPOCH HASHED - PRIORITY HIERARCHY", style={'margin':'0 0 10px 0','fontSize':'14px','color':'#aaa'}), html.Div(id='event-log-live'), html.Div(id='event-log-row')]),
         html.Div(dcc.Graph(id='main-chart', config={'displayModeBar':False}), style={'marginTop':'20px','border':'1px solid #333','borderRadius':'8px'}),
-        dcc.Interval(id='interval-component', interval=UI_REFRESH_INTERVAL, n_intervals=0)
+        dcc.Interval(id='interval-component', interval=UI_REFRESH_INTERVAL, n_intervals=0),
+        dcc.Interval(id='alert-poll', interval=ALERT_POLL_INTERVAL, n_intervals=0)
     ])
 
 app.layout = serve_layout
@@ -860,7 +880,7 @@ app.clientside_callback(
         }
         return window.dash_clientside.no_update;
     }""".replace("__AUDIO_KEEPALIVE_VOLUME__", str(AUDIO_KEEPALIVE_VOLUME)),
-    Output('keepalive-dummy','children'), Input('interval-component','n_intervals')
+    Output('keepalive-dummy','children'), Input('alert-poll','n_intervals')
 )
 
 app.clientside_callback(
@@ -947,19 +967,52 @@ app.clientside_callback(
 )
 
 @app.callback(
-    [Output('last-updated-label','children'), Output('signal-row-up','children'), Output('signal-row-down','children'), Output('metrics-row','children'), Output('event-log-row','children'), Output('main-chart','figure'), Output('last-signal-time','data'), Output('sound-trigger','data')],
-    [Input('interval-component','n_intervals'), Input('timeframe-dropdown','value'), Input('range-dropdown','value'), Input('ema-window','value'), Input('cvd-toggle','value')],
-    [State('last-signal-time','data')]
+    Output('sound-trigger', 'data'), Output('last-daemon-event-seq', 'data'),
+    Output('live-signal-notice', 'children'), Output('event-log-live', 'children'),
+    Output('displayed-daemon-event-id', 'data'), Output('committed-event-refresh', 'data'),
+    Input('alert-poll', 'n_intervals'), Input('timeframe-dropdown', 'value'),
+    State('last-daemon-event-seq', 'data'), State('displayed-daemon-event-id', 'data')
 )
-def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_signal_time):
+def deliver_daemon_signal(_n, timeframe, seen, displayed_event_id):
+    # This path only reads one in-memory event. It never copies history, reads the CSV,
+    # resamples data, or renders Plotly, so the one-second cadence has constant RAM cost.
+    with signal_event_lock:
+        event = latest_signal_events.get(timeframe)
+        event = event.copy() if event else None
+    seen = dict(seen or {})
+    if not event:
+        if displayed_event_id is not None:
+            return dash.no_update, seen, '', '', None, dash.no_update
+        return dash.no_update, seen, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    is_new = event['sequence'] > seen.get(timeframe, 0)
+    needs_render = event['signal_id'] != displayed_event_id
+    if not is_new and not needs_render:
+        return dash.no_update, seen, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    seen[timeframe] = max(event['sequence'], seen.get(timeframe, 0))
+    colors = {'TRUE_BREAKOUT':'lime','TRUE_BREAKDOWN':'#ff5555','SHORT_SQUEEZE':'orange','LONG_LIQUIDATION':'#bb66ff','TOP_EXHAUSTION':'#ff5050','BOTTOM_EXHAUSTION':'#00c8ff'}
+    color = colors.get(event['signal'], 'white')
+    title = f"{event['signal']} | {event['timeframe']} candle {event['timestamp']} closed"
+    detail = f"Fired {event['fired_at']} IST @ ${event['price']:,.2f}"
+    notice = html.Div([html.Strong(title), html.Span(f" — {detail}")], style={'backgroundColor':'#202020','border':f'2px solid {color}','color':color,'padding':'12px 16px','borderRadius':'8px','fontFamily':'monospace'})
+    log_line = html.Div(f"[{event['fired_at']}] {event['signal']} | {event['timeframe']} candle {event['timestamp']} @ ${event['price']:,.2f}", style={'color':color,'marginBottom':'8px','fontWeight':'bold'})
+    # Refreshes re-render the latest event but do not replay its audio.
+    return event['signal_id'] if is_new else dash.no_update, seen, notice, log_line, event['signal_id'], event['signal_id'] if is_new else dash.no_update
+
+@app.callback(
+    [Output('last-updated-label','children'), Output('signal-row-up','children'), Output('signal-row-down','children'), Output('metrics-row','children'), Output('event-log-row','children'), Output('main-chart','figure')],
+    [Input('interval-component','n_intervals'), Input('timeframe-dropdown','value'), Input('range-dropdown','value'), Input('ema-window','value'), Input('cvd-toggle','value'), Input('committed-event-refresh','data')]
+)
+def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, _event_refresh):
     global current_cvd_filter_setting
     use_cvd = 'on' in (cvd_toggle or [])
     with cvd_setting_lock: current_cvd_filter_setting = use_cvd
     with df_lock:
-        if global_df.empty or len(global_df)<2: return "Initializing...", html.H3("GATHERING...", style={'textAlign':'center','color':'grey'}), "", "", "", go.Figure(), dash.no_update, dash.no_update
+        if global_df.empty or len(global_df)<2: return "Initializing...", html.H3("GATHERING...", style={'textAlign':'center','color':'grey'}), "", "", "", go.Figure()
         base = global_df.copy()
     view = build_resampled_view(base, timeframe)
-    if len(view)<2: return "Resampling...", html.H3("CALIBRATING...", style={'color':'grey'}), "", "", "", go.Figure(), dash.no_update, dash.no_update
+    if len(view)<2: return "Resampling...", html.H3("CALIBRATING...", style={'color':'grey'}), "", "", "", go.Figure()
     now_live = now_ist()
     tf_map={'1min':1,'5min':5,'15min':15,'30min':30}
     tf_min=tf_map.get(timeframe,5)
@@ -974,7 +1027,7 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
         fig=go.Figure()
         fig.update_layout(template="plotly_dark",plot_bgcolor='#111',paper_bgcolor='#111',height=1150)
         card=html.Div(style={'backgroundColor':'#1a1a1a','padding':'20px','borderRadius':'8px','border':'1px solid #ffaa00','textAlign':'center'},children=[html.H2(f"⏳ {txt}",style={'color':'#ffaa00'}),html.P("Gathering statistical baseline.",style={'color':'#888','fontSize':'12px'})])
-        return last_upd, card, html.Div(), card, html.Div("Calibrating..."), fig, last_signal_time, dash.no_update
+        return last_upd, card, html.Div(), card, html.Div("Calibrating..."), fig
 
     last_ts = df_display['timestamp'].iloc[-1]
     is_forming = (last_ts + tf_delta) > now_live
@@ -991,25 +1044,22 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
     closed_str = closed_cur['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
     form_info = f" | Forming {forming.strftime('%H:%M')}..." if forming is not None else ""
     last_upd = f"System: {live_str} IST | Last Closed: {closed_str}{form_info} | Spot CVD Filter: {'Active' if use_cvd else 'Inactive'} (Noise Thresh: {live_cur.get('cvd_noise_thresh',0.5):.2f})"
-
-    active = False
-    an = "NONE"
     cur = closed_cur.copy()
-    
-    if cur['is_breakout']: active=True; an="TRUE_BREAKOUT"
-    elif cur['is_breakdown']: active=True; an="TRUE_BREAKDOWN"
-    elif cur['is_fakeout']: active=True; an="SHORT_SQUEEZE"
-    elif cur['is_long_liq']: active=True; an="LONG_LIQUIDATION"
-    elif cur['is_exhaustion']: active=True; an="TOP_EXHAUSTION"
-    elif cur['is_bottom_exhaust']: active=True; an="BOTTOM_EXHAUSTION"
+    # Card highlights are reflections of daemon-committed events, never of the independently
+    # recomputed (and potentially forming) dashboard bar.
+    with signal_event_lock:
+        committed = latest_signal_events.get(timeframe)
+        committed = committed.copy() if committed else None
+    closed_event_time = cur['timestamp'].strftime('%Y-%m-%d %H:%M')
+    committed_signal = committed['signal'] if committed and committed['timestamp'] == closed_event_time else None
+    signal_flags = {
+        'TRUE_BREAKOUT': 'is_breakout', 'TRUE_BREAKDOWN': 'is_breakdown',
+        'SHORT_SQUEEZE': 'is_fakeout', 'LONG_LIQUIDATION': 'is_long_liq',
+        'TOP_EXHAUSTION': 'is_exhaustion', 'BOTTOM_EXHAUSTION': 'is_bottom_exhaust'
+    }
+    for signal_name, column_name in signal_flags.items():
+        cur[column_name] = (signal_name == committed_signal)
 
-    epoch_id=int(cur['timestamp'].tz_localize(IST_TZ).timestamp())  # IST FIX: same correction as the daemon's epoch_int - localize to IST before computing epoch instead of silently assuming UTC/local
-    sig_hash=f"{epoch_id}_{timeframe}_{an}"
-    sound=dash.no_update
-    if active and last_signal_time!=sig_hash:
-        sound=sig_hash
-        last_signal_time=sig_hash
-        
     up = html.Div(style={'display':'grid','gridTemplateColumns':'repeat(auto-fit, minmax(280px, 1fr))','gap':'15px'}, children=[
         create_signal_card("🟩 TRUE BREAKOUT", cur['is_breakout'], "rgb(0, 255, 0)", "Trend Continuation", f"Price UP + OI {LONG_ROLLING_WINDOW_BARS}-Bar Accum + Whales Buying.", "Ride the Trend. Enter Long on close.", "High Volatility", f"Filters: Price > +{cur.get('price_thresh',0):.2f}% | OI Accum > +{cur.get('oi_accum_long_thresh',0):.2f}% | Whale Raw < EMA"),
         create_signal_card("🟪 LONG LIQUIDATION", cur['is_long_liq'], "rgb(170, 0, 255)", "Mean Reversion (Dip)", f"Cascade OI Drop + Extreme Sell Press + Whale Support.", "Fade the Flush. Enter Long.", "Low Volatility", f"Filters: OI Accum < -{cur.get('oi_accum_short_thresh',0):.2f}% | Sell Press > {cur.get('sp_thresh',0):.2f}x | Whale Raw < EMA"),
@@ -1238,7 +1288,7 @@ def update_dashboard(n, timeframe, time_range, ema_window, cvd_toggle, last_sign
             bar_width = pd.Timedelta(minutes=5)
         for _, drow in divergence_bars.head(200).iterrows():  # safety cap on shape count, not expected to matter in normal use
             fig.add_vrect(x0=drow['timestamp']-bar_width/2, x1=drow['timestamp']+bar_width/2, fillcolor='rgba(255,255,255,0.07)', line_width=0, layer='below')
-    return last_upd, up, down, metrics, logs, fig, last_signal_time, sound
+    return last_upd, up, down, metrics, logs, fig
 
 if __name__ == '__main__':
     start_background_thread()

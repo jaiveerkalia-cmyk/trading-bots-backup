@@ -87,8 +87,9 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
 
             tgt_inp = ui.number(
                 label='Target (opt)', value=None, min=0,
-                on_change=lambda e: f.update(
-                    {'target_price': float(e.value or 0)}
+                on_change=lambda e: (
+                    f.update({'target_price': float(e.value or 0)}),
+                    _recalc(f, shared, refs, state),
                 ),
             ).props('dense dark outlined').classes('flex-1')
             refs['tgt_inp'] = tgt_inp
@@ -154,11 +155,12 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         # Fire on: place immediately or wait for candle close
         with ui.row().classes('w-full items-center gap-2 mb-2'):
             ui.label('Fire on:').classes('text-xs text-gray-500 shrink-0')
-            ui.select(
+            fire_on_sel = ui.select(
                 {'current': 'Live', '1m': '1m Close', '5m': '5m Close'},
                 value='current',
                 on_change=lambda e: f.update({'fire_on': e.value}),
             ).props('dense dark outlined').classes('flex-1')
+            refs['fire_on_sel'] = fire_on_sel
 
         async def place():
             await _place(side, f, shared, redis, state, refs)
@@ -225,7 +227,8 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
 
 def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
     order_type = f.get('order_type', 'limit')
-    stop       = f.get('stop_price', 0) or 0
+    stop       = f.get('stop_price',  0) or 0
+    target     = f.get('target_price', 0) or 0
     exchange   = shared.get('exchange', 'binance_futures')
     balance    = max(shared.get('balance', 0), 1)
     maker_fee, taker_fee = _fees(exchange)
@@ -271,6 +274,48 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
                         tgt_ref.set_value(auto_tgt)
                     except Exception:
                         pass
+
+    elif (f.get('qty_mode') == 'risk'
+          and entry > 0 and target > 0 and stop <= 0
+          and abs(entry - target) > 0):
+        # ── Target-first: derive stop from R:R inverse, then compute qty ────────
+        rr   = float(shared.get('rr_ratio', 2.0) or 2.0)
+        side = f.get('side', 'long')
+        if rr > 0:
+            auto_stop = 0.0
+            if side == 'long':
+                # net reward per unit (fee-adjusted)
+                reward_pu = target * (1.0 - taker_fee) - entry * (1.0 + entry_fee_rate)
+                denom     = 1.0 - taker_fee
+                if reward_pu > 0 and denom > 0:
+                    # stop = (entry*(1+ef) - reward_pu/rr) / (1 - tf)
+                    auto_stop = (entry * (1.0 + entry_fee_rate) - reward_pu / rr) / denom
+                    if not (0 < auto_stop < entry):
+                        auto_stop = 0.0   # invalid for long
+            else:
+                # net reward per unit (fee-adjusted, short)
+                reward_pu = entry * (1.0 - entry_fee_rate) - target * (1.0 + taker_fee)
+                denom     = 1.0 + taker_fee
+                if reward_pu > 0 and denom > 0:
+                    # stop = (entry*(1-ef) + reward_pu/rr) / (1 + tf)
+                    auto_stop = (entry * (1.0 - entry_fee_rate) + reward_pu / rr) / denom
+                    if not (auto_stop > entry):
+                        auto_stop = 0.0   # invalid for short
+
+            if auto_stop > 0:
+                f['stop_price'] = round(auto_stop, 6)
+                stop_ref = refs.get('stop_inp')
+                if stop_ref:
+                    try:
+                        stop_ref.set_value(round(auto_stop, 6))
+                    except Exception:
+                        pass
+                # Now compute qty with the derived stop
+                fee_per_unit = entry * entry_fee_rate + auto_stop * taker_fee
+                risk_amt     = balance * (shared.get('risk_pct', 0.5) / 100)
+                qty          = round(risk_amt / (abs(entry - auto_stop) + fee_per_unit), 8)
+                f['qty']     = qty
+
     elif f.get('qty_mode') == 'risk':
         f['qty'] = 0.0
 
@@ -310,13 +355,19 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
 
 
 def _clear(f: dict, refs: dict) -> None:
-    f.update({'entry_price': 0.0, 'stop_price': 0.0, 'target_price': 0.0, 'qty': 0.0})
+    f.update({'entry_price': 0.0, 'stop_price': 0.0, 'target_price': 0.0,
+              'qty': 0.0, 'fire_on': 'current'})
     for k in ('entry_inp', 'stop_inp', 'tgt_inp', 'qty_inp'):
         if refs.get(k):
             try:
                 refs[k].set_value(None)
             except Exception:
                 pass
+    if refs.get('fire_on_sel'):
+        try:
+            refs['fire_on_sel'].set_value('current')
+        except Exception:
+            pass
     for k in ('info_lbl', 'fee_lbl', 'be_lbl'):
         if refs.get(k):
             refs[k].set_text('')
