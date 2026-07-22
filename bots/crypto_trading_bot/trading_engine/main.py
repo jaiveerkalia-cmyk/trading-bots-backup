@@ -854,22 +854,65 @@ async def main() -> None:
                 )
 
     async def _on_conditional_triggered(slot: TradeSlot) -> None:
-        """Submit the entry order once the candle-close condition fires."""
+        """Submit a MARKET order once the candle-close condition fires.
+
+        Qty is recalculated using the actual LTP at fire time so the risk
+        amount stays accurate regardless of when the order was set up.
+        """
         current = slot_manager.get_slot(slot.id)
         if not current or current.status != 'conditional':
             return
         entry = current.entries[0] if current.entries else None
         if not entry:
             return
+
+        # Fetch LTP at the moment the candle condition fires
+        ltp = 0.0
+        try:
+            raw_tick = await redis.get(
+                redis_keys.latest_tick_key(current.exchange, current.symbol)
+            )
+            if raw_tick:
+                ltp = float(json.loads(raw_tick).get('p', 0))
+        except Exception:
+            pass
+
+        # Recalculate qty using actual LTP for accurate risk sizing
+        order_qty = entry.qty
+        stop_px   = current.stop_price
+        risk_pct  = (getattr(current, 'risk_pct', settings.DEFAULT_RISK_PCT)
+                     or settings.DEFAULT_RISK_PCT)
+
+        if ltp > 0 and stop_px and abs(ltp - stop_px) > 0:
+            try:
+                raw_pf  = await redis.get('ui:portfolio')
+                balance = (float(json.loads(raw_pf).get('starting_balance', 10000))
+                           if raw_pf else 10000.0)
+            except Exception:
+                balance = 10000.0
+            fees_cfg = settings.EXCHANGE_FEES.get(
+                current.exchange, {'maker': 0.001, 'taker': 0.001}
+            )
+            fee_unit = ltp * fees_cfg['taker'] + stop_px * fees_cfg['taker']
+            risk_amt = balance * (risk_pct / 100)
+            new_qty  = round(risk_amt / (abs(ltp - stop_px) + fee_unit), 8)
+            if new_qty > 0:
+                order_qty = new_qty
+                state_pub.log(
+                    f"[COND] qty adjusted {entry.qty:g} \u2192 {new_qty:g} (LTP {ltp:g})",
+                    exchange=current.exchange, symbol=current.symbol,
+                )
+
         current.fire_on = None
         current.status  = 'pending'
         await slot_manager.update_slot(current)
+
+        # Always fire as MARKET so the order fills immediately at LTP
         order = Order(
             exchange=current.exchange, symbol=current.symbol,
             side='buy' if current.side == 'long' else 'sell',
-            order_type=entry.order_type,
-            price=entry.price or None,
-            qty=entry.qty,
+            order_type='market',
+            qty=order_qty,
             slot_id=current.id,
         )
         order = await order_manager.place_order(order, current)
@@ -884,11 +927,11 @@ async def main() -> None:
             await slot_manager.update_slot(current)
         state_pub.log(
             f"[COND ENTRY PLACED] {current.side} {current.symbol} "
-            f"{entry.order_type} @ {entry.price or 'MKT'}",
+            f"MARKET qty={order_qty:g} (LTP {ltp:g})",
             exchange=current.exchange, symbol=current.symbol,
         )
         await notifier.send(
-            f"[COND ENTRY] {current.side.upper()} {current.symbol} order placed"
+            f"[COND ENTRY] {current.side.upper()} {current.symbol} market order placed"
         )
 
     trigger = TriggerEngine(
