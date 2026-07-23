@@ -37,6 +37,8 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         'margin_mode':  'cross',
         'qty_mode':     'risk',
         'fire_on':      'current',
+        'target_auto':  True,   # True = auto-calculated; False = manually edited
+        'stop_auto':    True,   # True = auto-calculated; False = manually edited
     }
     refs     = {}
     # Initialise had_pos with sym key to prevent false clears on context changes
@@ -79,7 +81,7 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
             stop_inp = ui.number(
                 label='Stop', value=None, min=0,
                 on_change=lambda e: (
-                    f.update({'stop_price': float(e.value or 0)}),
+                    f.update({'stop_price': float(e.value or 0), 'stop_auto': False}),
                     _recalc(f, shared, refs, state),
                 ),
             ).props('dense dark outlined').classes('flex-1')
@@ -88,10 +90,10 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
             tgt_inp = ui.number(
                 label='Target (opt)', value=None, min=0,
                 on_change=lambda e: (
-                    f.update({'target_price': float(e.value or 0)}),
+                    f.update({'target_price': float(e.value or 0), 'target_auto': False}),
                     _recalc(f, shared, refs, state),
                 ),
-            ).props('dense dark outlined').classes('flex-1')
+            ).props('dense dark outlined debounce=600').classes('flex-1')
             refs['tgt_inp'] = tgt_inp
 
         # Margin mode
@@ -266,8 +268,9 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
                 auto_tgt = round(
                     (entry * qty * (1.0 - entry_fee_rate) - rr * risk_amt) / denom, 6
                 ) if denom > 0 else 0.0
-            if auto_tgt > 0:
+            if auto_tgt > 0 and f.get('target_auto', True):
                 f['target_price'] = auto_tgt
+                f['target_auto']  = True   # remains auto-calculated
                 tgt_ref = refs.get('tgt_inp')
                 if tgt_ref:
                     try:
@@ -277,6 +280,7 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
 
     elif (f.get('qty_mode') == 'risk'
           and entry > 0 and target > 0 and stop <= 0
+          and f.get('stop_auto', True)          # don't override manually edited stop
           and abs(entry - target) > 0):
         # ── Target-first: derive stop from R:R inverse, then compute qty ────────
         rr   = float(shared.get('rr_ratio', 2.0) or 2.0)
@@ -304,6 +308,7 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
 
             if auto_stop > 0:
                 f['stop_price'] = round(auto_stop, 6)
+                f['stop_auto']  = True   # auto-calculated, not manually edited
                 stop_ref = refs.get('stop_inp')
                 if stop_ref:
                     try:
@@ -356,7 +361,8 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
 
 def _clear(f: dict, refs: dict) -> None:
     f.update({'entry_price': 0.0, 'stop_price': 0.0, 'target_price': 0.0,
-              'qty': 0.0, 'fire_on': 'current'})
+              'qty': 0.0, 'fire_on': 'current',
+              'target_auto': True, 'stop_auto': True})
     for k in ('entry_inp', 'stop_inp', 'tgt_inp', 'qty_inp'):
         if refs.get(k):
             try:
