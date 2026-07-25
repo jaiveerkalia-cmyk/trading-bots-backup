@@ -483,6 +483,13 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
     MODIFY edits the value/period inline; REMOVE deactivates and clears the value, mirroring
     the Reset behavior already in premium_exit_card/index_exit_component."""
     opt_type = 'CE' if side == 'Call' else 'PE'
+    draft = {}
+
+    def sync_draft():
+        draft['value'] = params[value_key]
+        if time_key: draft['time'] = params[time_key]
+
+    sync_draft()
 
     def _symbol(_v=None):
         trade = shared_state['active_trades'].get(side)
@@ -495,6 +502,9 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
         prefix = 'call' if side == 'Call' else 'put'
         return str(params.get(f'{prefix}_qty', '-'))
 
+    def _fire_on_label(v):
+        return 'Live' if v == 'Current' else v  # cosmetic only: matches entry-card wording
+
     with ui.column().classes('w-full') as wrapper:
         wrapper.bind_visibility_from(params, active_key)
         with ui.expansion('', icon='tune').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
@@ -506,7 +516,7 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
                     ui.label(order_label).classes('w-24 text-purple-700 font-semibold')
                     ui.label('-').classes('w-24 text-right font-mono text-gray-400')  # Trigger Price: n/a for exit orders
                     if time_key:
-                        ui.label().bind_text_from(params, time_key).classes('w-16 text-gray-500')
+                        ui.label().bind_text_from(params, time_key, backward=_fire_on_label).classes('w-16 text-gray-500')
                     else:
                         ui.label('Live').classes('w-16 text-gray-400')
                     ui.label().bind_text_from(params, value_key, backward=lambda v: (str(v) if (not is_target and str(v).strip() not in ('', '0')) else '-')).classes('w-20 text-orange-600 text-right font-mono')
@@ -520,14 +530,28 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
                         params[value_key] = 0
                         ui.notify(f"{side} {order_label} Removed", type='info')
 
-                    ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', lambda: _toggle_expansion(exp))
+                    def open_modify():
+                        sync_draft()
+                        exp.value = True
+
+                    ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', open_modify)
                     ui.button('REMOVE').props('flat dense size=sm no-caps').classes('text-[10px] text-red-600').on('click.stop', remove_order)
 
             with ui.column().classes('w-full p-3 gap-2 bg-gray-50'):
                 with ui.row().classes('w-full gap-2 items-center'):
-                    ui.input('Value').bind_value(params, value_key).props('outlined dense bg-color=white').classes('grow')
+                    ui.input('Value').bind_value(draft, 'value').props('outlined dense bg-color=white').classes('grow')
                     if time_key:
-                        ui.radio(UI_OPTS['index_times'], value=params[time_key]).bind_value(params, time_key).props('inline dense')
+                        ui.radio(UI_OPTS['index_times'], value=draft['time']).bind_value(draft, 'time').props('inline dense')
+
+                def confirm_changes():
+                    params[value_key] = draft['value']
+                    if time_key: params[time_key] = draft['time']
+                    ui.notify(f"{side} {order_label} Updated", type='positive')
+                    exp.value = False
+
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('CONFIRM', color='green', on_click=confirm_changes).classes('grow h-8 text-xs rounded-lg font-bold')
+                    ui.button('Cancel', on_click=lambda: setattr(exp, 'value', False)).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800')
 
 def render_orderbook():
     """Full-width Open Orders table (white background, matching the rest of the app): pending

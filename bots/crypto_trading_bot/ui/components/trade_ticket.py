@@ -246,80 +246,67 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
     fee_lbl  = refs.get('fee_lbl')
     be_lbl   = refs.get('be_lbl')
 
-    if (f.get('qty_mode') == 'risk'
-            and entry > 0 and stop > 0 and abs(entry - stop) > 0):
+    if f.get('qty_mode') == 'risk' and entry > 0:
         risk_amt = balance * (shared.get('risk_pct', 0.5) / 100)
-        # Include entry fee + exit fee at stop in the risk calc
-        fee_per_unit = entry * entry_fee_rate + stop * taker_fee
-        qty = round(risk_amt / (abs(entry - stop) + fee_per_unit), 8)
-        f['qty'] = qty
+        rr       = float(shared.get('rr_ratio', 2.0) or 2.0)
+        side_dir = f.get('side', 'long')
 
-        # Auto-calculate fee-aware R:R target
-        rr   = float(shared.get('rr_ratio', 2.0) or 2.0)
-        side = f.get('side', 'long')
-        if rr > 0 and qty > 0:
-            if side == 'long':
-                denom = qty * (1.0 - taker_fee)
-                auto_tgt = round(
-                    (rr * risk_amt + entry * qty * (1.0 + entry_fee_rate)) / denom, 6
-                ) if denom > 0 else 0.0
-            else:
-                denom = qty * (1.0 + taker_fee)
-                auto_tgt = round(
-                    (entry * qty * (1.0 - entry_fee_rate) - rr * risk_amt) / denom, 6
-                ) if denom > 0 else 0.0
-            if auto_tgt > 0 and f.get('target_auto', True):
-                f['target_price'] = auto_tgt
-                f['target_auto']  = True   # remains auto-calculated
-                tgt_ref = refs.get('tgt_inp')
-                if tgt_ref:
-                    try:
-                        tgt_ref.set_value(auto_tgt)
-                    except Exception:
-                        pass
+        if not f.get('stop_auto', True) and stop > 0 and abs(entry - stop) > 0:
+            # ── Stop manually set → qty + optional auto-target ─────────────────────
+            fee_unit = entry * entry_fee_rate + stop * taker_fee
+            qty      = round(risk_amt / (abs(entry - stop) + fee_unit), 8)
+            f['qty'] = qty
 
-    elif (f.get('qty_mode') == 'risk'
-          and entry > 0 and target > 0 and stop <= 0
-          and f.get('stop_auto', True)          # don't override manually edited stop
-          and abs(entry - target) > 0):
-        # ── Target-first: derive stop from R:R inverse, then compute qty ────────
-        rr   = float(shared.get('rr_ratio', 2.0) or 2.0)
-        side = f.get('side', 'long')
-        if rr > 0:
+            if rr > 0 and f.get('target_auto', True):
+                # Per-unit formula (qty cancels, numerically stable):
+                # long:  target = (entry*(1+ef) + rr*risk_pu) / (1-tf)
+                # short: target = (entry*(1-ef) - rr*risk_pu) / (1+tf)
+                risk_pu  = (entry - stop if side_dir == 'long' else stop - entry) + fee_unit
+                if side_dir == 'long':
+                    auto_tgt = (entry * (1 + entry_fee_rate) + rr * risk_pu) / (1 - taker_fee)
+                else:
+                    auto_tgt = (entry * (1 - entry_fee_rate) - rr * risk_pu) / (1 + taker_fee)
+                if auto_tgt > 0:
+                    f['target_price'] = round(auto_tgt, 6)
+                    f['target_auto']  = True
+                    tgt_ref = refs.get('tgt_inp')
+                    if tgt_ref:
+                        try: tgt_ref.set_value(round(auto_tgt, 6))
+                        except Exception: pass
+
+        elif f.get('stop_auto', True) and target > 0 and abs(entry - target) > 0:
+            # ── No manual stop, target set → derive stop from R:R inverse ────────
+            # Works even when a previous auto-stop > 0 (stop_auto=True = safe to override)
             auto_stop = 0.0
-            if side == 'long':
-                # net reward per unit (fee-adjusted)
-                reward_pu = target * (1.0 - taker_fee) - entry * (1.0 + entry_fee_rate)
-                denom     = 1.0 - taker_fee
-                if reward_pu > 0 and denom > 0:
-                    # stop = (entry*(1+ef) - reward_pu/rr) / (1 - tf)
-                    auto_stop = (entry * (1.0 + entry_fee_rate) - reward_pu / rr) / denom
-                    if not (0 < auto_stop < entry):
-                        auto_stop = 0.0   # invalid for long
-            else:
-                # net reward per unit (fee-adjusted, short)
-                reward_pu = entry * (1.0 - entry_fee_rate) - target * (1.0 + taker_fee)
-                denom     = 1.0 + taker_fee
-                if reward_pu > 0 and denom > 0:
-                    # stop = (entry*(1-ef) + reward_pu/rr) / (1 + tf)
-                    auto_stop = (entry * (1.0 - entry_fee_rate) + reward_pu / rr) / denom
-                    if not (auto_stop > entry):
-                        auto_stop = 0.0   # invalid for short
+            if rr > 0:
+                if side_dir == 'long':
+                    reward_pu = target * (1 - taker_fee) - entry * (1 + entry_fee_rate)
+                    if reward_pu > 0:
+                        auto_stop = ((entry * (1 + entry_fee_rate) - reward_pu / rr)
+                                     / (1 - taker_fee))
+                        if not (0 < auto_stop < entry): auto_stop = 0.0
+                else:
+                    reward_pu = entry * (1 - entry_fee_rate) - target * (1 + taker_fee)
+                    if reward_pu > 0:
+                        auto_stop = ((entry * (1 - entry_fee_rate) + reward_pu / rr)
+                                     / (1 + taker_fee))
+                        if not (auto_stop > entry): auto_stop = 0.0
 
             if auto_stop > 0:
                 f['stop_price'] = round(auto_stop, 6)
-                f['stop_auto']  = True   # auto-calculated, not manually edited
+                f['stop_auto']  = True
                 stop_ref = refs.get('stop_inp')
                 if stop_ref:
-                    try:
-                        stop_ref.set_value(round(auto_stop, 6))
-                    except Exception:
-                        pass
-                # Now compute qty with the derived stop
-                fee_per_unit = entry * entry_fee_rate + auto_stop * taker_fee
-                risk_amt     = balance * (shared.get('risk_pct', 0.5) / 100)
-                qty          = round(risk_amt / (abs(entry - auto_stop) + fee_per_unit), 8)
-                f['qty']     = qty
+                    try: stop_ref.set_value(round(auto_stop, 6))
+                    except Exception: pass
+                fee_unit = entry * entry_fee_rate + auto_stop * taker_fee
+                qty      = round(risk_amt / (abs(entry - auto_stop) + fee_unit), 8)
+                f['qty'] = qty
+            else:
+                f['qty'] = 0.0
+
+        else:
+            f['qty'] = 0.0
 
     elif f.get('qty_mode') == 'risk':
         f['qty'] = 0.0

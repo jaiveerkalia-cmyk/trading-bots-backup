@@ -341,11 +341,16 @@ class LogicEngine:
     def check_triggers(self):
         if not self.trading_active: return
         now = datetime.now(); idx_ltp = shared_state[params['trading_index']]['ltp']
-        is_new_min = now.second < 5; curr_min = now.minute
-        fire_1m = is_new_min and self.last_trigger_time['1m'] != curr_min
-        fire_5m = is_new_min and (curr_min % 5 == 0) and self.last_trigger_time['5m'] != curr_min
-        fire_15m = is_new_min and (curr_min % 15 == 0) and self.last_trigger_time['15m'] != curr_min
-        fire_60m = is_new_min and (curr_min == 0) and self.last_trigger_time['60m'] != curr_min
+        # Strict candle-close timing: fire exactly once per minute-boundary crossing (no
+        # second-based grace window). More precise (no longer fires anywhere in a 0-4 second
+        # window after the minute rolls over) AND more robust (can't be missed even if a tick
+        # runs long, since it compares "have we already processed this minute" not "are we
+        # within a narrow second window").
+        curr_min = now.minute
+        fire_1m = self.last_trigger_time['1m'] != curr_min
+        fire_5m = (curr_min % 5 == 0) and self.last_trigger_time['5m'] != curr_min
+        fire_15m = (curr_min % 15 == 0) and self.last_trigger_time['15m'] != curr_min
+        fire_60m = (curr_min == 0) and self.last_trigger_time['60m'] != curr_min
 
         # 15:19 Auto-Squareoff (SAVES PNL)
         if now.time() >= AUTO_SQUAREOFF_TIME and now.time() < dtime(15, 20) and not shared_state['auto_sq_done']:
