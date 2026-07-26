@@ -23,9 +23,6 @@ FORCE_EXIT_TIME = dtime(23, 59)
 AUTO_SQUAREOFF_TIME = dtime(15, 19)
 
 # --- ALERT SOUND LIBRARY ---
-# Reuses the same known-good sound URLs already used elsewhere in the app (open/close/error),
-# plus a few louder alarm-style additions, exposed as user-selectable named options for the
-# shared Alert Sound Profile panel.
 ALERT_SOUND_URLS = {
     'Wood Plank': 'https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg',
     'Pop': 'https://actions.google.com/sounds/v1/cartoon/pop.ogg',
@@ -37,8 +34,6 @@ ALERT_SOUND_URLS = {
 }
 
 # --- ALERT SOUND PROFILE PERSISTENCE ---
-# Saved to disk (not just in-memory params) so the chosen sound+duration survives page
-# reloads, worker restarts, and full script restarts.
 def load_alert_profile():
     try:
         with open(ALERT_PROFILE_FILE, 'r') as f:
@@ -83,9 +78,6 @@ shared_state = {
     'sound_queue': [],
     'toast_queue': [],
 
-    # Live diagnostic snapshot for armed unified triggers, overwritten every check_triggers()
-    # tick (not appended/logged, so it can never grow or spam the activity log). Read by the
-    # Order Book UI to show exactly what's being compared for a pending Limit/Stop-Market order.
     'unified_debug': {'Call': None, 'Put': None},
 }
 
@@ -110,8 +102,6 @@ ui_refs = {
     'monitor_status': None, 'calc_qty': None, 'log_panel': None,
     'call_orderbook_debug': None, 'put_orderbook_debug': None,
 
-    # New "OPEN POSITIONS" table row refs (dark-themed section, separate from the banner
-    # CALL/PUT POSITION cards above; populated each tick in auto_run.py's update_ui()).
     'open_positions_count': None,
     'call_pos_row': None, 'call_pos_symbol': None, 'call_pos_mark': None, 'call_pos_size': None,
     'call_pos_pnl': None, 'call_pos_entry': None, 'call_pos_qty': None,
@@ -130,10 +120,8 @@ UI_OPTS = {
     'index_times': ['Current', '5m', '1m'],
     'toggles': ['Yes', 'No'],
     'on_off': ['On', 'Off'],
-    # Unified Open Short/Long card options (order type + fire-on timeframe)
     'order_types': ['Market', 'Limit', 'Stop-Market'],
     'fire_on_opts': ['Live', '1m', '5m', '15m', '60m'],
-    # Alert sound options (shared Alert Sound Profile panel)
     'alert_sounds': list(ALERT_SOUND_URLS.keys()),
 }
 
@@ -142,11 +130,14 @@ params = {
     'trading_index': 'NIFTY', 'lots': 4, 'live_trading': 'Off', 'mute_sound': False,
     'hedgeless_mode': True,
 
-    # Independent Auto Close Flags
+    # Options Buy Mode: global toggle. True = whole bot buys (Call=buy CE, Put=buy PE),
+    # always hedgeless. Guarded in auto_run.py: blocked while any position open, mutually
+    # exclusive with Auto Pilot. Default False = identical to prior selling-only behavior.
+    'options_buy_mode': False,
+
     'call_target_active': False, 'call_stop_active': False,
     'put_target_active': False, 'put_stop_active': False,
 
-    # Independent Auto Close Values
     'call_target_val': 0, 'call_stop_val': 0,
     'put_target_val': 0, 'put_stop_val': 0,
 
@@ -161,9 +152,6 @@ params = {
     'alert_upper': 0, 'alert_lower': 0,
     'alert_upper_active': False, 'alert_lower_active': False,
 
-    # Upper/Lower alert cards: independent threshold + period. Sound + duration are now a
-    # single shared profile (see render_alert_sound_panel in ui_components.py), loaded here
-    # from disk so it survives reloads/restarts; both sides start out identical.
     'alert_upper_period': 'Current', 'alert_lower_period': 'Current',
     'alert_upper_sound': _saved_alert_sound, 'alert_lower_sound': _saved_alert_sound,
     'alert_upper_duration': _saved_alert_duration, 'alert_lower_duration': _saved_alert_duration,
@@ -176,16 +164,12 @@ params = {
     'put_index_stop_val': 0, 'put_index_stop_time': 'Current', 'put_index_stop_active': False,
     'put_index_target_val': 0, 'put_index_target_time': 'Current', 'put_index_tgt_active': False,
 
-    # Premium exit params
     'call_prem_stop_val': 0, 'call_prem_stop_time': 'Current', 'call_prem_stop_active': False,
     'call_prem_target_val': 0, 'call_prem_target_time': 'Current', 'call_prem_tgt_active': False,
 
     'put_prem_stop_val': 0, 'put_prem_stop_time': 'Current', 'put_prem_stop_active': False,
     'put_prem_target_val': 0, 'put_prem_target_time': 'Current', 'put_prem_tgt_active': False,
 
-    # --- Unified Open Short/Long cards (index-based, single-step order entry) ---
-    # order_type: Market fires immediately. Limit/Stop-Market check trigger_price against
-    # index price on the fire_on timeframe, then fire a market order for the option leg.
     'call_order_type': 'Market', 'call_trigger_price': 0, 'call_strike_offset': 1,
     'call_fire_on': 'Live', 'call_qty': 4, 'call_armed': False,
     'call_new_stop': '', 'call_new_target': '',

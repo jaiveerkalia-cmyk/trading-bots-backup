@@ -76,24 +76,34 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
             ).props('dense dark outlined').classes('w-full')
         refs['entry_inp'] = entry_inp
 
-        # Stop / Target
+        # Stop / Target — auto-derive whichever is empty from the other + R:R
+        def _on_stop_change(e) -> None:
+            val  = float(e.value or 0)
+            last = refs.get('_last_auto_stop')
+            if last is not None and abs(val - last) < 1e-6:
+                return  # echo of our own programmatic set_value, not a real edit
+            f.update({'stop_price': val, 'stop_auto': False})
+            _recalc(f, shared, refs, state)
+
+        def _on_tgt_change(e) -> None:
+            val  = float(e.value or 0)
+            last = refs.get('_last_auto_target')
+            if last is not None and abs(val - last) < 1e-6:
+                return  # echo of our own programmatic set_value, not a real edit
+            f.update({'target_price': val, 'target_auto': False})
+            _recalc(f, shared, refs, state)
+
         with ui.row().classes('w-full gap-2 mb-2'):
             stop_inp = ui.number(
                 label='Stop', value=None, min=0,
-                on_change=lambda e: (
-                    f.update({'stop_price': float(e.value or 0), 'stop_auto': False}),
-                    _recalc(f, shared, refs, state),
-                ),
+                on_change=_on_stop_change,
             ).props('dense dark outlined').classes('flex-1')
             refs['stop_inp'] = stop_inp
 
             tgt_inp = ui.number(
                 label='Target (opt)', value=None, min=0,
-                on_change=lambda e: (
-                    f.update({'target_price': float(e.value or 0), 'target_auto': False}),
-                    _recalc(f, shared, refs, state),
-                ),
-            ).props('dense dark outlined debounce=600').classes('flex-1')
+                on_change=_on_tgt_change,
+            ).props('dense dark outlined').classes('flex-1')
             refs['tgt_inp'] = tgt_inp
 
         # Margin mode
@@ -251,57 +261,59 @@ def _recalc(f: dict, shared: dict, refs: dict, state) -> None:
         rr       = float(shared.get('rr_ratio', 2.0) or 2.0)
         side_dir = f.get('side', 'long')
 
-        if not f.get('stop_auto', True) and stop > 0 and abs(entry - stop) > 0:
-            # ── Stop manually set → qty + optional auto-target ─────────────────────
-            fee_unit = entry * entry_fee_rate + stop * taker_fee
-            qty      = round(risk_amt / (abs(entry - stop) + fee_unit), 8)
-            f['qty'] = qty
+        def _loss_pu(sp: float) -> float:
+            return (entry * (1 + entry_fee_rate) - sp * (1 - taker_fee) if side_dir == 'long'
+                    else sp * (1 + taker_fee) - entry * (1 - entry_fee_rate))
 
-            if rr > 0 and f.get('target_auto', True):
-                # Per-unit formula (qty cancels, numerically stable):
-                # long:  target = (entry*(1+ef) + rr*risk_pu) / (1-tf)
-                # short: target = (entry*(1-ef) - rr*risk_pu) / (1+tf)
-                risk_pu  = (entry - stop if side_dir == 'long' else stop - entry) + fee_unit
-                if side_dir == 'long':
-                    auto_tgt = (entry * (1 + entry_fee_rate) + rr * risk_pu) / (1 - taker_fee)
-                else:
-                    auto_tgt = (entry * (1 - entry_fee_rate) - rr * risk_pu) / (1 + taker_fee)
+        def _reward_pu(tp: float) -> float:
+            return (tp * (1 - taker_fee) - entry * (1 + entry_fee_rate) if side_dir == 'long'
+                    else entry * (1 - entry_fee_rate) - tp * (1 + taker_fee))
+
+        valid_stop = (side_dir == 'long' and 0 < stop < entry and (entry - stop) / entry <= 0.5) or \
+                     (side_dir == 'short' and stop > entry > 0 and (stop - entry) / entry <= 0.5)
+
+        if not f.get('stop_auto', True) and valid_stop:
+            # ── Stop manually set → qty + optional auto-target ──────────
+            loss_pu  = _loss_pu(stop)
+            f['qty'] = round(risk_amt / loss_pu, 8) if loss_pu > 0 else 0.0
+
+            if rr > 0 and loss_pu > 0 and f.get('target_auto', True):
+                auto_tgt = ((entry * (1 + entry_fee_rate) + rr * loss_pu) / (1 - taker_fee)
+                            if side_dir == 'long' else
+                            (entry * (1 - entry_fee_rate) - rr * loss_pu) / (1 + taker_fee))
                 if auto_tgt > 0:
                     f['target_price'] = round(auto_tgt, 6)
                     f['target_auto']  = True
                     tgt_ref = refs.get('tgt_inp')
                     if tgt_ref:
+                        refs['_last_auto_target'] = round(auto_tgt, 6)
                         try: tgt_ref.set_value(round(auto_tgt, 6))
                         except Exception: pass
 
-        elif f.get('stop_auto', True) and target > 0 and abs(entry - target) > 0:
-            # ── No manual stop, target set → derive stop from R:R inverse ────────
-            # Works even when a previous auto-stop > 0 (stop_auto=True = safe to override)
+        elif f.get('stop_auto', True) and target > 0 and entry > 0:
+            # ── No manual stop, target set → derive stop from R:R inverse ──
             auto_stop = 0.0
             if rr > 0:
-                if side_dir == 'long':
-                    reward_pu = target * (1 - taker_fee) - entry * (1 + entry_fee_rate)
-                    if reward_pu > 0:
-                        auto_stop = ((entry * (1 + entry_fee_rate) - reward_pu / rr)
-                                     / (1 - taker_fee))
-                        if not (0 < auto_stop < entry): auto_stop = 0.0
-                else:
-                    reward_pu = entry * (1 - entry_fee_rate) - target * (1 + taker_fee)
-                    if reward_pu > 0:
-                        auto_stop = ((entry * (1 - entry_fee_rate) + reward_pu / rr)
-                                     / (1 + taker_fee))
-                        if not (auto_stop > entry): auto_stop = 0.0
+                reward_pu = _reward_pu(target)
+                if reward_pu > 0:
+                    auto_stop = ((entry * (1 + entry_fee_rate) - reward_pu / rr) / (1 - taker_fee)
+                                 if side_dir == 'long' else
+                                 (entry * (1 - entry_fee_rate) + reward_pu / rr) / (1 + taker_fee))
+                    ok = ((0 < auto_stop < entry and (entry - auto_stop) / entry <= 0.5) if side_dir == 'long'
+                          else (auto_stop > entry and (auto_stop - entry) / entry <= 0.5))
+                    if not ok:
+                        auto_stop = 0.0
 
             if auto_stop > 0:
                 f['stop_price'] = round(auto_stop, 6)
                 f['stop_auto']  = True
                 stop_ref = refs.get('stop_inp')
                 if stop_ref:
+                    refs['_last_auto_stop'] = round(auto_stop, 6)
                     try: stop_ref.set_value(round(auto_stop, 6))
                     except Exception: pass
-                fee_unit = entry * entry_fee_rate + auto_stop * taker_fee
-                qty      = round(risk_amt / (abs(entry - auto_stop) + fee_unit), 8)
-                f['qty'] = qty
+                loss_pu  = _loss_pu(auto_stop)
+                f['qty'] = round(risk_amt / loss_pu, 8) if loss_pu > 0 else 0.0
             else:
                 f['qty'] = 0.0
 
@@ -350,6 +362,8 @@ def _clear(f: dict, refs: dict) -> None:
     f.update({'entry_price': 0.0, 'stop_price': 0.0, 'target_price': 0.0,
               'qty': 0.0, 'fire_on': 'current',
               'target_auto': True, 'stop_auto': True})
+    refs['_last_auto_target'] = 0.0
+    refs['_last_auto_stop']   = 0.0
     for k in ('entry_inp', 'stop_inp', 'tgt_inp', 'qty_inp'):
         if refs.get(k):
             try:
@@ -391,15 +405,7 @@ async def _place(side: str, f: dict, shared: dict,
 
     if order_type == 'market':
         entry = ref_price
-        if f.get('qty_mode') == 'risk' and entry and stop and abs(entry - stop) > 0:
-            exchange     = shared.get('exchange', 'binance_futures')
-            balance      = max(shared.get('balance', 0), 1)
-            mf, tf       = _fees(exchange)
-            fee_per_unit = entry * tf + stop * tf
-            f['qty']     = round(
-                (balance * (shared.get('risk_pct', 0.5) / 100))
-                / (abs(entry - stop) + fee_per_unit), 8
-            )
+        # qty already kept current by _recalc() on every tick (see update()); no recompute here
     else:
         entry = f.get('entry_price', 0) or 0
 
