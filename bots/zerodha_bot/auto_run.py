@@ -331,6 +331,7 @@ class AutoController:
             params['call_prem_target_val'] = 0; params['call_prem_tgt_active'] = False
             # Unified Open Short card
             params['call_armed'] = False; params['call_trigger_price'] = 0
+            params['call_armed_at'] = None
             params['call_new_stop'] = ''; params['call_new_target'] = ''
         elif side == 'Put':
             params['put_target_val'] = 0; params['put_target_active'] = False
@@ -344,6 +345,7 @@ class AutoController:
             params['put_prem_target_val'] = 0; params['put_prem_tgt_active'] = False
             # Unified Open Long card
             params['put_armed'] = False; params['put_trigger_price'] = 0
+            params['put_armed_at'] = None
             params['put_new_stop'] = ''; params['put_new_target'] = ''
 
     def sync_ui_parameters(self):
@@ -480,6 +482,14 @@ class AutoController:
     def run_loop(self):
         now = datetime.now()
         ts = now.strftime('%H:%M:%S')
+
+        # 0. DEFENSIVE GUARD: Auto Pilot must never act while Options Buy Mode is on. The UI
+        # blocks turning either one on while the other is active, but this check protects
+        # against any edge case (e.g. stale .automode_state on restart, or a race between the
+        # two toggles) where mode could end up 'ON' anyway -- Auto Pilot's sell-only
+        # strike/trailing/commission logic must never run against Buy Mode positions.
+        if params.get('options_buy_mode', False):
+            return
 
         # 1. PRIORITY: GLOBAL EOD ROUTINE
         if AutoConfig.SQ_OFF_TIME <= now.time() < dtime(15, 40):
@@ -898,9 +908,15 @@ def update_ui():
     if idx in INDICES and ui_refs.get('calc_qty'): 
         ui_refs['calc_qty'].set_text(f"(Qty: {int(params['lots']) * INDICES[idx]['lot_size']})")
 
+    # Buy Mode badge suffix: shows BUY on positions opened while Options Buy Mode is on,
+    # driven by the trade's own recorded direction (not the live toggle), so history stays
+    # correct even if the mode is switched back after the position closes.
     tc = shared_state['active_trades']['Call']
     if tc:
-        ui_refs['call_status'].set_text('OPEN'); ui_refs['call_status'].classes(replace='text-[10px] font-bold text-white bg-red-600 px-2 rounded animate-pulse')
+        is_buy_c = tc.get('direction', 'SELL') == 'BUY'
+        status_txt = 'OPEN (BUY)' if is_buy_c else 'OPEN'
+        status_cls = 'text-[10px] font-bold text-white bg-blue-600 px-2 rounded animate-pulse' if is_buy_c else 'text-[10px] font-bold text-white bg-red-600 px-2 rounded animate-pulse'
+        ui_refs['call_status'].set_text(status_txt); ui_refs['call_status'].classes(replace=status_cls)
         ui_refs['call_info'].set_text(f"Time: {tc['entry_time']}"); ui_refs['call_trigger'].set_text(f"Trig: {tc['trigger']}")
         ui_refs['call_main_strike'].set_text(f"M ({tc['main']['strike']})")
         ui_refs['call_main_open'].set_text(f"{tc['main']['entry_price']:.1f}")
@@ -928,7 +944,10 @@ def update_ui():
     
     tp = shared_state['active_trades']['Put']
     if tp:
-        ui_refs['put_status'].set_text('OPEN'); ui_refs['put_status'].classes(replace='text-[10px] font-bold text-white bg-green-600 px-2 rounded animate-pulse')
+        is_buy_p = tp.get('direction', 'SELL') == 'BUY'
+        status_txt_p = 'OPEN (BUY)' if is_buy_p else 'OPEN'
+        status_cls_p = 'text-[10px] font-bold text-white bg-blue-600 px-2 rounded animate-pulse' if is_buy_p else 'text-[10px] font-bold text-white bg-green-600 px-2 rounded animate-pulse'
+        ui_refs['put_status'].set_text(status_txt_p); ui_refs['put_status'].classes(replace=status_cls_p)
         ui_refs['put_info'].set_text(f"Time: {tp['entry_time']}"); ui_refs['put_trigger'].set_text(f"Trig: {tp['trigger']}")
         ui_refs['put_main_strike'].set_text(f"M ({tp['main']['strike']})")
         ui_refs['put_main_open'].set_text(f"{tp['main']['entry_price']:.1f}")
@@ -959,7 +978,8 @@ def update_ui():
     if tc and ui_refs.get('call_pos_symbol'):
         open_count += 1
         strike = tc['main']['strike']; mark = tc['main']['current_price']; entry = tc['main']['entry_price']
-        ui_refs['call_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} CE")
+        dir_suffix_c = ' (BUY)' if tc.get('direction', 'SELL') == 'BUY' else ''
+        ui_refs['call_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} CE{dir_suffix_c}")
         ui_refs['call_pos_mark'].set_text(f"{mark:.2f}")
         ui_refs['call_pos_size'].set_text(f"{tc['qty']}")
         ui_refs['call_pos_entry'].set_text(f"{entry:.2f}")
@@ -967,11 +987,20 @@ def update_ui():
         c = 'text-green-600' if tc['pnl'] >= 0 else 'text-red-600'
         ui_refs['call_pos_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
         ui_refs['call_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
+        # Side badge (fixes: previously hardcoded to always say 'SHORT' regardless of mode).
+        if ui_refs.get('call_pos_side_label'):
+            if tc.get('direction', 'SELL') == 'BUY':
+                ui_refs['call_pos_side_label'].set_text('BUY')
+                ui_refs['call_pos_side_label'].classes(replace='bg-blue-100 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded')
+            else:
+                ui_refs['call_pos_side_label'].set_text('SHORT')
+                ui_refs['call_pos_side_label'].classes(replace='bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
 
     if tp and ui_refs.get('put_pos_symbol'):
         open_count += 1
         strike = tp['main']['strike']; mark = tp['main']['current_price']; entry = tp['main']['entry_price']
-        ui_refs['put_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} PE")
+        dir_suffix_p = ' (BUY)' if tp.get('direction', 'SELL') == 'BUY' else ''
+        ui_refs['put_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} PE{dir_suffix_p}")
         ui_refs['put_pos_mark'].set_text(f"{mark:.2f}")
         ui_refs['put_pos_size'].set_text(f"{tp['qty']}")
         ui_refs['put_pos_entry'].set_text(f"{entry:.2f}")
@@ -979,6 +1008,14 @@ def update_ui():
         c = 'text-green-600' if tp['pnl'] >= 0 else 'text-red-600'
         ui_refs['put_pos_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
         ui_refs['put_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
+        # Side badge (fixes: previously hardcoded to always say 'SHORT' regardless of mode).
+        if ui_refs.get('put_pos_side_label'):
+            if tp.get('direction', 'SELL') == 'BUY':
+                ui_refs['put_pos_side_label'].set_text('BUY')
+                ui_refs['put_pos_side_label'].classes(replace='bg-blue-100 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded')
+            else:
+                ui_refs['put_pos_side_label'].set_text('SHORT')
+                ui_refs['put_pos_side_label'].classes(replace='bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
 
     if ui_refs.get('open_positions_count'):
         ui_refs['open_positions_count'].set_text(f"{open_count} position{'s' if open_count != 1 else ''}")
@@ -1021,9 +1058,20 @@ def custom_render_master_banner(update_lots_callback):
                 with ui.column().classes('gap-0'):
                     ui.label('HEDGELESS').classes('font-bold text-purple-900 text-[10px] leading-none')
                     ui.label('No hedge buy').classes('text-[8px] font-mono text-purple-600 leading-none')
-                ui.toggle(['On', 'Off'], value='On' if params['hedgeless_mode'] else 'Off',
+                # Disabled (greyed) whenever Options Buy Mode is on, since Buy Mode is always
+                # hedgeless -- keeps the banner from looking contradictory. bind_enabled_from
+                # reads a boolean, so it's inverted via a tiny backward transform.
+                hedgeless_toggle = ui.toggle(['On', 'Off'], value='On' if params['hedgeless_mode'] else 'Off',
                     on_change=lambda e: params.update({'hedgeless_mode': e.value == 'On'})
                 ).props('dense').classes('text-xs')
+                hedgeless_toggle.bind_enabled_from(params, 'options_buy_mode', backward=lambda v: not v)
+            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
+                with ui.column().classes('gap-0'):
+                    ui.label('OPTIONS BUY MODE').classes('font-bold text-indigo-900 text-[10px] leading-none')
+                    ui.label('Buy CE/PE, no hedge').classes('text-[8px] font-mono text-indigo-600 leading-none')
+                ui.toggle(['On', 'Off'], value='On' if params['options_buy_mode'] else 'Off',
+                    on_change=on_buy_mode_change
+                ).props('dense color=indigo').classes('text-xs')
 
         with ui.card().classes('w-full p-1 px-3 bg-gray-100 border-t border-gray-300 rounded-none'):
             with ui.row().classes('items-center gap-2'):
@@ -1126,7 +1174,15 @@ def on_auto_mode_change(e):
     ts = datetime.now().strftime('%Y-%m-%d (%a) %H:%M:%S')
     now = datetime.now()
     is_weekend = now.weekday() in [5, 6]
-    
+
+    # Auto Pilot remains sell-only. Block turning it ON while Options Buy Mode is active, so
+    # its sell-side assumptions (ITM strike selection, trailing, commission usage) never fire
+    # trades while the bot is conceptually in buy mode.
+    if e.value == 'ON' and params.get('options_buy_mode', False):
+        controller.mode = 'OFF'
+        ui.notify("Auto Pilot is Sell-Mode-only. Turn off Options Buy Mode first.", type='negative')
+        return
+
     if e.value == 'OFF':
         controller.clear_leg_fields('Call')
         controller.clear_leg_fields('Put')
@@ -1159,6 +1215,30 @@ def on_auto_mode_change(e):
              ui.notify("Auto Mode ON (Saved for Tomorrow)")
         else:
              ui.notify("Auto Mode ON")
+
+def on_buy_mode_change(e):
+    """Toggles Options Buy Mode. Blocked while any position is open (safest: avoids a live
+    position's exit logic disagreeing with the global mode mid-trade) and mutually exclusive
+    with Auto Pilot (which remains sell-only)."""
+    turning_on = (e.value == 'On')
+
+    if turning_on:
+        if shared_state['active_trades']['Call'] is not None or shared_state['active_trades']['Put'] is not None:
+            params['options_buy_mode'] = False
+            e.sender.value = 'Off'
+            ui.notify("Close open positions before switching to Options Buy Mode.", type='negative')
+            return
+        if controller.is_active:
+            params['options_buy_mode'] = False
+            e.sender.value = 'Off'
+            ui.notify("Turn off Auto Pilot before switching to Options Buy Mode.", type='negative')
+            return
+        params['options_buy_mode'] = True
+        params['hedgeless_mode'] = True
+        ui.notify("Options Buy Mode ON: Call=Buy CE, Put=Buy PE, always hedgeless.", type='warning')
+    else:
+        params['options_buy_mode'] = False
+        ui.notify("Options Buy Mode OFF: back to option selling.", type='info')
 
 def handle_open(side):
     s, m = logic.open_position(side); ui.notify(m, type='positive' if s else 'negative')

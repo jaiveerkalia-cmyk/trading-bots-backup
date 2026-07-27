@@ -10,7 +10,7 @@ class CsvManager:
     def __init__(self): self.init_files()
     def init_files(self):
         if not os.path.exists(TRADEBOOK_FILE):
-            cols = ['Trade_ID', 'Date', 'Index_Type', 'Expiry', 'Type', 'Qty', 'Main_Strike', 'Hedge_Strike', 'Open_Main_Price', 'Open_Hedge_Price', 'Open_Index_Price', 'Open_Time', 'Close_Main_Price', 'Close_Hedge_Price', 'Close_Index_Price', 'Close_Time', 'Profit', 'Status']
+            cols = ['Trade_ID', 'Date', 'Index_Type', 'Expiry', 'Type', 'Direction', 'Qty', 'Main_Strike', 'Hedge_Strike', 'Open_Main_Price', 'Open_Hedge_Price', 'Open_Index_Price', 'Open_Time', 'Close_Main_Price', 'Close_Hedge_Price', 'Close_Index_Price', 'Close_Time', 'Profit', 'Status']
             pd.DataFrame(columns=cols).to_csv(TRADEBOOK_FILE, index=False)
         if not os.path.exists(DAILY_PNL_FILE):
             cols = ['Date', 'Net_Profit', 'Trade_Num', 'Trades_List']
@@ -23,7 +23,7 @@ class CsvManager:
         hedge_entry  = trade_data['hedge']['entry_price'] if trade_data['hedge'] else 0
         new_row = pd.DataFrame([{
             'Trade_ID': str(trade_id), 'Date': datetime.now().strftime('%Y-%m-%d'), 'Index_Type': params['trading_index'], 'Expiry': str(expiry),
-            'Type': trade_data['type'], 'Qty': int(trade_data['qty']), 'Main_Strike': float(trade_data['main']['strike']), 'Hedge_Strike': float(hedge_strike),
+            'Type': trade_data['type'], 'Direction': trade_data.get('direction', 'SELL'), 'Qty': int(trade_data['qty']), 'Main_Strike': float(trade_data['main']['strike']), 'Hedge_Strike': float(hedge_strike),
             'Open_Main_Price': float(trade_data['main']['entry_price']), 'Open_Hedge_Price': float(hedge_entry), 'Open_Index_Price': float(trade_data['index_entry_price']),
             'Open_Time': datetime.now().strftime('%H:%M:%S'), 'Close_Main_Price': 0.0, 'Close_Hedge_Price': 0.0, 'Close_Index_Price': 0.0, 'Close_Time': 'Active', 'Profit': 0.0, 'Status': 'OPEN'
         }])
@@ -134,7 +134,9 @@ class LogicEngine:
         index_name = params['trading_index']; index_ltp = shared_state[index_name]['ltp']
         step = INDICES[index_name]['step']; lot_size = INDICES[index_name]['lot_size']
         segment = INDICES[index_name]['segment']
-        hedgeless = params.get('hedgeless_mode', False)
+        buy_mode = params.get('options_buy_mode', False)
+        # Buy Mode is always hedgeless (enforced here defensively too, not just in the UI guard).
+        hedgeless = True if buy_mode else params.get('hedgeless_mode', False)
 
         if index_ltp == 0: return False, "Index Price 0"
         if shared_state['active_trades'][side] is not None: return False, "Position Open"
@@ -163,9 +165,11 @@ class LogicEngine:
         kite = self.inst_manager.kite
 
         if hedgeless:
-            # Hedgeless: only place sell on main, no hedge lookup or order
+            # Hedgeless: only place one order on main (SELL when option-selling, BUY when
+            # Options Buy Mode is on), no hedge lookup or order either way.
+            main_txn = kite.TRANSACTION_TYPE_BUY if buy_mode else kite.TRANSACTION_TYPE_SELL
             if params['live_trading'] == 'On':
-                if not self._place_live_order(main_symbol, kite.TRANSACTION_TYPE_SELL, qty, kite.PRODUCT_MIS, segment):
+                if not self._place_live_order(main_symbol, main_txn, qty, kite.PRODUCT_MIS, segment):
                     return False, "Main Fail"
 
             self.ticker.subscribe_new([main_token])
@@ -175,7 +179,7 @@ class LogicEngine:
             m_pr = shared_state['option_chain'][main_token]['ltp']
             trade_id = str(uuid.uuid4())[:8]
             trade = {
-                'id': trade_id, 'type': opt_type, 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
+                'id': trade_id, 'type': opt_type, 'direction': 'BUY' if buy_mode else 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
                 'index_entry_price': index_ltp, 'index_current_price': index_ltp, 'csv_synced': False,
                 'entry_time': datetime.now().strftime("%H:%M:%S"), 'trigger': reason,
                 'main': {'symbol': main_symbol, 'token': main_token, 'strike': main_strike, 'entry_price': m_pr, 'current_price': m_pr},
@@ -183,14 +187,16 @@ class LogicEngine:
             }
             shared_state['active_trades'][side] = trade
             self.csv_manager.log_open(trade_id, trade)
-            dtls = f"Idx: {index_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | HEDGELESS"
-            self.log_action(f"OPENED {side} HEDGELESS ({reason})", dtls)
+            mode_label = "BUY (Hedgeless)" if buy_mode else "HEDGELESS"
+            dtls = f"Idx: {index_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | {mode_label}"
+            self.log_action(f"OPENED {side} {mode_label} ({reason})", dtls)
             self.play_sound('open')
             self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
-            return True, f"Opened {side} (Hedgeless)"
+            return True, f"Opened {side} ({mode_label})"
 
         else:
-            # Normal mode: buy hedge + sell main
+            # Normal sell mode: buy hedge + sell main. (Not reachable when buy_mode is True,
+            # since hedgeless is forced True above in that case.)
             hedge_strike = main_strike + (10 * step) if side == 'Call' else main_strike - (10 * step)
             hedge_token, hedge_symbol = self.inst_manager.get_atm_token(index_name, hedge_strike, opt_type)
             if not hedge_token: return False, "Hedge Token Not Found"
@@ -209,7 +215,7 @@ class LogicEngine:
 
             trade_id = str(uuid.uuid4())[:8]
             trade = {
-                'id': trade_id, 'type': opt_type, 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
+                'id': trade_id, 'type': opt_type, 'direction': 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
                 'index_entry_price': index_ltp, 'index_current_price': index_ltp, 'csv_synced': False,
                 'entry_time': datetime.now().strftime("%H:%M:%S"), 'trigger': reason,
                 'main': {'symbol': main_symbol, 'token': main_token, 'strike': main_strike, 'entry_price': m_pr, 'current_price': m_pr},
@@ -228,15 +234,18 @@ class LogicEngine:
         if not trade: return False, "No Position"
         m = trade['main']
         h = trade['hedge']  # may be None in hedgeless mode
+        is_buy = trade.get('direction', 'SELL') == 'BUY'
 
         kite = self.inst_manager.kite
         segment = INDICES[params['trading_index']]['segment']
 
         if params['live_trading'] == 'On':
-            # Always cover the main (short) leg
-            if not self._place_live_order(m['symbol'], kite.TRANSACTION_TYPE_BUY, trade['qty'], kite.PRODUCT_MIS, segment):
+            # Cover the main leg: SELL to close if it was bought (Buy Mode), BUY to cover if
+            # it was sold (Sell Mode, existing behavior).
+            main_close_txn = kite.TRANSACTION_TYPE_SELL if is_buy else kite.TRANSACTION_TYPE_BUY
+            if not self._place_live_order(m['symbol'], main_close_txn, trade['qty'], kite.PRODUCT_MIS, segment):
                 return False, "Cover Fail"
-            # Only sell hedge if it exists
+            # Only sell hedge if it exists (never present in Buy Mode)
             if h:
                 time.sleep(1)
                 if not self._place_live_order(h['symbol'], kite.TRANSACTION_TYPE_SELL, trade['qty'], kite.PRODUCT_MIS, segment):
@@ -254,8 +263,14 @@ class LogicEngine:
             h_exit_price = h_curr
         else:
             h_curr = 0; h_entry = 0; h_exit_price = 0
-            net_pnl = (m_entry - m_curr) * trade['qty']
-            net_pnl -= self.commission(trade['qty'], m_curr, m_entry)
+            if is_buy:
+                # Bought main, now selling to close: profit as price rises.
+                net_pnl = (m_curr - m_entry) * trade['qty']
+                # commission(qty, buy_price, sell_price): entry was the buy leg, exit is the sell leg.
+                net_pnl -= self.commission(trade['qty'], m_entry, m_curr)
+            else:
+                net_pnl = (m_entry - m_curr) * trade['qty']
+                net_pnl -= self.commission(trade['qty'], m_curr, m_entry)
 
         shared_state['pnl']['realized'] += net_pnl
         shared_state['pnl']['trades_history'].append({'symbol': f"{m['symbol']}", 'pnl': round(net_pnl, 2), 'reason': reason})
@@ -313,6 +328,7 @@ class LogicEngine:
                 m_ltp = shared_state['option_chain'].get(trade['main']['token'], {}).get('ltp', 0)
                 trade['main']['current_price'] = m_ltp
                 if trade['main']['entry_price'] == 0 and m_ltp > 0: trade['main']['entry_price'] = m_ltp
+                is_buy = trade.get('direction', 'SELL') == 'BUY'
 
                 if trade['hedge']:
                     h_ltp = shared_state['option_chain'].get(trade['hedge']['token'], {}).get('ltp', 0)
@@ -326,12 +342,18 @@ class LogicEngine:
                     h_pnl = (h_ltp - trade['hedge']['entry_price']) * trade['qty'] if h_ltp > 0 else 0
                     trade['pnl'] = m_pnl + h_pnl
                 else:
-                    # Hedgeless: PnL is only from the short main leg
+                    # Hedgeless: PnL is only from the main leg. Direction determines sign:
+                    # SELL (existing) profits as price falls; BUY (Options Buy Mode) profits
+                    # as price rises.
                     if not trade['csv_synced'] and trade['main']['entry_price'] > 0:
+                        sync_label = "📝 Entry Price Confirmed (Buy Mode)" if is_buy else "📝 Entry Price Confirmed (Hedgeless)"
                         self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], 0, idx_ltp)
-                        self.log_action("📝 Entry Price Confirmed (Hedgeless)", f"M: {trade['main']['entry_price']:.2f}")
+                        self.log_action(sync_label, f"M: {trade['main']['entry_price']:.2f}")
                         trade['csv_synced'] = True
-                    m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
+                    if is_buy:
+                        m_pnl = (m_ltp - trade['main']['entry_price']) * trade['qty'] if m_ltp > 0 else 0
+                    else:
+                        m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
                     trade['pnl'] = m_pnl
 
                 unrealized += trade['pnl']
@@ -365,11 +387,11 @@ class LogicEngine:
 
         # Unified Open Short/Long cards (index-based, order-type + fire-on aware)
         if shared_state['active_trades']['Call'] is None and params.get('call_armed'):
-            self._check_unified_open('Call', idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+            self._check_unified_open('Call', now, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
         else:
             shared_state['unified_debug']['Call'] = None
         if shared_state['active_trades']['Put'] is None and params.get('put_armed'):
-            self._check_unified_open('Put', idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+            self._check_unified_open('Put', now, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
         else:
             shared_state['unified_debug']['Put'] = None
 
@@ -414,11 +436,25 @@ class LogicEngine:
                 params[f'{prefix}_trigger_active'] = False
                 self.play_sound('error')
 
-    def _check_unified_open(self, side, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m):
-        """Checks/fires the new unified Open Short/Long card (order type + fire-on timeframe)."""
+    def _check_unified_open(self, side, now, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m):
+        """Checks/fires the new unified Open Short/Long card (order type + fire-on timeframe).
+        Trigger direction depends on options_buy_mode: Sell Mode (existing) treats Call/Put as
+        short-bias reversal entries; Options Buy Mode treats Call as a bullish breakout-buy and
+        Put as a bearish breakdown-buy, so the Stop-Market/Limit comparisons flip.
+
+        Timing fix: fire_1m/5m/15m/60m are TRUE for the entire minute in which that boundary
+        was crossed (they only turn False again once check_triggers() has processed that
+        minute once for that timeframe). If a card is armed mid-way through a minute that
+        already satisfies the boundary (e.g. armed at 10:35:20 with fire_on='5m'), the very
+        next tick would see fire_5m=True and fire instantly -- one tick after arming, not
+        after waiting for the NEXT candle close as the trader intends. Fixed by stamping
+        params['{prefix}_armed_at'] with the datetime the card was armed (unified_entry_card /
+        MODIFY-CONFIRM in ui_components.py), and requiring 'now' to be strictly after that
+        timestamp AND in a later boundary-minute than when it was armed."""
         prefix = 'call' if side == 'Call' else 'put'
         order_type = params.get(f'{prefix}_order_type', 'Market')
         fire_on = params.get(f'{prefix}_fire_on', 'Live')
+        buy_mode = params.get('options_buy_mode', False)
 
         raw_trigger = params.get(f'{prefix}_trigger_price', 0)
         try: trigger_price = float(raw_trigger)
@@ -428,12 +464,19 @@ class LogicEngine:
         try: qty = int(float(params.get(f'{prefix}_qty', 4)))
         except (ValueError, TypeError): qty = 4
 
-        # Gate by the selected candle-close timeframe. 'Live' checks every tick.
+        # Gate by the selected candle-close timeframe. 'Live' checks every tick. For 1m/5m/
+        # 15m/60m, additionally require the current moment to be AFTER the minute in which
+        # this order was armed -- otherwise arming during a boundary-minute fires instantly.
+        armed_at = params.get(f'{prefix}_armed_at')
+        after_arm_minute = True
+        if armed_at is not None and fire_on != 'Live':
+            after_arm_minute = (now.replace(second=0, microsecond=0) > armed_at.replace(second=0, microsecond=0))
+
         if fire_on == 'Live': timing_ok = True
-        elif fire_on == '1m': timing_ok = fire_1m
-        elif fire_on == '5m': timing_ok = fire_5m
-        elif fire_on == '15m': timing_ok = fire_15m
-        elif fire_on == '60m': timing_ok = fire_60m
+        elif fire_on == '1m': timing_ok = fire_1m and after_arm_minute
+        elif fire_on == '5m': timing_ok = fire_5m and after_arm_minute
+        elif fire_on == '15m': timing_ok = fire_15m and after_arm_minute
+        elif fire_on == '60m': timing_ok = fire_60m and after_arm_minute
         else: timing_ok = True
 
         should_fire = False
@@ -448,15 +491,26 @@ class LogicEngine:
             should_fire = True
             reason = "Market (Immediate)"
         elif not timing_ok:
-            skip_reason = f"waiting for {fire_on} candle close"
-        elif order_type == 'Stop-Market':
-            # Breakout confirmation in the direction of the trade's original bias.
-            if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
-            elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
-        elif order_type == 'Limit':
-            # Wait for a better (opposite-direction) entry price.
-            if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
-            elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
+            skip_reason = f"waiting for {fire_on} candle close" if after_arm_minute else f"waiting for next {fire_on} candle close after arming"
+        elif not buy_mode:
+            # --- Sell Mode (existing, unchanged) ---
+            if order_type == 'Stop-Market':
+                # Breakout confirmation in the direction of the trade's original bias.
+                if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
+                elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
+            elif order_type == 'Limit':
+                # Wait for a better (opposite-direction) entry price.
+                if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
+                elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
+        else:
+            # --- Options Buy Mode: directions flipped. Call = buy CE on breakout above;
+            # Put = buy PE on breakdown below. ---
+            if order_type == 'Stop-Market':
+                if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
+                elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
+            elif order_type == 'Limit':
+                if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
+                elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
 
         # Live diagnostic snapshot (overwritten every tick, never logged/appended -> zero log
         # spam). Read by the Order Book UI so a stuck pending order is debuggable at a glance.
@@ -475,6 +529,7 @@ class LogicEngine:
             success, msg = self.open_position(side, reason=reason, qty_override=qty, strike_offset=strike_offset)
             if success:
                 params[f'{prefix}_armed'] = False
+                params[f'{prefix}_armed_at'] = None
                 shared_state['unified_debug'][side] = None
                 # Optional stop/target set at entry, applied via the existing PnL exit engine.
                 try:
@@ -492,15 +547,19 @@ class LogicEngine:
             else:
                 self.log_action(f"⚠️ Unified Trigger Fired but Open Failed: {msg}")
                 params[f'{prefix}_armed'] = False
+                params[f'{prefix}_armed_at'] = None
                 shared_state['unified_debug'][side] = None
                 self.play_sound('error')
 
     def _check_exits(self, idx_ltp, fire_1m, fire_5m):
+        buy_mode = params.get('options_buy_mode', False)
         for side in ['Call', 'Put']:
             trade = shared_state['active_trades'][side]
             if not trade: continue
 
             # --- PNL EXITS ---
+            # (trade['pnl'] is already mode-aware via update_pnl(), so target/stop comparisons
+            # need no change here for either mode.)
             try: tgt = float(params[f'{side.lower()}_target_val']) if str(params[f'{side.lower()}_target_val']).strip() != '' else 0.0
             except ValueError: tgt = 0.0
             try: stp = float(params[f'{side.lower()}_stop_val']) if str(params[f'{side.lower()}_stop_val']).strip() != '' else 0.0
@@ -526,16 +585,31 @@ class LogicEngine:
             tt_key = f'{side.lower()}_index_target_time'; check_tgt = (params[tt_key] == 'Current') or (params[tt_key] == '1m' and fire_1m) or (params[tt_key] == '5m' and fire_5m)
             s_active = params[f'{side.lower()}_index_stop_active']; t_active = params[f'{side.lower()}_index_tgt_active']
 
-            if side == 'Call':
-                if check_stop and s_active and s_val > 0 and idx_ltp >= s_val: self.close_position(side, f"Idx Stop {s_val}")
-                if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
-                    self.close_position(side, f"Idx Target {t_val}")
-                    self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+            if not buy_mode:
+                # --- Sell Mode (existing, unchanged) ---
+                if side == 'Call':
+                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+                else:
+                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
             else:
-                if check_stop and s_active and s_val > 0 and idx_ltp <= s_val: self.close_position(side, f"Idx Stop {s_val}")
-                if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
-                    self.close_position(side, f"Idx Target {t_val}")
-                    self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+                # --- Options Buy Mode: directions flipped (Call profits as idx rises,
+                # Put profits as idx falls). ---
+                if side == 'Call':
+                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+                else:
+                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
 
             # Re-check if position still open after index exits
             trade = shared_state['active_trades'][side]
@@ -555,17 +629,33 @@ class LogicEngine:
             try: pt_val = float(params[f'{side.lower()}_prem_target_val']) if str(params[f'{side.lower()}_prem_target_val']).strip() != '' else 0.0
             except ValueError: pt_val = 0.0
 
-            # Stop: premium rises above stop value (loss on short)
-            if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp >= ps_val:
-                self.close_position(side, f"Prem Stop {ps_val}")
+            is_buy = trade.get('direction', 'SELL') == 'BUY'
+            if not is_buy:
+                # --- Sell Mode (existing, unchanged) ---
+                # Stop: premium rises above stop value (loss on short)
+                if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp >= ps_val:
+                    self.close_position(side, f"Prem Stop {ps_val}")
 
-            trade = shared_state['active_trades'][side]
-            if not trade: continue
+                trade = shared_state['active_trades'][side]
+                if not trade: continue
 
-            # Target: premium falls below target value (profit on short)
-            if check_pt and params[f'{side.lower()}_prem_tgt_active'] and pt_val > 0 and main_ltp <= pt_val:
-                self.close_position(side, f"Prem Target {pt_val}")
-                self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
+                # Target: premium falls below target value (profit on short)
+                if check_pt and params[f'{side.lower()}_prem_tgt_active'] and pt_val > 0 and main_ltp <= pt_val:
+                    self.close_position(side, f"Prem Target {pt_val}")
+                    self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
+            else:
+                # --- Options Buy Mode: comparisons flipped ---
+                # Stop: premium falls below stop value (loss on long)
+                if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp <= ps_val:
+                    self.close_position(side, f"Prem Stop {ps_val}")
+
+                trade = shared_state['active_trades'][side]
+                if not trade: continue
+
+                # Target: premium rises above target value (profit on long)
+                if check_pt and params[f'{side.lower()}_prem_tgt_active'] and pt_val > 0 and main_ltp >= pt_val:
+                    self.close_position(side, f"Prem Target {pt_val}")
+                    self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
 
     def _check_global_limits(self):
         total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']

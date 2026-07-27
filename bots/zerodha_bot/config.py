@@ -105,10 +105,10 @@ ui_refs = {
     'open_positions_count': None,
     'call_pos_row': None, 'call_pos_symbol': None, 'call_pos_mark': None, 'call_pos_size': None,
     'call_pos_pnl': None, 'call_pos_entry': None, 'call_pos_qty': None,
-    'call_pos_maxloss': None, 'call_pos_maxprofit': None,
+    'call_pos_maxloss': None, 'call_pos_maxprofit': None, 'call_pos_side_label': None,
     'put_pos_row': None, 'put_pos_symbol': None, 'put_pos_mark': None, 'put_pos_size': None,
     'put_pos_pnl': None, 'put_pos_entry': None, 'put_pos_qty': None,
-    'put_pos_maxloss': None, 'put_pos_maxprofit': None,
+    'put_pos_maxloss': None, 'put_pos_maxprofit': None, 'put_pos_side_label': None,
 }
 
 # --- UI CONFIGURATION ---
@@ -164,17 +164,25 @@ params = {
     'put_index_stop_val': 0, 'put_index_stop_time': 'Current', 'put_index_stop_active': False,
     'put_index_target_val': 0, 'put_index_target_time': 'Current', 'put_index_tgt_active': False,
 
+    # Premium exit params
     'call_prem_stop_val': 0, 'call_prem_stop_time': 'Current', 'call_prem_stop_active': False,
     'call_prem_target_val': 0, 'call_prem_target_time': 'Current', 'call_prem_tgt_active': False,
 
     'put_prem_stop_val': 0, 'put_prem_stop_time': 'Current', 'put_prem_stop_active': False,
     'put_prem_target_val': 0, 'put_prem_target_time': 'Current', 'put_prem_tgt_active': False,
 
+    # --- Unified Open Short/Long cards (index-based, single-step order entry) ---
+    # order_type: Market fires immediately. Limit/Stop-Market check trigger_price against
+    # index price on the fire_on timeframe, then fire a market order for the option leg.
+    # armed_at: datetime.now() stamped the moment the card is armed (or MODIFY-CONFIRMed);
+    # used by logic_engine._check_unified_open to require the fire_on boundary to be crossed
+    # AFTER arming, not merely "any boundary crossing", so a card armed during a boundary
+    # minute doesn't fire on the very next tick.
     'call_order_type': 'Market', 'call_trigger_price': 0, 'call_strike_offset': 1,
-    'call_fire_on': 'Live', 'call_qty': 4, 'call_armed': False,
+    'call_fire_on': 'Live', 'call_qty': 4, 'call_armed': False, 'call_armed_at': None,
     'call_new_stop': '', 'call_new_target': '',
 
     'put_order_type': 'Market', 'put_trigger_price': 0, 'put_strike_offset': 1,
-    'put_fire_on': 'Live', 'put_qty': 4, 'put_armed': False,
+    'put_fire_on': 'Live', 'put_qty': 4, 'put_armed': False, 'put_armed_at': None,
     'put_new_stop': '', 'put_new_target': '',
 }

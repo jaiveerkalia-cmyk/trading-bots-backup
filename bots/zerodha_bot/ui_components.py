@@ -1,5 +1,6 @@
 from nicegui import ui
 from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state, ALERT_SOUND_URLS, save_alert_profile
+from datetime import datetime
 import pandas as pd
 
 # --- SHARED HELPERS ---
@@ -38,6 +39,7 @@ def _reset_unified_card_defaults(prefix):
     """Fully resets a unified Open Short/Long card (Cancel button) back to defaults:
     disarms, clears the trigger price, and restores order type/strike/qty/fire-on/stop/target."""
     params[f'{prefix}_armed'] = False
+    params[f'{prefix}_armed_at'] = None
     params[f'{prefix}_order_type'] = 'Market'
     params[f'{prefix}_trigger_price'] = 0
     params[f'{prefix}_strike_offset'] = 1
@@ -46,23 +48,46 @@ def _reset_unified_card_defaults(prefix):
     params[f'{prefix}_new_stop'] = ''
     params[f'{prefix}_new_target'] = ''
 
+def _unified_card_title(side, buy_mode):
+    """Card title reflects the CURRENT mode's real semantics, not the sell-mode-only 'Short'/
+    'Long' framing. In Sell Mode, Call=sell CE (short-biased card), Put=sell PE (long-biased
+    card) -- unchanged wording. In Buy Mode, Call=buy CE (bullish) and Put=buy PE (bearish),
+    which is the opposite plain-English framing from Sell Mode's Put card, so the label must
+    say so explicitly or a Buy Mode Put position looks like a mislabeled 'short'."""
+    if not buy_mode:
+        return 'Open Short' if side == 'Call' else 'Open Long'
+    return 'Buy Call (Bullish)' if side == 'Call' else 'Buy Put (Bearish)'
+
 def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
     Stop-Market), trigger price, strike offset (0=ATM, 1=ITM, -1=OTM, with -/+ steppers),
     optional stop/target, a fire-on timeframe, and its own qty (also with -/+ steppers).
     Market fires immediately via on_fire_market. Limit/Stop-Market arm the trade; index
     conditions are then checked and fired by LogicEngine._check_unified_open in
-    logic_engine.py."""
+    logic_engine.py.
+
+    Title and trigger-direction hint are reactive to options_buy_mode (see
+    _unified_card_title) so the card never uses Sell Mode's 'Short'/'Long' wording while
+    Buy Mode is active, since the plain-English direction is opposite in that mode."""
     color_class = 'bg-red-100 border-red-300' if side == 'Call' else 'bg-green-100 border-green-300'
     btn_color = 'red' if side == 'Call' else 'green'
-    title = 'Open Short' if side == 'Call' else 'Open Long'
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
     stop_key = f'{prefix}_new_stop'; target_key = f'{prefix}_new_target'
 
     with ui.card().classes(f'w-full p-3 gap-2 {color_class} border shadow-md rounded-xl'):
-        ui.label(title).classes('font-bold text-sm uppercase text-gray-800')
+        title_lbl = ui.label(_unified_card_title(side, params.get('options_buy_mode', False))).classes('font-bold text-sm uppercase text-gray-800')
+        title_lbl.bind_text_from(params, 'options_buy_mode', backward=lambda v, s=side: _unified_card_title(s, v))
+
+        hint_lbl = ui.label().classes('text-[10px] text-gray-500 -mt-1')
+        def _hint(buy_mode, s=side):
+            if not buy_mode:
+                return 'Stop-Market fires on breakout confirmation; Limit fires on a better price.'
+            direction = 'rises above (breakout)' if s == 'Call' else 'falls below (breakdown)'
+            return f'Buy Mode: Stop-Market fires when index {direction} trigger.'
+        hint_lbl.set_text(_hint(params.get('options_buy_mode', False)))
+        hint_lbl.bind_text_from(params, 'options_buy_mode', backward=_hint)
 
         with ui.row().classes('w-full justify-start'):
             ui.radio(UI_OPTS['order_types'], value=params[order_key]).bind_value(params, order_key).props('inline dense')
@@ -90,14 +115,19 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             if params[order_key] == 'Market':
                 if on_fire_market: on_fire_market()
             else:
+                # Stamp the arm time so the timing-boundary check in
+                # LogicEngine._check_unified_open requires the NEXT candle close after this
+                # moment, not any boundary crossing (fixes: arming during a boundary-minute
+                # firing on the very next tick instead of waiting a full period).
+                params[f'{prefix}_armed_at'] = datetime.now()
                 params[armed_key] = True
                 status.set_text(f"ARMED: {params[order_key]} @ {params[trig_key]} ({params[fire_key]})")
-                ui.notify(f"{title} ARMED", type='positive')
+                ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} ARMED", type='positive')
 
         def cancel():
             # Full reset: trigger price + every other field back to default (not just disarm).
             _reset_unified_card_defaults(prefix)
-            ui.notify(f"{title} Cancelled & Reset", type='info')
+            ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} Cancelled & Reset", type='info')
 
         with ui.row().classes('w-full gap-2'):
             fire_btn = ui.button('Open Now', color=btn_color, on_click=fire_or_arm).classes('grow h-8 text-xs rounded-lg shadow-sm')
@@ -188,12 +218,23 @@ def index_exit_component(side, label, time_key, value_key, active_key):
             ui.button('Reset', on_click=reset).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
 
 def premium_exit_card(side):
-    """Exit based on the live LTP of the main (short) option leg."""
+    """Exit based on the live LTP of the main option leg. Stop/Target sub-labels and helper
+    text auto-flip based on options_buy_mode: in Sell Mode (unchanged) Stop = premium rises
+    (loss on short), Target = premium falls (profit on short); in Buy Mode these invert since
+    a long position profits as premium rises."""
     color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
     label_color = 'text-red-800' if side == 'Call' else 'text-green-800'
     s = side.lower()
     with ui.card().classes(f'w-full p-2 gap-2 {color_class} border shadow-sm rounded-xl'):
         ui.label(f'{side} Exit based on Option Premium').classes(f'font-bold text-xs uppercase {label_color}')
+        hint = ui.label().classes('text-[9px] text-gray-500 -mt-1')
+        def _prem_hint(buy_mode):
+            if not buy_mode:
+                return 'Stop: premium rises above value. Target: premium falls below value.'
+            return 'Buy Mode: Stop: premium falls below value. Target: premium rises above value.'
+        hint.set_text(_prem_hint(params.get('options_buy_mode', False)))
+        hint.bind_text_from(params, 'options_buy_mode', backward=_prem_hint)
+
         with ui.row().classes('w-full gap-2'):
             # Stop sub-card
             with ui.card().classes(f'w-full p-2 gap-1 {color_class} border rounded-lg'):
@@ -319,10 +360,30 @@ def render_alert_sound_panel():
 
 # --- OPEN POSITIONS (kept alongside the existing banner CALL/PUT POSITION cards) ---
 
+def _position_side_badge(side, buy_mode, trade):
+    """SHORT/LONG (Sell Mode) or BUY (Buy Mode) badge text+color for the Open Positions row.
+    Reads the trade's OWN recorded direction when a trade exists (so history/labels never
+    flip just because the global toggle changed later); falls back to the live buy_mode flag
+    only when no trade is present yet (e.g. right when a position is being opened, before the
+    trade dict is fully populated in shared_state)."""
+    direction = None
+    if trade is not None:
+        direction = trade.get('direction')
+    if direction is None:
+        direction = 'BUY' if buy_mode else 'SELL'
+    if direction == 'BUY':
+        return 'BUY', 'bg-blue-100 text-blue-700'
+    return ('SHORT', 'bg-red-100 text-red-700') if side == 'Call' else ('SHORT', 'bg-red-100 text-red-700')
+
 def _position_row(side, on_close=None):
     """One row of the Open Positions section. Only visible while that side has an active
     trade. Values (mark/size/pnl/entry/qty/symbol) are populated live each tick by
     auto_run.py's update_ui(), the same pattern already used for the banner cards.
+
+    The side badge (previously hardcoded to always say 'SHORT') is now a live label driven
+    by the trade's own recorded direction, via update_ui() setting its text/classes each
+    tick (ui_refs[f'{prefix}_pos_side_label']) -- SELL trades show 'SHORT', BUY trades (i.e.
+    Options Buy Mode) show 'BUY'.
 
     Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
     call_index_stop_active etc, the same params the 'Exit based on Index' cards use) rather
@@ -343,7 +404,9 @@ def _position_row(side, on_close=None):
         with ui.row().classes('w-full justify-between items-center flex-wrap gap-2'):
             with ui.row().classes('items-center gap-2'):
                 ui_refs[f'{prefix}_pos_symbol'] = ui.label('-').classes('text-gray-800 font-bold text-sm font-mono')
-                ui.label('SHORT').classes('bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
+                side_label, side_cls = _position_side_badge(side, params.get('options_buy_mode', False), shared_state['active_trades'].get(side))
+                side_lbl = ui.label(side_label).classes(f'{side_cls} text-[10px] font-bold px-2 py-0.5 rounded')
+                ui_refs[f'{prefix}_pos_side_label'] = side_lbl
             with ui.row().classes('items-center gap-6'):
                 with ui.column().classes('items-end gap-0'):
                     ui.label('MARK').classes('text-gray-400 text-[9px] uppercase tracking-wider')
@@ -397,8 +460,15 @@ def _orderbook_table_row(side, prefix):
     live-bound to the underlying params (no manual refresh needed). MODIFY opens a staged
     edit panel (trigger price, strike/qty with -/+ steppers, fire-on, stop, target) bound to
     a local draft, not the live params directly -- edits only take effect after CONFIRM.
+    CONFIRM re-stamps armed_at (see logic_engine._check_unified_open) so a modified order's
+    timing window restarts from the moment it was confirmed, not the original arm time.
     REMOVE fully resets that side's card back to defaults immediately (no confirm needed,
-    matching the existing Cancel behavior elsewhere)."""
+    matching the existing Cancel behavior elsewhere).
+
+    Side label (SELL/BUY) is mode-aware: Sell Mode entry orders open a SHORT position (so the
+    order itself is a SELL), Buy Mode entry orders open a LONG position (so the order itself
+    is a BUY) -- this reflects options_buy_mode live, since a pending (not yet filled) order
+    has no trade dict yet to read a fixed direction from."""
     opt_type = 'CE' if side == 'Call' else 'PE'
     draft = {}
 
@@ -413,6 +483,11 @@ def _orderbook_table_row(side, prefix):
 
     sync_draft()
 
+    def _txn_side_label(buy_mode):
+        return 'BUY' if buy_mode else 'SELL'
+    def _txn_side_cls(buy_mode):
+        return 'w-14 text-blue-600 font-bold' if buy_mode else 'w-14 text-red-600 font-bold'
+
     with ui.column().classes('w-full') as wrapper:
         wrapper.bind_visibility_from(params, f'{prefix}_armed')
         with ui.expansion('', icon='tune').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
@@ -420,7 +495,9 @@ def _orderbook_table_row(side, prefix):
                 with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
                     ui.label().bind_text_from(params, 'trading_index', backward=lambda v: INDICES.get(v, {}).get('segment', v)).classes('w-16 text-gray-400 font-mono')
                     ui.label().bind_text_from(params, 'trading_index', backward=lambda v: f"{v} {opt_type}").classes('w-28 font-bold text-gray-800 font-mono')
-                    ui.label('SELL').classes('w-14 text-red-600 font-bold')
+                    txn_lbl = ui.label(_txn_side_label(params.get('options_buy_mode', False))).classes(_txn_side_cls(params.get('options_buy_mode', False)))
+                    txn_lbl.bind_text_from(params, 'options_buy_mode', backward=_txn_side_label)
+                    txn_lbl.bind_visibility_from(params, 'options_buy_mode', backward=lambda v: True)  # keep visible; classes set once at build, acceptable since mode can't change with orders armed
                     ui.label().bind_text_from(params, f'{prefix}_order_type').classes('w-24 text-purple-700')
                     ui.label().bind_text_from(params, f'{prefix}_trigger_price', backward=lambda v: f"{v}").classes('w-24 text-right font-mono text-gray-800')
                     ui.label().bind_text_from(params, f'{prefix}_fire_on').classes('w-16 text-gray-500')
@@ -463,6 +540,9 @@ def _orderbook_table_row(side, prefix):
                     params[f'{prefix}_fire_on'] = draft['fire_on']
                     params[f'{prefix}_new_stop'] = draft['new_stop']
                     params[f'{prefix}_new_target'] = draft['new_target']
+                    # Re-stamp arm time: a modified order's timing window should restart from
+                    # now, matching fresh-arm behavior (see unified_entry_card.fire_or_arm).
+                    params[f'{prefix}_armed_at'] = datetime.now()
                     ui.notify(f"{side} Order Updated", type='positive')
                     exp.value = False
 
@@ -477,11 +557,13 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
     """One expandable row for an active conditional EXIT order tied to an open position --
     from the Open Positions Idx Stop/Target quick controls, or the Premium/Index-based exit
     cards. Visible only while active. Columns match the SAME layout as the entry-order rows
-    above (Exch/Symbol/Side/Type/Trigger Price/Fire On/Stop/Target/Qty/Status). Side is
-    always BUY: these orders close/cover an existing SHORT position. Symbol and Qty are read
-    from the live open position itself (not guessed), so they always match the real trade.
-    MODIFY edits the value/period inline; REMOVE deactivates and clears the value, mirroring
-    the Reset behavior already in premium_exit_card/index_exit_component."""
+    above (Exch/Symbol/Side/Type/Trigger Price/Fire On/Stop/Target/Qty/Status). Side reads
+    the OPEN TRADE's own recorded direction when available (SELL trade -> exit order is BUY
+    to cover; BUY trade -> exit order is SELL to close), falling back to the live buy_mode
+    flag only if no trade is present. Symbol and Qty are read from the live open position
+    itself (not guessed), so they always match the real trade. MODIFY edits the value/period
+    inline; REMOVE deactivates and clears the value, mirroring the Reset behavior already in
+    premium_exit_card/index_exit_component."""
     opt_type = 'CE' if side == 'Call' else 'PE'
     draft = {}
 
@@ -502,6 +584,12 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
         prefix = 'call' if side == 'Call' else 'put'
         return str(params.get(f'{prefix}_qty', '-'))
 
+    def _exit_txn_label(_v=None):
+        trade = shared_state['active_trades'].get(side)
+        if trade is not None:
+            return 'SELL' if trade.get('direction', 'SELL') == 'BUY' else 'BUY'
+        return 'SELL' if params.get('options_buy_mode', False) else 'BUY'
+
     def _fire_on_label(v):
         return 'Live' if v == 'Current' else v  # cosmetic only: matches entry-card wording
 
@@ -512,7 +600,7 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
                 with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
                     ui.label().bind_text_from(params, 'trading_index', backward=lambda v: INDICES.get(v, {}).get('segment', v)).classes('w-16 text-gray-400 font-mono')
                     ui.label().bind_text_from(params, active_key, backward=_symbol).classes('w-28 font-bold text-gray-800 font-mono')
-                    ui.label('BUY').classes('w-14 text-green-600 font-bold')
+                    ui.label().bind_text_from(params, active_key, backward=_exit_txn_label).classes('w-14 text-green-600 font-bold')
                     ui.label(order_label).classes('w-24 text-purple-700 font-semibold')
                     ui.label('-').classes('w-24 text-right font-mono text-gray-400')  # Trigger Price: n/a for exit orders
                     if time_key:
