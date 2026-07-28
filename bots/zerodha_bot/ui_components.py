@@ -58,6 +58,19 @@ def _unified_card_title(side, buy_mode):
         return 'Open Short' if side == 'Call' else 'Open Long'
     return 'Buy Call (Bullish)' if side == 'Call' else 'Buy Put (Bearish)'
 
+def _unified_card_colors(side, buy_mode):
+    """Card background/border/button colors. Sell Mode (unchanged): Call=red (short-side),
+    Put=green (long-side). Buy Mode (flipped, per request): Buy Call=green (bullish),
+    Buy Put=red (bearish) -- i.e. colors track the plain-English market direction rather than
+    the fixed Call/Put identity."""
+    if not buy_mode:
+        is_red = (side == 'Call')
+    else:
+        is_red = (side == 'Put')
+    if is_red:
+        return 'bg-red-100 border-red-300', 'red'
+    return 'bg-green-100 border-green-300', 'green'
+
 def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
     Stop-Market), trigger price, strike offset (0=ATM, 1=ITM, -1=OTM, with -/+ steppers),
@@ -66,17 +79,37 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     conditions are then checked and fired by LogicEngine._check_unified_open in
     logic_engine.py.
 
-    Title and trigger-direction hint are reactive to options_buy_mode (see
-    _unified_card_title) so the card never uses Sell Mode's 'Short'/'Long' wording while
-    Buy Mode is active, since the plain-English direction is opposite in that mode."""
-    color_class = 'bg-red-100 border-red-300' if side == 'Call' else 'bg-green-100 border-green-300'
-    btn_color = 'red' if side == 'Call' else 'green'
+    Title, trigger-direction hint, AND card colors are all reactive to options_buy_mode (see
+    _unified_card_title / _unified_card_colors) so the card never uses Sell Mode's wording or
+    colors while Buy Mode is active: in Buy Mode, Buy Call is green (bullish) and Buy Put is
+    red (bearish) -- the opposite of Sell Mode's fixed Call=red/Put=green scheme."""
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
     stop_key = f'{prefix}_new_stop'; target_key = f'{prefix}_new_target'
 
-    with ui.card().classes(f'w-full p-3 gap-2 {color_class} border shadow-md rounded-xl'):
+    init_color_class, init_btn_color = _unified_card_colors(side, params.get('options_buy_mode', False))
+
+    with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
+        # Card background/border re-applied on every options_buy_mode change so the color
+        # scheme flips live, not just at initial render.
+        def _card_cls(buy_mode, s=side):
+            cls, _ = _unified_card_colors(s, buy_mode)
+            return f'w-full p-3 gap-2 {cls} border shadow-md rounded-xl'
+        card.bind_visibility_from(params, 'options_buy_mode', backward=lambda v: True)  # keep visible; forces a rebind hook
+        # NiceGUI/Quasar elements don't have a generic "bind classes" helper, so we drive this
+        # from a text-less label callback pattern using an on_change-style watcher instead:
+        # simplest robust approach is to just recompute classes in the same place options_buy_mode
+        # is written (on_buy_mode_button_click / on_buy_mode_change in auto_run.py) OR re-render
+        # the whole page. Since neither is practical here without deeper refactor, we use
+        # bind_text_from on a zero-width helper label as a change hook to trigger a classes()
+        # call via its own on-set callback.
+        _mode_hook = ui.label('').classes('hidden')
+        def _apply_card_colors(buy_mode, c=card, s=side):
+            c.classes(replace=_card_cls(buy_mode, s))
+            return ''  # label text stays empty; this function is used purely for its side effect
+        _mode_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_card_colors)
+
         title_lbl = ui.label(_unified_card_title(side, params.get('options_buy_mode', False))).classes('font-bold text-sm uppercase text-gray-800')
         title_lbl.bind_text_from(params, 'options_buy_mode', backward=lambda v, s=side: _unified_card_title(s, v))
 
@@ -130,8 +163,16 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} Cancelled & Reset", type='info')
 
         with ui.row().classes('w-full gap-2'):
-            fire_btn = ui.button('Open Now', color=btn_color, on_click=fire_or_arm).classes('grow h-8 text-xs rounded-lg shadow-sm')
+            fire_btn = ui.button('Open Now', color=init_btn_color, on_click=fire_or_arm).classes('grow h-8 text-xs rounded-lg shadow-sm')
             fire_btn.bind_text_from(params, order_key, backward=lambda v: 'Open Now' if v == 'Market' else 'Arm')
+            # Button color also flips with mode, via the same zero-width hook pattern as the
+            # card background above (NiceGUI buttons don't expose a reactive 'color' bind).
+            def _apply_btn_color(buy_mode, b=fire_btn, s=side):
+                _, btn_c = _unified_card_colors(s, buy_mode)
+                b.props(f'color={btn_c}')
+                return ''
+            _btn_hook = ui.label('').classes('hidden')
+            _btn_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_btn_color)
             ui.button('Cancel', on_click=cancel).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
             ui.button('Close', on_click=on_close).classes('grow h-8 text-xs rounded-lg bg-gray-300 text-gray-800 hover:bg-gray-400')
 

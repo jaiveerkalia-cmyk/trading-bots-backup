@@ -483,15 +483,13 @@ class AutoController:
         now = datetime.now()
         ts = now.strftime('%H:%M:%S')
 
-        # 0. DEFENSIVE GUARD: Auto Pilot must never act while Options Buy Mode is on. The UI
-        # blocks turning either one on while the other is active, but this check protects
-        # against any edge case (e.g. stale .automode_state on restart, or a race between the
-        # two toggles) where mode could end up 'ON' anyway -- Auto Pilot's sell-only
-        # strike/trailing/commission logic must never run against Buy Mode positions.
-        if params.get('options_buy_mode', False):
-            return
-
-        # 1. PRIORITY: GLOBAL EOD ROUTINE
+        # 1. PRIORITY: GLOBAL EOD ROUTINE -- ALWAYS runs regardless of options_buy_mode. This
+        # is the fix for "15:19 final PnL write never happened in Buy Mode": this block used
+        # to be skipped entirely because the options_buy_mode guard (which correctly blocks
+        # Auto Pilot's sell-only strategy logic below) previously sat ABOVE this block and
+        # returned before it could run. save_daily_report()/close_all_positions() themselves
+        # are mode-agnostic (they only read trade PnL, which is already correct for both
+        # modes via LogicEngine.update_pnl), so this routine is safe to run unconditionally.
         if AutoConfig.SQ_OFF_TIME <= now.time() < dtime(15, 40):
             # Wipe all fields
             self.clear_leg_fields('Call')
@@ -512,7 +510,16 @@ class AutoController:
 
         if self.state == 'DONE': return
 
-        # 2. SYNC UI
+        # 2. DEFENSIVE GUARD: Auto Pilot's STRATEGY logic (everything below this point --
+        # arming, ITM strike selection, hourly trailing, reversal hunting, etc) must never run
+        # while Options Buy Mode is on, since it's sell-only. The UI already blocks turning
+        # either mode on while the other is active; this is a second line of defense against
+        # any edge case (stale .automode_state on restart, a race between the two toggles).
+        # Placed AFTER the EOD block above so the always-safe daily PnL save is never skipped.
+        if params.get('options_buy_mode', False):
+            return
+
+        # 3. SYNC UI
         self.sync_ui_parameters()
         #self.log_parameter_changes() 
         
@@ -908,6 +915,18 @@ def update_ui():
     if idx in INDICES and ui_refs.get('calc_qty'): 
         ui_refs['calc_qty'].set_text(f"(Qty: {int(params['lots']) * INDICES[idx]['lot_size']})")
 
+    # Buy Mode big button: refresh its text/color every tick to reflect the current state
+    # (also handles it being flipped back off automatically by a failed toggle attempt).
+    # Solid green when ON, solid red when OFF -- no pulse/blink (per request: "no need to be
+    # blinking").
+    if ui_refs.get('buy_mode_button'):
+        if params.get('options_buy_mode', False):
+            ui_refs['buy_mode_button'].set_text('🟢 OPTIONS BUY MODE: ON  (tap to switch to SELLING)')
+            ui_refs['buy_mode_button'].classes(replace='w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-green-600 text-white hover:bg-green-700 tracking-wide')
+        else:
+            ui_refs['buy_mode_button'].set_text('🔴 OPTIONS SELLING MODE  (tap to switch to BUY MODE)')
+            ui_refs['buy_mode_button'].classes(replace='w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-red-600 text-white hover:bg-red-700 tracking-wide')
+
     # Buy Mode badge suffix: shows BUY on positions opened while Options Buy Mode is on,
     # driven by the trade's own recorded direction (not the live toggle), so history stays
     # correct even if the mode is switched back after the position closes.
@@ -1041,6 +1060,22 @@ def custom_render_master_banner(update_lots_callback):
                         ui.label('Realized').classes('text-orange-800 text-[9px] uppercase tracking-wider')
                         ui_refs['pnl_realized'] = ui.label('₹ 0.00').classes('text-xl font-mono font-bold text-green-700 leading-none')
 
+        # --- BIG STANDALONE OPTIONS BUY MODE BUTTON ---
+        # Made deliberately large, full-width, and high-contrast (not folded into the small
+        # toggle row below) since a mode-switch this consequential (changes entry/exit
+        # direction on both legs) needs to be unmissable rather than another row toggle among
+        # several. Solid green = Buy Mode ON, solid red = Selling Mode (no pulse/blink). Text
+        # and color are refreshed every tick in update_ui() so it always reflects the true
+        # current state, including if a toggle attempt is auto-reverted (e.g. blocked because
+        # a position is open). Initial colors here match the update_ui() default (OFF/red)
+        # since options_buy_mode defaults to False.
+        with ui.card().classes('w-full p-0 bg-transparent shadow-none rounded-none border-none'):
+            buy_mode_btn = ui.button(
+                '🔴 OPTIONS SELLING MODE  (tap to switch to BUY MODE)',
+                on_click=lambda: on_buy_mode_button_click()
+            ).classes('w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-red-600 text-white hover:bg-red-700 tracking-wide')
+            ui_refs['buy_mode_button'] = buy_mode_btn
+
         with ui.card().classes('w-full p-2 bg-orange-50 flex-row items-center gap-6 rounded-none border-x border-orange-200'):
             with ui.row().classes('items-center gap-2'):
                 ui.label('Index:').classes('font-bold text-orange-900 text-xs')
@@ -1065,13 +1100,6 @@ def custom_render_master_banner(update_lots_callback):
                     on_change=lambda e: params.update({'hedgeless_mode': e.value == 'On'})
                 ).props('dense').classes('text-xs')
                 hedgeless_toggle.bind_enabled_from(params, 'options_buy_mode', backward=lambda v: not v)
-            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
-                with ui.column().classes('gap-0'):
-                    ui.label('OPTIONS BUY MODE').classes('font-bold text-indigo-900 text-[10px] leading-none')
-                    ui.label('Buy CE/PE, no hedge').classes('text-[8px] font-mono text-indigo-600 leading-none')
-                ui.toggle(['On', 'Off'], value='On' if params['options_buy_mode'] else 'Off',
-                    on_change=on_buy_mode_change
-                ).props('dense color=indigo').classes('text-xs')
 
         with ui.card().classes('w-full p-1 px-3 bg-gray-100 border-t border-gray-300 rounded-none'):
             with ui.row().classes('items-center gap-2'):
@@ -1216,21 +1244,17 @@ def on_auto_mode_change(e):
         else:
              ui.notify("Auto Mode ON")
 
-def on_buy_mode_change(e):
-    """Toggles Options Buy Mode. Blocked while any position is open (safest: avoids a live
-    position's exit logic disagreeing with the global mode mid-trade) and mutually exclusive
-    with Auto Pilot (which remains sell-only)."""
-    turning_on = (e.value == 'On')
+def on_buy_mode_button_click():
+    """Handles the big standalone Options Buy Mode button (toggles the opposite of current
+    state). Reuses the exact same guard logic as the old small toggle: blocked while any
+    position is open, and mutually exclusive with Auto Pilot."""
+    turning_on = not params.get('options_buy_mode', False)
 
     if turning_on:
         if shared_state['active_trades']['Call'] is not None or shared_state['active_trades']['Put'] is not None:
-            params['options_buy_mode'] = False
-            e.sender.value = 'Off'
             ui.notify("Close open positions before switching to Options Buy Mode.", type='negative')
             return
         if controller.is_active:
-            params['options_buy_mode'] = False
-            e.sender.value = 'Off'
             ui.notify("Turn off Auto Pilot before switching to Options Buy Mode.", type='negative')
             return
         params['options_buy_mode'] = True
