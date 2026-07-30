@@ -21,6 +21,51 @@ def _num_stepper(target, key, step=1, label=''):
         ui.input(label).bind_value(target, key).props('outlined dense bg-color=white').classes('grow text-center')
         ui.button(icon='add', on_click=inc).props('flat dense round size=sm').classes('text-gray-600 bg-gray-100')
 
+def _side_is_red(side, buy_mode):
+    """Single source of truth for Call/Put color direction across EVERY card in the app.
+    Sell Mode (unchanged): Call=red (short-side), Put=green (long-side).
+    Buy Mode (flipped, per request): Buy Call=green (bullish), Buy Put=red (bearish) --
+    i.e. colors always track the plain-English market direction of the position, not the
+    fixed Call/Put identity. All per-side cards (unified entry, auto close, premium exit,
+    index exit) call this so they stay visually consistent with each other in both modes."""
+    if not buy_mode:
+        return side == 'Call'
+    return side == 'Put'
+
+def _side_colors(side, buy_mode, weight='100'):
+    """Returns (bg/border class string, plain color name) for a given side+mode+shade.
+    weight matches the existing per-card shade conventions already in this file (some cards
+    use bg-*-50/border-*-200, others bg-*-100/border-*-300) so visuals don't change except
+    for the actual hue swap in Buy Mode."""
+    is_red = _side_is_red(side, buy_mode)
+    if weight == '50':
+        return (('bg-red-50 border-red-200', 'red') if is_red else ('bg-green-50 border-green-200', 'green'))
+    return (('bg-red-100 border-red-300', 'red') if is_red else ('bg-green-100 border-green-300', 'green'))
+
+def _bind_card_colors(card, side, cls_template):
+    """Re-applies a card's background/border classes every time options_buy_mode changes, so
+    the color scheme flips live rather than only at initial render. NiceGUI/Quasar elements
+    don't expose a generic reactive 'bind classes' helper, so this drives the re-application
+    via a hidden zero-width label whose bind_text_from callback is used purely for its side
+    effect (calling card.classes(replace=...)) -- the label's own text is always empty and
+    it renders with 'hidden' so it's invisible. cls_template(is_red) -> full class string."""
+    def _apply(buy_mode, c=card, s=side):
+        is_red = _side_is_red(s, buy_mode)
+        c.classes(replace=cls_template(is_red))
+        return ''
+    hook = ui.label('').classes('hidden')
+    hook.bind_text_from(params, 'options_buy_mode', backward=_apply)
+
+def _bind_btn_color(button, side, red_color='red', green_color='green'):
+    """Same hidden-hook pattern as _bind_card_colors, but for a button's color prop (NiceGUI
+    buttons don't expose a reactive 'color' bind either)."""
+    def _apply(buy_mode, b=button, s=side):
+        is_red = _side_is_red(s, buy_mode)
+        b.props(f'color={red_color if is_red else green_color}')
+        return ''
+    hook = ui.label('').classes('hidden')
+    hook.bind_text_from(params, 'options_buy_mode', backward=_apply)
+
 # --- CONTROL CARDS ---
 
 def entry_card(side, label, mode_key, input_key, on_open=None, on_close=None):
@@ -59,17 +104,10 @@ def _unified_card_title(side, buy_mode):
     return 'Buy Call (Bullish)' if side == 'Call' else 'Buy Put (Bearish)'
 
 def _unified_card_colors(side, buy_mode):
-    """Card background/border/button colors. Sell Mode (unchanged): Call=red (short-side),
-    Put=green (long-side). Buy Mode (flipped, per request): Buy Call=green (bullish),
-    Buy Put=red (bearish) -- i.e. colors track the plain-English market direction rather than
-    the fixed Call/Put identity."""
-    if not buy_mode:
-        is_red = (side == 'Call')
-    else:
-        is_red = (side == 'Put')
-    if is_red:
-        return 'bg-red-100 border-red-300', 'red'
-    return 'bg-green-100 border-green-300', 'green'
+    """Backwards-compatible wrapper around _side_colors (100-weight), kept so any external
+    reference to this exact name still works."""
+    cls, btn = _side_colors(side, buy_mode, weight='100')
+    return cls, btn
 
 def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
@@ -80,35 +118,18 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     logic_engine.py.
 
     Title, trigger-direction hint, AND card colors are all reactive to options_buy_mode (see
-    _unified_card_title / _unified_card_colors) so the card never uses Sell Mode's wording or
-    colors while Buy Mode is active: in Buy Mode, Buy Call is green (bullish) and Buy Put is
-    red (bearish) -- the opposite of Sell Mode's fixed Call=red/Put=green scheme."""
+    _unified_card_title / _side_colors) so the card never uses Sell Mode's wording or colors
+    while Buy Mode is active: in Buy Mode, Buy Call is green (bullish) and Buy Put is red
+    (bearish) -- the opposite of Sell Mode's fixed Call=red/Put=green scheme."""
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
     stop_key = f'{prefix}_new_stop'; target_key = f'{prefix}_new_target'
 
-    init_color_class, init_btn_color = _unified_card_colors(side, params.get('options_buy_mode', False))
+    init_color_class, init_btn_color = _side_colors(side, params.get('options_buy_mode', False), weight='100')
 
     with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
-        # Card background/border re-applied on every options_buy_mode change so the color
-        # scheme flips live, not just at initial render.
-        def _card_cls(buy_mode, s=side):
-            cls, _ = _unified_card_colors(s, buy_mode)
-            return f'w-full p-3 gap-2 {cls} border shadow-md rounded-xl'
-        card.bind_visibility_from(params, 'options_buy_mode', backward=lambda v: True)  # keep visible; forces a rebind hook
-        # NiceGUI/Quasar elements don't have a generic "bind classes" helper, so we drive this
-        # from a text-less label callback pattern using an on_change-style watcher instead:
-        # simplest robust approach is to just recompute classes in the same place options_buy_mode
-        # is written (on_buy_mode_button_click / on_buy_mode_change in auto_run.py) OR re-render
-        # the whole page. Since neither is practical here without deeper refactor, we use
-        # bind_text_from on a zero-width helper label as a change hook to trigger a classes()
-        # call via its own on-set callback.
-        _mode_hook = ui.label('').classes('hidden')
-        def _apply_card_colors(buy_mode, c=card, s=side):
-            c.classes(replace=_card_cls(buy_mode, s))
-            return ''  # label text stays empty; this function is used purely for its side effect
-        _mode_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_card_colors)
+        _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-2 {'bg-red-100 border-red-300' if is_red else 'bg-green-100 border-green-300'} border shadow-md rounded-xl")
 
         title_lbl = ui.label(_unified_card_title(side, params.get('options_buy_mode', False))).classes('font-bold text-sm uppercase text-gray-800')
         title_lbl.bind_text_from(params, 'options_buy_mode', backward=lambda v, s=side: _unified_card_title(s, v))
@@ -165,20 +186,18 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
         with ui.row().classes('w-full gap-2'):
             fire_btn = ui.button('Open Now', color=init_btn_color, on_click=fire_or_arm).classes('grow h-8 text-xs rounded-lg shadow-sm')
             fire_btn.bind_text_from(params, order_key, backward=lambda v: 'Open Now' if v == 'Market' else 'Arm')
-            # Button color also flips with mode, via the same zero-width hook pattern as the
-            # card background above (NiceGUI buttons don't expose a reactive 'color' bind).
-            def _apply_btn_color(buy_mode, b=fire_btn, s=side):
-                _, btn_c = _unified_card_colors(s, buy_mode)
-                b.props(f'color={btn_c}')
-                return ''
-            _btn_hook = ui.label('').classes('hidden')
-            _btn_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_btn_color)
+            _bind_btn_color(fire_btn, side)
             ui.button('Cancel', on_click=cancel).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
             ui.button('Close', on_click=on_close).classes('grow h-8 text-xs rounded-lg bg-gray-300 text-gray-800 hover:bg-gray-400')
 
 def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_active_key):
-    color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
-    with ui.card().classes(f'w-full p-2 gap-2 {color_class} border shadow-sm rounded-xl'):
+    """Card background is mode-aware via _side_colors/_bind_card_colors: Sell Mode unchanged
+    (Call=red, Put=green); Buy Mode flips (Buy Call=green, Buy Put=red), matching every other
+    per-side card in the app."""
+    init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
+    with ui.card().classes(f'w-full p-2 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
+        _bind_card_colors(card, side, lambda is_red: f"w-full p-2 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl")
+
         ui.label(f'Auto Close {side}').classes('font-bold text-xs uppercase text-gray-500 mb-1')
 
         with ui.row().classes('w-full items-center gap-1'):
@@ -240,8 +259,13 @@ def global_control_card(label, value_key, active_key):
             ui.button('Reset', on_click=reset).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
 
 def index_exit_component(side, label, time_key, value_key, active_key):
-    color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
-    with ui.card().classes(f'w-full p-2 gap-1 {color_class} border rounded-lg'):
+    """Card background is mode-aware via _side_colors/_bind_card_colors: Sell Mode unchanged
+    (Call=red, Put=green); Buy Mode flips (Buy Call=green, Buy Put=red), matching every other
+    per-side card in the app."""
+    init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
+    with ui.card().classes(f'w-full p-2 gap-1 {init_color_class} border rounded-lg') as card:
+        _bind_card_colors(card, side, lambda is_red: f"w-full p-2 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg")
+
         ui.label(label).classes('font-bold text-xs text-gray-600')
         with ui.row().classes('items-center justify-between w-full'):
             ui.input().bind_value(params, value_key).props('outlined dense bg-color=white').classes('w-24')
@@ -262,12 +286,32 @@ def premium_exit_card(side):
     """Exit based on the live LTP of the main option leg. Stop/Target sub-labels and helper
     text auto-flip based on options_buy_mode: in Sell Mode (unchanged) Stop = premium rises
     (loss on short), Target = premium falls (profit on short); in Buy Mode these invert since
-    a long position profits as premium rises."""
-    color_class = 'bg-red-50 border-red-200' if side == 'Call' else 'bg-green-50 border-green-200'
-    label_color = 'text-red-800' if side == 'Call' else 'text-green-800'
+    a long position profits as premium rises. Card + both sub-card backgrounds and the header
+    label color are also mode-aware via _side_colors/_bind_card_colors (Sell Mode unchanged:
+    Call=red, Put=green; Buy Mode flips: Buy Call=green, Buy Put=red)."""
+    init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     s = side.lower()
-    with ui.card().classes(f'w-full p-2 gap-2 {color_class} border shadow-sm rounded-xl'):
-        ui.label(f'{side} Exit based on Option Premium').classes(f'font-bold text-xs uppercase {label_color}')
+
+    def _outer_cls(is_red):
+        return f"w-full p-2 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl"
+    def _sub_cls(is_red):
+        return f"w-full p-2 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg"
+    def _label_cls(is_red):
+        return f"font-bold text-xs uppercase {'text-red-800' if is_red else 'text-green-800'}"
+
+    init_label_color = 'text-red-800' if _side_is_red(side, params.get('options_buy_mode', False)) else 'text-green-800'
+
+    with ui.card().classes(f'w-full p-2 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
+        _bind_card_colors(card, side, _outer_cls)
+
+        header_lbl = ui.label(f'{side} Exit based on Option Premium').classes(f'font-bold text-xs uppercase {init_label_color}')
+        def _apply_label_color(buy_mode, lbl=header_lbl, sd=side):
+            is_red = _side_is_red(sd, buy_mode)
+            lbl.classes(replace=_label_cls(is_red))
+            return ''
+        _label_hook = ui.label('').classes('hidden')
+        _label_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_label_color)
+
         hint = ui.label().classes('text-[9px] text-gray-500 -mt-1')
         def _prem_hint(buy_mode):
             if not buy_mode:
@@ -278,7 +322,8 @@ def premium_exit_card(side):
 
         with ui.row().classes('w-full gap-2'):
             # Stop sub-card
-            with ui.card().classes(f'w-full p-2 gap-1 {color_class} border rounded-lg'):
+            with ui.card().classes(f'w-full p-2 gap-1 {init_color_class} border rounded-lg') as stop_card:
+                _bind_card_colors(stop_card, side, _sub_cls)
                 ui.label('Stop').classes('font-bold text-xs text-gray-600')
                 with ui.row().classes('items-center justify-between w-full'):
                     ui.input().bind_value(params, f'{s}_prem_stop_val').props('outlined dense bg-color=white').classes('w-24')
@@ -301,7 +346,8 @@ def premium_exit_card(side):
                     ui.button('Reset', on_click=rst_s).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
 
             # Target sub-card
-            with ui.card().classes(f'w-full p-2 gap-1 {color_class} border rounded-lg'):
+            with ui.card().classes(f'w-full p-2 gap-1 {init_color_class} border rounded-lg') as tgt_card:
+                _bind_card_colors(tgt_card, side, _sub_cls)
                 ui.label('Tgt').classes('font-bold text-xs text-gray-600')
                 with ui.row().classes('items-center justify-between w-full'):
                     ui.input().bind_value(params, f'{s}_prem_target_val').props('outlined dense bg-color=white').classes('w-24')
