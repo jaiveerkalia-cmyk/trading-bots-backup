@@ -1306,15 +1306,45 @@ def handle_close_all():
     except Exception as e:
         ui.notify(f"Error closing all: {e}", type='negative')
 
+def _index_exit_wrapper(side):
+    """The outer 'Call Exit based on Index' / 'Put Exit based on Index' wrapper card. Uses
+    the SAME mode-aware color helpers as every card in ui_components.py (comp._side_is_red /
+    comp._bind_card_colors) so it never mismatches the index_exit_component cards nested
+    inside it. Previously this wrapper's colors were hardcoded (Call=bg-red-50, Put=
+    bg-green-50) independent of options_buy_mode, which caused it to visually clash with the
+    correctly mode-aware sub-cards inside it in Buy Mode."""
+    init_cls, _ = comp._side_colors(side, params.get('options_buy_mode', False), weight='50')
+
+    def _cls(is_red):
+        return f"w-full p-2 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl"
+    def _label_cls(is_red):
+        return f"font-bold text-xs uppercase {'text-red-800' if is_red else 'text-green-800'}"
+
+    init_label_cls = 'text-red-800' if comp._side_is_red(side, params.get('options_buy_mode', False)) else 'text-green-800'
+
+    with ui.card().classes(f'w-full p-2 gap-2 {init_cls} border shadow-sm rounded-xl') as card:
+        comp._bind_card_colors(card, side, _cls)
+        title = ui.label(f'{side} Exit based on Index').classes(f'font-bold text-xs uppercase {init_label_cls}')
+        def _apply_label(buy_mode, lbl=title, s=side):
+            is_red = comp._side_is_red(s, buy_mode)
+            lbl.classes(replace=_label_cls(is_red))
+            return ''
+        hook = ui.label('').classes('hidden')
+        hook.bind_text_from(params, 'options_buy_mode', backward=_apply_label)
+
+        with ui.row().classes('w-full gap-2'):
+            if side == 'Call':
+                comp.index_exit_component('Call', 'Stop', 'call_index_stop_time', 'call_index_stop_val', 'call_index_stop_active')
+                comp.index_exit_component('Call', 'Tgt', 'call_index_target_time', 'call_index_target_val', 'call_index_tgt_active')
+            else:
+                comp.index_exit_component('Put', 'Stop', 'put_index_stop_time', 'put_index_stop_val', 'put_index_stop_active')
+                comp.index_exit_component('Put', 'Tgt', 'put_index_target_time', 'put_index_target_val', 'put_index_tgt_active')
+
 def build_left_stack():
     comp.unified_entry_card('Call', 'call', on_fire_market=lambda: handle_fire_market('Call'), on_close=lambda: handle_close('Call'))
     comp.auto_close_card('Call', 'call_target_val', 'call_target_active', 'call_stop_val', 'call_stop_active')
     comp.premium_exit_card('Call')
-    with ui.card().classes('w-full p-2 gap-2 bg-red-50 border border-red-200 shadow-sm rounded-xl'):
-        ui.label('Call Exit based on Index').classes('font-bold text-xs uppercase text-red-800')
-        with ui.row().classes('w-full gap-2'):
-            comp.index_exit_component('Call', 'Stop', 'call_index_stop_time', 'call_index_stop_val', 'call_index_stop_active')
-            comp.index_exit_component('Call', 'Tgt', 'call_index_target_time', 'call_index_target_val', 'call_index_tgt_active')
+    _index_exit_wrapper('Call')
 
 def build_center_stack():
     ui.button('Run 9 AM Daily Scan', on_click=run_daily_scan).classes('bg-orange-200 text-orange-900 w-full shadow-md rounded-xl h-12 font-bold')
@@ -1331,11 +1361,7 @@ def build_right_stack():
     comp.unified_entry_card('Put', 'put', on_fire_market=lambda: handle_fire_market('Put'), on_close=lambda: handle_close('Put'))
     comp.auto_close_card('Put', 'put_target_val', 'put_target_active', 'put_stop_val', 'put_stop_active')
     comp.premium_exit_card('Put')
-    with ui.card().classes('w-full p-2 gap-2 bg-green-50 border border-green-200 shadow-sm rounded-xl'):
-        ui.label('Put Exit based on Index').classes('font-bold text-xs uppercase text-green-800')
-        with ui.row().classes('w-full gap-2'):
-            comp.index_exit_component('Put', 'Stop', 'put_index_stop_time', 'put_index_stop_val', 'put_index_stop_active')
-            comp.index_exit_component('Put', 'Tgt', 'put_index_target_time', 'put_index_target_val', 'put_index_tgt_active')
+    _index_exit_wrapper('Put')
 
 
 # ==========================================
