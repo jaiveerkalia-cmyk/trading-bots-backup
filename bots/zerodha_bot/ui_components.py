@@ -27,10 +27,29 @@ def _side_is_red(side, buy_mode):
     Buy Mode (flipped, per request): Buy Call=green (bullish), Buy Put=red (bearish) --
     i.e. colors always track the plain-English market direction of the position, not the
     fixed Call/Put identity. All per-side cards (unified entry, auto close, premium exit,
-    index exit) call this so they stay visually consistent with each other in both modes."""
+    index exit, open positions) call this so they stay visually consistent with each other
+    in both modes."""
     if not buy_mode:
         return side == 'Call'
     return side == 'Put'
+
+def _trade_is_red(side, buy_mode, trade):
+    """Same red/green direction logic as _side_is_red, but for an OPEN TRADE specifically:
+    reads the trade's own recorded 'direction' (BUY/SELL) when a trade exists, so a
+    position's color never flips just because the global options_buy_mode toggle changes
+    later (e.g. after the trade closes and the mode is switched back) -- consistent with how
+    _position_side_badge already handles the SHORT/BUY text label. Falls back to the live
+    buy_mode flag only when no trade is present yet."""
+    if trade is not None:
+        direction = trade.get('direction', 'SELL')
+        is_buy_trade = (direction == 'BUY')
+    else:
+        is_buy_trade = buy_mode
+    # A BUY trade profits like a "Call-in-Buy-Mode" (bullish/green); a SELL trade behaves
+    # like a "Call-in-Sell-Mode" (red) for Call, or the Put equivalent. Reuse _side_is_red's
+    # exact mapping so this can never drift out of sync with every other card in the app.
+    effective_buy_mode = is_buy_trade
+    return _side_is_red(side, effective_buy_mode)
 
 def _side_colors(side, buy_mode, weight='100'):
     """Returns (bg/border class string, plain color name) for a given side+mode+shade.
@@ -462,6 +481,16 @@ def _position_side_badge(side, buy_mode, trade):
         return 'BUY', 'bg-blue-100 text-blue-700'
     return ('SHORT', 'bg-red-100 text-red-700') if side == 'Call' else ('SHORT', 'bg-red-100 text-red-700')
 
+def _position_row_accent(side, buy_mode, trade):
+    """Left accent border class for an Open Positions row. Mode-aware via _trade_is_red, so
+    it matches every other card's color convention: Sell Mode unchanged (Call=red border,
+    Put=green border); Buy Mode flips (Buy Call=green border since it's a bullish long, Buy
+    Put=red border since it's a bearish long). Fixes: this was previously hardcoded to
+    'border-red-500' for Call / 'border-green-500' for Put regardless of mode, which is why
+    a Buy Mode Call (long/bullish) position was showing with a red accent instead of green."""
+    is_red = _trade_is_red(side, buy_mode, trade)
+    return 'border-red-500' if is_red else 'border-green-500'
+
 def _position_row(side, on_close=None):
     """One row of the Open Positions section. Only visible while that side has an active
     trade. Values (mark/size/pnl/entry/qty/symbol) are populated live each tick by
@@ -472,21 +501,35 @@ def _position_row(side, on_close=None):
     tick (ui_refs[f'{prefix}_pos_side_label']) -- SELL trades show 'SHORT', BUY trades (i.e.
     Options Buy Mode) show 'BUY'.
 
+    The left accent border (previously hardcoded Call=red/Put=green regardless of mode) is
+    now driven by _position_row_accent, reactive to BOTH options_buy_mode changes AND the
+    trade opening/closing (via the active_trades bind hook below), so a Buy Mode Call
+    position correctly shows green and a Buy Mode Put position correctly shows red.
+
     Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
     call_index_stop_active etc, the same params the 'Exit based on Index' cards use) rather
     than the PnL-based Auto Close values, and always check on live price: toggling either
     switch forces the corresponding *_index_stop_time/*_index_target_time to 'Current'."""
     prefix = 'call' if side == 'Call' else 'put'
-    accent = 'border-red-500' if side == 'Call' else 'border-green-500'
+    init_accent = _position_row_accent(side, params.get('options_buy_mode', False), shared_state['active_trades'].get(side))
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
 
     def force_live(_e=None, key=None):
         params[key] = 'Current'
 
-    with ui.card().classes(f'w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
+    with ui.card().classes(f'w-full bg-white border-l-4 {init_accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         row.bind_visibility_from(shared_state['active_trades'], side, backward=lambda v: v is not None)
         ui_refs[f'{prefix}_pos_row'] = row
+
+        # Re-applies the accent border whenever options_buy_mode changes (mode toggled while
+        # this row happens to be visible) via the same hidden-hook pattern as _bind_card_colors.
+        def _apply_accent_on_mode(buy_mode, r=row, s=side, pfx=prefix):
+            accent = _position_row_accent(s, buy_mode, shared_state['active_trades'].get(s))
+            r.classes(replace=f"w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm")
+            return ''
+        _mode_hook = ui.label('').classes('hidden')
+        _mode_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_accent_on_mode)
 
         with ui.row().classes('w-full justify-between items-center flex-wrap gap-2'):
             with ui.row().classes('items-center gap-2'):
