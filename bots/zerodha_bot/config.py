@@ -79,6 +79,17 @@ shared_state = {
     'toast_queue': [],
 
     'unified_debug': {'Call': None, 'Put': None},
+
+    # --- Active Alerts (multi-alert system) ---
+    # List of independent, user-created price alerts. Each entry:
+    #   {'id': short-uuid str, 'direction': 'upper'|'lower', 'value': float,
+    #    'period': 'Current'|'1m'|'5m', 'sound': str (key into ALERT_SOUND_URLS),
+    #    'duration': float (seconds), 'created_at': 'HH:MM:SS'}
+    # Multiple alerts in the same direction are allowed. Fired alerts are removed from
+    # this list (one-shot, same semantics as the old single-slot alert_upper_active/
+    # alert_lower_active flags). Lives in shared_state (not params) since these are
+    # dynamic runtime instances, matching the existing active_trades/option_chain pattern.
+    'alerts': [],
 }
 
 # --- UI REFERENCES ---
@@ -147,11 +158,12 @@ params = {
     'put_entry_mode': 'ATM', 'put_manual_strike': '',
     'long_trigger_active': False, 'long_open_mode': 'Current', 'long_open_amount': 0, 'long_open_strike': 0,
 
-    'alert_period': 'Current',
+    # --- Active Alerts: 'add new alert' form state (upper/lower), NOT the alerts
+    # themselves (those live in shared_state['alerts'] as independent instances so
+    # multiple can coexist per direction). These are just the staged input values for
+    # the next alert about to be created, plus the shared default sound/duration profile
+    # applied to new alerts at creation time (editable per-alert afterward via MODIFY).
     'alert_upper_input': 0, 'alert_lower_input': 0,
-    'alert_upper': 0, 'alert_lower': 0,
-    'alert_upper_active': False, 'alert_lower_active': False,
-
     'alert_upper_period': 'Current', 'alert_lower_period': 'Current',
     'alert_upper_sound': _saved_alert_sound, 'alert_lower_sound': _saved_alert_sound,
     'alert_upper_duration': _saved_alert_duration, 'alert_lower_duration': _saved_alert_duration,

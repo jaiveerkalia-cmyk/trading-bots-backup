@@ -675,26 +675,45 @@ class LogicEngine:
             self.play_sound('error')
 
     def _check_alerts(self, idx_ltp, fire_1m, fire_5m):
-        up = params['alert_upper']; low = params['alert_lower']
+        """Multi-alert system: shared_state['alerts'] holds any number of independent price
+        alerts (multiple allowed in the same direction). Each is evaluated against its own
+        'period' (Current/1m/5m) and 'direction' (upper: fires when idx_ltp >= value; lower:
+        fires when idx_ltp <= value). A fired alert is removed from the list (one-shot, same
+        semantics as the old single-slot alert_upper_active/alert_lower_active flags).
 
-        upper_mode = params.get('alert_upper_period', 'Current')
-        lower_mode = params.get('alert_lower_period', 'Current')
-        check_upper = (upper_mode == 'Current') or (upper_mode == '1m' and fire_1m) or (upper_mode == '5m' and fire_5m)
-        check_lower = (lower_mode == 'Current') or (lower_mode == '1m' and fire_1m) or (lower_mode == '5m' and fire_5m)
+        NOTE: message text intentionally avoids the word "alert" (case-insensitive). The
+        global ui.notify interceptor in auto_run.py auto-queues its own generic fallback
+        sound (fixed sound, no duration limit) whenever a notification's text contains
+        "alert", which was silently overriding/mixing with the user's chosen sound+duration
+        from play_alert_sound() below. "Price Hit" conveys the same info without colliding.
 
-        # NOTE: message text intentionally avoids the word "alert" (case-insensitive). The
-        # global ui.notify interceptor in auto_run.py auto-queues its own generic fallback
-        # sound (fixed sound, no duration limit) whenever a notification's text contains
-        # "alert", which was silently overriding/mixing with the user's chosen sound+duration
-        # from play_alert_sound() below. "Price Hit" conveys the same info without colliding.
-        if check_upper and params['alert_upper_active'] and up > 0 and idx_ltp >= up:
-            ui.notify(f"Price Hit: {idx_ltp} > {up}", type='warning', close_button=True)
-            params['alert_upper_active'] = False; params['alert_upper_input'] = 0
-            self.log_action(f"🔔 Price Hit (Upper): {idx_ltp} >= {up}")
-            self.play_alert_sound(params.get('alert_upper_sound', 'Wood Plank'), params.get('alert_upper_duration', 5))
+        Iterates a shallow copy of the list since firing mutates (removes from) the original;
+        modifying a list while iterating it directly would skip entries / raise."""
+        alerts = shared_state.get('alerts', [])
+        if not alerts: return
 
-        if check_lower and params['alert_lower_active'] and low > 0 and idx_ltp <= low:
-            ui.notify(f"Price Hit: {idx_ltp} < {low}", type='warning', close_button=True)
-            params['alert_lower_active'] = False; params['alert_lower_input'] = 0
-            self.log_action(f"🔔 Price Hit (Lower): {idx_ltp} <= {low}")
-            self.play_alert_sound(params.get('alert_lower_sound', 'Wood Plank'), params.get('alert_lower_duration', 5))
+        fired_ids = []
+        for alert in list(alerts):
+            try: value = float(alert.get('value', 0))
+            except (ValueError, TypeError): continue
+            if value <= 0: continue
+
+            period = alert.get('period', 'Current')
+            check_now = (period == 'Current') or (period == '1m' and fire_1m) or (period == '5m' and fire_5m)
+            if not check_now: continue
+
+            direction = alert.get('direction')
+            should_fire = False
+            if direction == 'upper' and idx_ltp >= value: should_fire = True
+            elif direction == 'lower' and idx_ltp <= value: should_fire = True
+            if not should_fire: continue
+
+            cmp_sym = '>' if direction == 'upper' else '<'
+            label = 'Upper' if direction == 'upper' else 'Lower'
+            ui.notify(f"Price Hit: {idx_ltp} {cmp_sym} {value}", type='warning', close_button=True)
+            self.log_action(f"🔔 Price Hit ({label}): {idx_ltp} vs {value}")
+            self.play_alert_sound(alert.get('sound', 'Wood Plank'), alert.get('duration', 5))
+            fired_ids.append(alert.get('id'))
+
+        if fired_ids:
+            shared_state['alerts'] = [a for a in shared_state['alerts'] if a.get('id') not in fired_ids]

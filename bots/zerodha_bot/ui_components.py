@@ -2,6 +2,7 @@ from nicegui import ui
 from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state, ALERT_SOUND_URLS, save_alert_profile
 from datetime import datetime
 import pandas as pd
+import uuid
 
 # --- SHARED HELPERS ---
 
@@ -147,13 +148,13 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
 
     init_color_class, init_btn_color = _side_colors(side, params.get('options_buy_mode', False), weight='100')
 
-    with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
-        _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-2 {'bg-red-100 border-red-300' if is_red else 'bg-green-100 border-green-300'} border shadow-md rounded-xl")
+    with ui.card().classes(f'w-full p-4 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
+        _bind_card_colors(card, side, lambda is_red: f"w-full p-4 gap-2 {'bg-red-100 border-red-300' if is_red else 'bg-green-100 border-green-300'} border shadow-md rounded-xl")
 
         title_lbl = ui.label(_unified_card_title(side, params.get('options_buy_mode', False))).classes('font-bold text-sm uppercase text-gray-800')
         title_lbl.bind_text_from(params, 'options_buy_mode', backward=lambda v, s=side: _unified_card_title(s, v))
 
-        hint_lbl = ui.label().classes('text-[10px] text-gray-500 -mt-1')
+        hint_lbl = ui.label().classes('text-[10px] text-gray-500 mb-1')
         def _hint(buy_mode, s=side):
             if not buy_mode:
                 return 'Stop-Market fires on breakout confirmation; Limit fires on a better price.'
@@ -214,8 +215,8 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
     (Call=red, Put=green); Buy Mode flips (Buy Call=green, Buy Put=red), matching every other
     per-side card in the app."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
-    with ui.card().classes(f'w-full p-2 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
-        _bind_card_colors(card, side, lambda is_red: f"w-full p-2 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl")
+    with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
+        _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl")
 
         ui.label(f'Auto Close {side}').classes('font-bold text-xs uppercase text-gray-500 mb-1')
 
@@ -282,8 +283,8 @@ def index_exit_component(side, label, time_key, value_key, active_key):
     (Call=red, Put=green); Buy Mode flips (Buy Call=green, Buy Put=red), matching every other
     per-side card in the app."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
-    with ui.card().classes(f'w-full p-2 gap-1 {init_color_class} border rounded-lg') as card:
-        _bind_card_colors(card, side, lambda is_red: f"w-full p-2 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg")
+    with ui.card().classes(f'w-full p-3 gap-1 {init_color_class} border rounded-lg') as card:
+        _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg")
 
         ui.label(label).classes('font-bold text-xs text-gray-600')
         with ui.row().classes('items-center justify-between w-full'):
@@ -312,7 +313,7 @@ def premium_exit_card(side):
     s = side.lower()
 
     def _outer_cls(is_red):
-        return f"w-full p-2 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl"
+        return f"w-full p-3 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl"
     def _sub_cls(is_red):
         return f"w-full p-2 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg"
     def _label_cls(is_red):
@@ -320,7 +321,7 @@ def premium_exit_card(side):
 
     init_label_color = 'text-red-800' if _side_is_red(side, params.get('options_buy_mode', False)) else 'text-green-800'
 
-    with ui.card().classes(f'w-full p-2 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
+    with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
         _bind_card_colors(card, side, _outer_cls)
 
         header_lbl = ui.label(f'{side} Exit based on Option Premium').classes(f'font-bold text-xs uppercase {init_label_color}')
@@ -388,42 +389,49 @@ def premium_exit_card(side):
                     ui.button('Set', color='black', on_click=act_t).props('outline').classes('grow h-6 text-[10px] rounded')
                     ui.button('Reset', on_click=rst_t).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
 
-def _alert_side_card(side_label, threshold_key, threshold_input_key, active_key, period_key, notify_fn):
-    """Shared builder for a single-sided (Upper or Lower) price alert card. Sound + duration
-    now live in the separate shared Alert Sound Profile panel (render_alert_sound_panel)."""
+def _add_alert_card(direction, side_label, input_key, period_key, notify_fn):
+    """'Add Alert' form for one direction (Upper or Lower). Unlike the old single-slot
+    version, this does NOT hold the alert's live state -- clicking 'Add' appends a brand new,
+    independent entry to shared_state['alerts'] and clears the input for the next one, so any
+    number of alerts can be created in the same direction. Sound/duration are captured at
+    creation time from the current shared Alert Sound Profile (render_alert_sound_panel),
+    and can be changed per-alert afterward via MODIFY in the Active Alerts section."""
     with ui.card().classes('w-full p-3 gap-2 bg-yellow-50 shadow-md border-l-4 border-yellow-400 rounded-xl'):
-        ui.label(f'{side_label} Price Alert').classes('font-bold text-gray-800')
+        ui.label(f'Add {side_label} Price Alert').classes('font-bold text-gray-800')
 
         with ui.row().classes('items-center w-full justify-between'):
             ui.label('Period:').classes('text-xs text-gray-500')
             ui.radio(UI_OPTS['alert_periods'], value=params[period_key]).bind_value(params, period_key).props('inline dense')
 
-        ui.input(side_label).bind_value(params, threshold_input_key).props('outlined dense bg-color=white').classes('w-full')
+        ui.input(side_label).bind_value(params, input_key).props('outlined dense bg-color=white').classes('w-full')
 
-        status = ui.label().classes('w-full text-center text-xs font-bold text-white bg-orange-500 rounded p-1 shadow-sm')
-        status.bind_visibility_from(params, active_key)
-
-        def set_alert():
+        def add_alert():
             try:
-                params[threshold_key] = float(params[threshold_input_key])
-                params[active_key] = True if params[threshold_key] > 0 else False
-                status.set_text(f"ARMED: {params[threshold_key]}")
-                notify_fn(f"{side_label} Alert ARMED: {params[threshold_key]}", type='positive')
-            except: notify_fn("Invalid Alert Value", type='negative')
+                value = float(params[input_key])
+                if value <= 0: raise ValueError
+            except (ValueError, TypeError):
+                notify_fn("Invalid Alert Value", type='negative')
+                return
+            new_alert = {
+                'id': str(uuid.uuid4())[:8],
+                'direction': direction,
+                'value': value,
+                'period': params[period_key],
+                'sound': params.get('alert_upper_sound', 'Wood Plank'),
+                'duration': params.get('alert_upper_duration', 5),
+                'created_at': datetime.now().strftime('%H:%M:%S'),
+            }
+            shared_state['alerts'].append(new_alert)
+            params[input_key] = 0  # clear the form so the next alert starts fresh
+            notify_fn(f"{side_label} Alert ADDED: {value}", type='positive')
 
-        def reset_alert():
-            params[threshold_key] = 0; params[threshold_input_key] = 0; params[active_key] = False
-            notify_fn(f"{side_label} Alert DISARMED", type='info')
-
-        with ui.row().classes('w-full gap-2'):
-            ui.button('Set', color='orange', on_click=set_alert).classes('grow h-8 rounded-lg')
-            ui.button('Reset', color='grey', on_click=reset_alert).props('flat').classes('grow h-8 rounded-lg')
+        ui.button('Add Alert', color='orange', on_click=add_alert).classes('w-full h-8 rounded-lg')
 
 def alerts_card_upper():
-    _alert_side_card('Upper', 'alert_upper', 'alert_upper_input', 'alert_upper_active', 'alert_upper_period', ui.notify)
+    _add_alert_card('upper', 'Upper', 'alert_upper_input', 'alert_upper_period', ui.notify)
 
 def alerts_card_lower():
-    _alert_side_card('Lower', 'alert_lower', 'alert_lower_input', 'alert_lower_active', 'alert_lower_period', ui.notify)
+    _add_alert_card('lower', 'Lower', 'alert_lower_input', 'alert_lower_period', ui.notify)
 
 def _preview_sound(sound_name, duration):
     url = ALERT_SOUND_URLS.get(sound_name, ALERT_SOUND_URLS['Wood Plank'])
@@ -464,6 +472,126 @@ def render_alert_sound_panel():
             ui.button('▶ Preview', on_click=preview).classes('grow h-8 rounded-lg')
             ui.button('Set', color='orange', on_click=set_profile).classes('grow h-8 rounded-lg')
 
+# --- ACTIVE ALERTS (multiple, independent price alerts per direction) ---
+
+def _alert_row(alert):
+    """One expandable row for a single pending price alert in shared_state['alerts'],
+    matching the same header/expansion pattern as the Order Book rows (_orderbook_table_row/
+    _exit_order_row) for visual consistency across the app. MODIFY opens a staged draft
+    (value/period/sound/duration) that only commits on CONFIRM, by looking the alert back up
+    via its id (so it keeps editing the right entry even if other alerts are added/removed/
+    reordered in the list while this row's expansion is open). CANCEL removes it immediately,
+    no confirm needed (matching REMOVE elsewhere in the app)."""
+    alert_id = alert['id']
+    direction = alert['direction']
+    label = 'Upper' if direction == 'upper' else 'Lower'
+    label_cls = 'w-14 text-orange-600 font-bold' if direction == 'upper' else 'w-14 text-blue-600 font-bold'
+    draft = {'value': alert['value'], 'period': alert['period'], 'sound': alert['sound'], 'duration': alert['duration']}
+
+    def _find():
+        # Re-fetch the live dict by id every time, since shared_state['alerts'] entries are
+        # never mutated in place from outside _check_alerts (which replaces the whole list).
+        for a in shared_state['alerts']:
+            if a.get('id') == alert_id: return a
+        return None
+
+    with ui.expansion('', icon='notifications').classes('w-full bg-white border border-gray-200 rounded-lg').props('dense') as exp:
+        with exp.add_slot('header'):
+            with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
+                ui.label(alert['created_at']).classes('w-16 text-gray-400 font-mono')
+                ui.label(label).classes(label_cls)
+                ui.label(f"idx {'>=' if direction == 'upper' else '<='} {alert['value']}").classes('w-32 font-mono text-gray-800')
+                ui.label(alert['period']).classes('w-16 text-gray-500')
+                ui.label(alert['sound']).classes('w-32 text-purple-700')
+                ui.label(f"{alert['duration']}s").classes('w-12 text-gray-500')
+                ui.label('PENDING').classes('bg-orange-500 text-white px-2 py-0.5 rounded text-[10px] font-bold')
+                ui.space()
+
+                def cancel_alert():
+                    shared_state['alerts'] = [a for a in shared_state['alerts'] if a.get('id') != alert_id]
+                    ui.notify(f"{label} Alert Cancelled", type='info')
+
+                def open_modify():
+                    live = _find()
+                    if live:
+                        draft['value'] = live['value']; draft['period'] = live['period']
+                        draft['sound'] = live['sound']; draft['duration'] = live['duration']
+                    # Force-open on the NEXT event loop tick, not immediately: the header's own
+                    # click toggle handler runs in the same click event as this button (click.stop
+                    # prevents the DOM bubble, but Quasar's expansion internally still flips its
+                    # own v-model on click of anything inside the header slot in some versions),
+                    # so setting exp.value=True here could get immediately re-toggled back to
+                    # False by that same click. Deferring by one tick lets any such toggle finish
+                    # first, then forces it open afterward -- fixes MODIFY collapsing instead of
+                    # expanding.
+                    def _force_open():
+                        exp.value = True
+                    ui.timer(0.05, _force_open, once=True)
+
+                ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', open_modify)
+                ui.button('CANCEL').props('flat dense size=sm no-caps').classes('text-[10px] text-red-600').on('click.stop', cancel_alert)
+
+        with ui.column().classes('w-full p-3 gap-2 bg-gray-50'):
+            with ui.row().classes('w-full gap-2'):
+                ui.input(label).bind_value(draft, 'value').props('outlined dense bg-color=white').classes('grow')
+                ui.radio(UI_OPTS['alert_periods'], value=draft['period']).bind_value(draft, 'period').props('inline dense')
+            with ui.row().classes('w-full gap-2'):
+                ui.select(UI_OPTS['alert_sounds'], value=draft['sound'], label='Sound').bind_value(draft, 'sound').props('outlined dense bg-color=white').classes('grow')
+                ui.input('Duration (s)').bind_value(draft, 'duration').props('outlined dense bg-color=white').classes('w-28')
+
+            def preview():
+                _preview_sound(draft['sound'], draft['duration'])
+
+            def confirm_changes():
+                try:
+                    value = float(draft['value'])
+                    if value <= 0: raise ValueError
+                except (ValueError, TypeError):
+                    ui.notify("Invalid Alert Value", type='negative')
+                    return
+                live = _find()
+                if live is None:
+                    ui.notify("Alert no longer exists", type='negative')
+                    exp.value = False
+                    return
+                live['value'] = value; live['period'] = draft['period']
+                live['sound'] = draft['sound']; live['duration'] = draft['duration']
+                ui.notify(f"{label} Alert Updated", type='positive')
+                exp.value = False
+
+            with ui.row().classes('w-full gap-2'):
+                ui.button('▶ Preview', on_click=preview).classes('grow h-8 text-xs rounded-lg')
+                ui.button('CONFIRM', color='green', on_click=confirm_changes).classes('grow h-8 text-xs rounded-lg font-bold')
+                ui.button('Cancel', on_click=lambda: setattr(exp, 'value', False)).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800')
+
+def render_active_alerts():
+    """'ACTIVE ALERTS' section: lists every pending price alert in shared_state['alerts'],
+    any number per direction, each independently editable (MODIFY) or cancellable (CANCEL).
+    Rebuilds its rows on a short timer since alerts can be added (from the Add Alert cards)
+    or removed (fired by LogicEngine._check_alerts, or cancelled here) from outside this
+    render call -- NiceGUI has no built-in reactive 'for each item in a list' binding, so a
+    periodic refresh_view is the same pattern already used for render_order_history's
+    _refresh_history_table."""
+    with ui.card().classes('w-full bg-white p-3 gap-2 rounded-xl shadow-sm mb-4 border border-gray-200'):
+        with ui.row().classes('w-full justify-between items-center mb-1'):
+            ui.label('ACTIVE ALERTS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
+            count_lbl = ui.label('0 pending').classes('text-[10px] text-gray-400')
+
+        rows_container = ui.column().classes('w-full gap-1')
+        empty_lbl = ui.label('No active alerts.').classes('w-full text-center text-xs text-gray-400 italic')
+
+        def refresh_view():
+            alerts = shared_state.get('alerts', [])
+            count_lbl.set_text(f"{len(alerts)} pending")
+            empty_lbl.set_visibility(len(alerts) == 0)
+            rows_container.clear()
+            with rows_container:
+                for alert in alerts:
+                    _alert_row(alert)
+
+        refresh_view()
+        ui.timer(1.0, refresh_view)
+
 # --- OPEN POSITIONS (kept alongside the existing banner CALL/PUT POSITION cards) ---
 
 def _position_side_badge(side, buy_mode, trade):
@@ -471,7 +599,13 @@ def _position_side_badge(side, buy_mode, trade):
     Reads the trade's OWN recorded direction when a trade exists (so history/labels never
     flip just because the global toggle changed later); falls back to the live buy_mode flag
     only when no trade is present yet (e.g. right when a position is being opened, before the
-    trade dict is fully populated in shared_state)."""
+    trade dict is fully populated in shared_state).
+
+    Sell Mode (direction != 'BUY'): Call = SHORT (sell CE), Put = LONG (sell PE) -- these are
+    genuinely different positions with different bias, so they must not share one label.
+    Buy Mode (direction == 'BUY'): both Call and Put show BUY, since both are long options,
+    just on opposite underlying bias (bullish CE vs bearish PE) -- color (not the text label)
+    is what distinguishes them there, via _position_row_accent/_trade_is_red."""
     direction = None
     if trade is not None:
         direction = trade.get('direction')
@@ -479,57 +613,61 @@ def _position_side_badge(side, buy_mode, trade):
         direction = 'BUY' if buy_mode else 'SELL'
     if direction == 'BUY':
         return 'BUY', 'bg-blue-100 text-blue-700'
-    return ('SHORT', 'bg-red-100 text-red-700') if side == 'Call' else ('SHORT', 'bg-red-100 text-red-700')
+    return ('SHORT', 'bg-red-100 text-red-700') if side == 'Call' else ('LONG', 'bg-green-100 text-green-700')
 
 def _position_row_accent(side, buy_mode, trade):
     """Left accent border class for an Open Positions row. Mode-aware via _trade_is_red, so
     it matches every other card's color convention: Sell Mode unchanged (Call=red border,
     Put=green border); Buy Mode flips (Buy Call=green border since it's a bullish long, Buy
-    Put=red border since it's a bearish long). Fixes: this was previously hardcoded to
-    'border-red-500' for Call / 'border-green-500' for Put regardless of mode, which is why
-    a Buy Mode Call (long/bullish) position was showing with a red accent instead of green."""
+    Put=red border since it's a bearish long)."""
     is_red = _trade_is_red(side, buy_mode, trade)
     return 'border-red-500' if is_red else 'border-green-500'
+
+def _set_position_row_style(row, side, buy_mode, trade):
+    """SINGLE source of truth for an Open Positions row's classes AND visibility. Both must
+    always be set together in one call, in this exact order (classes first, visibility
+    second): row.classes(replace=...) overwrites the element's ENTIRE class list, including
+    whatever 'hidden' class set_visibility() previously added -- calling classes(replace=...)
+    without immediately re-applying visibility afterward silently un-hides the row (this was
+    the real cause of rows staying visible with no trade, and of stale/incorrect accent
+    colors from whichever code path last touched classes). Every caller (build time and every
+    tick in auto_run.py's update_ui()) MUST go through this one function -- never call
+    row.classes(replace=...) or row.set_visibility(...) on a position row directly."""
+    accent = _position_row_accent(side, buy_mode, trade)
+    row.classes(replace=f"w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm")
+    row.set_visibility(trade is not None)
 
 def _position_row(side, on_close=None):
     """One row of the Open Positions section. Only visible while that side has an active
     trade. Values (mark/size/pnl/entry/qty/symbol) are populated live each tick by
     auto_run.py's update_ui(), the same pattern already used for the banner cards.
 
-    The side badge (previously hardcoded to always say 'SHORT') is now a live label driven
-    by the trade's own recorded direction, via update_ui() setting its text/classes each
-    tick (ui_refs[f'{prefix}_pos_side_label']) -- SELL trades show 'SHORT', BUY trades (i.e.
-    Options Buy Mode) show 'BUY'.
-
-    The left accent border (previously hardcoded Call=red/Put=green regardless of mode) is
-    now driven by _position_row_accent, reactive to BOTH options_buy_mode changes AND the
-    trade opening/closing (via the active_trades bind hook below), so a Buy Mode Call
-    position correctly shows green and a Buy Mode Put position correctly shows red.
+    Classes AND visibility for the outer row are always set together via
+    _set_position_row_style (see its docstring for why) -- both at build time here and every
+    tick from auto_run.py's update_ui(), so they can never drift out of sync.
 
     Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
     call_index_stop_active etc, the same params the 'Exit based on Index' cards use) rather
     than the PnL-based Auto Close values, and always check on live price: toggling either
     switch forces the corresponding *_index_stop_time/*_index_target_time to 'Current'."""
     prefix = 'call' if side == 'Call' else 'put'
-    init_accent = _position_row_accent(side, params.get('options_buy_mode', False), shared_state['active_trades'].get(side))
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
 
     def force_live(_e=None, key=None):
         params[key] = 'Current'
 
-    with ui.card().classes(f'w-full bg-white border-l-4 {init_accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
-        row.bind_visibility_from(shared_state['active_trades'], side, backward=lambda v: v is not None)
+    with ui.card().classes('w-full bg-white border-l-4 border-gray-300 border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         ui_refs[f'{prefix}_pos_row'] = row
+        _set_position_row_style(row, side, params.get('options_buy_mode', False), shared_state['active_trades'].get(side))
 
-        # Re-applies the accent border whenever options_buy_mode changes (mode toggled while
-        # this row happens to be visible) via the same hidden-hook pattern as _bind_card_colors.
-        def _apply_accent_on_mode(buy_mode, r=row, s=side, pfx=prefix):
-            accent = _position_row_accent(s, buy_mode, shared_state['active_trades'].get(s))
-            r.classes(replace=f"w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm")
+        # Re-applies style+visibility together whenever options_buy_mode changes (mode toggled
+        # while this row happens to be visible or hidden).
+        def _apply_row_style_on_mode(buy_mode, r=row, s=side):
+            _set_position_row_style(r, s, buy_mode, shared_state['active_trades'].get(s))
             return ''
         _mode_hook = ui.label('').classes('hidden')
-        _mode_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_accent_on_mode)
+        _mode_hook.bind_text_from(params, 'options_buy_mode', backward=_apply_row_style_on_mode)
 
         with ui.row().classes('w-full justify-between items-center flex-wrap gap-2'):
             with ui.row().classes('items-center gap-2'):
