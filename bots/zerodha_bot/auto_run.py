@@ -994,17 +994,6 @@ def update_ui():
 
     # --- OPEN POSITIONS section (kept alongside the banner cards above) ---
     open_count = 0
-    # Explicit visibility control for the Open Positions rows: force-hidden whenever there is
-    # no active trade on that side, rather than relying solely on the bind_visibility_from
-    # hook set up at build time in ui_components._position_row. That binding watches a plain
-    # dict key (shared_state['active_trades'][side]), which NiceGUI's binding refresh loop
-    # does poll, but driving it explicitly here -- in the same per-tick function that already
-    # drives every other Open Positions value -- is the same reliable pattern already used for
-    # every other value in this function, and guarantees the row can never be stuck visible.
-    if ui_refs.get('call_pos_row'):
-        ui_refs['call_pos_row'].set_visibility(tc is not None)
-    if ui_refs.get('put_pos_row'):
-        ui_refs['put_pos_row'].set_visibility(tp is not None)
 
     if tc and ui_refs.get('call_pos_symbol'):
         open_count += 1
@@ -1018,7 +1007,6 @@ def update_ui():
         c = 'text-green-600' if tc['pnl'] >= 0 else 'text-red-600'
         ui_refs['call_pos_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
         ui_refs['call_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
-        # Side badge (fixes: previously hardcoded to always say 'SHORT' regardless of mode).
         if ui_refs.get('call_pos_side_label'):
             if tc.get('direction', 'SELL') == 'BUY':
                 ui_refs['call_pos_side_label'].set_text('BUY')
@@ -1026,13 +1014,6 @@ def update_ui():
             else:
                 ui_refs['call_pos_side_label'].set_text('SHORT')
                 ui_refs['call_pos_side_label'].classes(replace='bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
-        # Left accent border (fixes: previously hardcoded red for Call regardless of mode --
-        # a Buy Mode Call position, being bullish/long, must show green instead). Re-evaluated
-        # every tick from the trade's own recorded direction via comp._position_row_accent, so
-        # it updates the instant a position opens rather than only when options_buy_mode toggles.
-        if ui_refs.get('call_pos_row'):
-            accent_c = comp._position_row_accent('Call', params.get('options_buy_mode', False), tc)
-            ui_refs['call_pos_row'].classes(replace=f"w-full bg-white border-l-4 {accent_c} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm")
 
     if tp and ui_refs.get('put_pos_symbol'):
         open_count += 1
@@ -1046,10 +1027,6 @@ def update_ui():
         c = 'text-green-600' if tp['pnl'] >= 0 else 'text-red-600'
         ui_refs['put_pos_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
         ui_refs['put_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
-        # Side badge (fixes: previously hardcoded to always say 'SHORT' regardless of side/
-        # mode -- Sell Mode Put is actually a LONG position (sell PE), distinct from Call's
-        # SHORT (sell CE), so they must not share one label. Matches
-        # comp._position_side_badge's corrected Call=SHORT/Put=LONG mapping.).
         if ui_refs.get('put_pos_side_label'):
             if tp.get('direction', 'SELL') == 'BUY':
                 ui_refs['put_pos_side_label'].set_text('BUY')
@@ -1057,12 +1034,16 @@ def update_ui():
             else:
                 ui_refs['put_pos_side_label'].set_text('LONG')
                 ui_refs['put_pos_side_label'].classes(replace='bg-green-100 text-green-700 text-[10px] font-bold px-2 py-0.5 rounded')
-        # Left accent border (fixes: previously hardcoded green for Put regardless of mode --
-        # a Buy Mode Put position, being bearish/long-PE, must show red instead). Same
-        # per-tick refresh pattern as the Call side above.
-        if ui_refs.get('put_pos_row'):
-            accent_p = comp._position_row_accent('Put', params.get('options_buy_mode', False), tp)
-            ui_refs['put_pos_row'].classes(replace=f"w-full bg-white border-l-4 {accent_p} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm")
+
+    # Row classes AND visibility are ALWAYS set together via comp._set_position_row_style --
+    # never call .classes(replace=...) or .set_visibility(...) on these rows separately (that
+    # split caused the earlier bug: replacing classes silently wiped the 'hidden' class,
+    # leaving the row visible with no trade). Called unconditionally every tick, for both
+    # sides, regardless of whether tc/tp exist.
+    if ui_refs.get('call_pos_row'):
+        comp._set_position_row_style(ui_refs['call_pos_row'], 'Call', params.get('options_buy_mode', False), tc)
+    if ui_refs.get('put_pos_row'):
+        comp._set_position_row_style(ui_refs['put_pos_row'], 'Put', params.get('options_buy_mode', False), tp)
 
     if ui_refs.get('open_positions_count'):
         ui_refs['open_positions_count'].set_text(f"{open_count} position{'s' if open_count != 1 else ''}")

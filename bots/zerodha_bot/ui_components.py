@@ -389,6 +389,17 @@ def premium_exit_card(side):
                     ui.button('Set', color='black', on_click=act_t).props('outline').classes('grow h-6 text-[10px] rounded')
                     ui.button('Reset', on_click=rst_t).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
 
+def _log_alert_action(message):
+    """Writes an entry into the shared Trade Event Log (shared_state['activity_log']) -- the
+    exact same store LogicEngine.log_action() writes to in logic_engine.py, using the same
+    '[HH:MM:SS] message' format and 100-entry cap -- so alert add/modify/cancel show up
+    alongside trade opens/closes/fires in one unified log. Defined here rather than calling
+    into LogicEngine since these UI handlers have no LogicEngine instance available; writing
+    directly to shared_state keeps a single source of truth for the log's storage."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    shared_state['activity_log'].insert(0, f"[{timestamp}] {message}")
+    shared_state['activity_log'] = shared_state['activity_log'][:100]
+
 def _add_alert_card(direction, side_label, input_key, period_key, notify_fn):
     """'Add Alert' form for one direction (Upper or Lower). Unlike the old single-slot
     version, this does NOT hold the alert's live state -- clicking 'Add' appends a brand new,
@@ -424,6 +435,7 @@ def _add_alert_card(direction, side_label, input_key, period_key, notify_fn):
             shared_state['alerts'].append(new_alert)
             params[input_key] = 0  # clear the form so the next alert starts fresh
             notify_fn(f"{side_label} Alert ADDED: {value}", type='positive')
+            _log_alert_action(f"🔔 {side_label} Alert Set: {value} ({new_alert['period']})")
 
         ui.button('Add Alert', color='orange', on_click=add_alert).classes('w-full h-8 rounded-lg')
 
@@ -500,33 +512,31 @@ def _alert_row(alert):
             with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
                 ui.label(alert['created_at']).classes('w-16 text-gray-400 font-mono')
                 ui.label(label).classes(label_cls)
-                ui.label(f"idx {'>=' if direction == 'upper' else '<='} {alert['value']}").classes('w-32 font-mono text-gray-800')
-                ui.label(alert['period']).classes('w-16 text-gray-500')
-                ui.label(alert['sound']).classes('w-32 text-purple-700')
-                ui.label(f"{alert['duration']}s").classes('w-12 text-gray-500')
+                # These four are bound directly to the SAME dict object stored in
+                # shared_state['alerts'] (not a static f-string snapshot) so that CONFIRM's
+                # in-place mutation of that dict (see confirm_changes below) is reflected here
+                # immediately. Without this, the header kept showing the pre-MODIFY value: rows
+                # are only rebuilt when the alert id SET changes (see render_active_alerts),
+                # not on every field edit, so a static label set once at build time would never
+                # picked up a later in-place change to the same alert.
+                ui.label().bind_text_from(alert, 'value', backward=lambda v, d=direction: f"idx {'>=' if d == 'upper' else '<='} {v}").classes('w-32 font-mono text-gray-800')
+                ui.label().bind_text_from(alert, 'period').classes('w-16 text-gray-500')
+                ui.label().bind_text_from(alert, 'sound').classes('w-32 text-purple-700')
+                ui.label().bind_text_from(alert, 'duration', backward=lambda v: f"{v}s").classes('w-12 text-gray-500')
                 ui.label('PENDING').classes('bg-orange-500 text-white px-2 py-0.5 rounded text-[10px] font-bold')
                 ui.space()
 
                 def cancel_alert():
                     shared_state['alerts'] = [a for a in shared_state['alerts'] if a.get('id') != alert_id]
                     ui.notify(f"{label} Alert Cancelled", type='info')
+                    _log_alert_action(f"🔔 {label} Alert Cancelled: {alert['value']}")
 
                 def open_modify():
                     live = _find()
                     if live:
                         draft['value'] = live['value']; draft['period'] = live['period']
                         draft['sound'] = live['sound']; draft['duration'] = live['duration']
-                    # Force-open on the NEXT event loop tick, not immediately: the header's own
-                    # click toggle handler runs in the same click event as this button (click.stop
-                    # prevents the DOM bubble, but Quasar's expansion internally still flips its
-                    # own v-model on click of anything inside the header slot in some versions),
-                    # so setting exp.value=True here could get immediately re-toggled back to
-                    # False by that same click. Deferring by one tick lets any such toggle finish
-                    # first, then forces it open afterward -- fixes MODIFY collapsing instead of
-                    # expanding.
-                    def _force_open():
-                        exp.value = True
-                    ui.timer(0.05, _force_open, once=True)
+                    exp.value = True
 
                 ui.button('MODIFY').props('flat dense size=sm no-caps').classes('text-[10px] text-blue-600').on('click.stop', open_modify)
                 ui.button('CANCEL').props('flat dense size=sm no-caps').classes('text-[10px] text-red-600').on('click.stop', cancel_alert)
@@ -557,6 +567,7 @@ def _alert_row(alert):
                 live['value'] = value; live['period'] = draft['period']
                 live['sound'] = draft['sound']; live['duration'] = draft['duration']
                 ui.notify(f"{label} Alert Updated", type='positive')
+                _log_alert_action(f"🔔 {label} Alert Modified: {value} ({draft['period']})")
                 exp.value = False
 
             with ui.row().classes('w-full gap-2'):
@@ -567,11 +578,15 @@ def _alert_row(alert):
 def render_active_alerts():
     """'ACTIVE ALERTS' section: lists every pending price alert in shared_state['alerts'],
     any number per direction, each independently editable (MODIFY) or cancellable (CANCEL).
-    Rebuilds its rows on a short timer since alerts can be added (from the Add Alert cards)
-    or removed (fired by LogicEngine._check_alerts, or cancelled here) from outside this
-    render call -- NiceGUI has no built-in reactive 'for each item in a list' binding, so a
-    periodic refresh_view is the same pattern already used for render_order_history's
-    _refresh_history_table."""
+
+    Rows are only cleared and rebuilt when the SET of alert ids actually changes (an alert
+    added or removed/fired) -- NOT on every 1s timer tick regardless. The real cause of
+    'MODIFY keeps collapsing' was that an earlier version unconditionally called
+    rows_container.clear() + rebuilt every row every second; any expansion the user had just
+    opened via MODIFY was destroyed and recreated (collapsed by default) within ~1 second of
+    opening it, which looked exactly like the click itself failing. Only touching the DOM
+    when the id set changes leaves an open expansion alone indefinitely while nothing is
+    added/removed elsewhere."""
     with ui.card().classes('w-full bg-white p-3 gap-2 rounded-xl shadow-sm mb-4 border border-gray-200'):
         with ui.row().classes('w-full justify-between items-center mb-1'):
             ui.label('ACTIVE ALERTS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
@@ -580,10 +595,19 @@ def render_active_alerts():
         rows_container = ui.column().classes('w-full gap-1')
         empty_lbl = ui.label('No active alerts.').classes('w-full text-center text-xs text-gray-400 italic')
 
+        last_ids = {'ids': None}
+
         def refresh_view():
             alerts = shared_state.get('alerts', [])
             count_lbl.set_text(f"{len(alerts)} pending")
             empty_lbl.set_visibility(len(alerts) == 0)
+
+            current_ids = tuple(a.get('id') for a in alerts)
+            if current_ids == last_ids['ids']:
+                return  # nothing added/removed -- leave existing rows (and any open MODIFY
+                        # expansion) completely untouched
+            last_ids['ids'] = current_ids
+
             rows_container.clear()
             with rows_container:
                 for alert in alerts:
@@ -597,7 +621,7 @@ def render_active_alerts():
 def _position_side_badge(side, buy_mode, trade):
     """SHORT/LONG (Sell Mode) or BUY (Buy Mode) badge text+color for the Open Positions row.
     Reads the trade's OWN recorded direction when a trade exists (so history/labels never
-    flip just because the global toggle changed later); falls back to the live buy_mode flag
+    flip just because the global toggle changes later); falls back to the live buy_mode flag
     only when no trade is present yet (e.g. right when a position is being opened, before the
     trade dict is fully populated in shared_state).
 
@@ -624,18 +648,38 @@ def _position_row_accent(side, buy_mode, trade):
     return 'border-red-500' if is_red else 'border-green-500'
 
 def _set_position_row_style(row, side, buy_mode, trade):
-    """SINGLE source of truth for an Open Positions row's classes AND visibility. Both must
-    always be set together in one call, in this exact order (classes first, visibility
-    second): row.classes(replace=...) overwrites the element's ENTIRE class list, including
-    whatever 'hidden' class set_visibility() previously added -- calling classes(replace=...)
-    without immediately re-applying visibility afterward silently un-hides the row (this was
-    the real cause of rows staying visible with no trade, and of stale/incorrect accent
-    colors from whichever code path last touched classes). Every caller (build time and every
-    tick in auto_run.py's update_ui()) MUST go through this one function -- never call
-    row.classes(replace=...) or row.set_visibility(...) on a position row directly."""
-    accent = _position_row_accent(side, buy_mode, trade)
-    row.classes(replace=f"w-full bg-white border-l-4 {accent} border border-gray-200 rounded-lg p-3 gap-2 shadow-sm")
-    row.set_visibility(trade is not None)
+    """SINGLE source of truth for an Open Positions row's accent color AND visibility.
+
+    These two concerns are DELIBERATELY handled through two completely independent
+    mechanisms so that updating one can never accidentally clobber the other:
+      - Color: applied via row.style(...) (a MERGE into the element's inline style dict),
+        never via row.classes(replace=...). classes(replace=...) overwrites the ENTIRE class
+        list, which is what silently wiped out visibility state in earlier attempts at this
+        fix. style() only touches the one CSS property named, leaving everything else --
+        including any visibility-related class or style -- untouched.
+      - Visibility: applied via a direct 'display' CSS style (the most fundamental, literal
+        way to hide an element in a browser -- it cannot be undone by any classes() call
+        elsewhere, since classes() and style() are separate attributes on the element). This
+        does NOT rely on NiceGUI's set_visibility()/bind_visibility_from() abstractions at
+        all, which is intentional: those are the mechanisms earlier fix attempts already went
+        through, and the row was still staying visible, meaning something about how they
+        interact with the Tailwind 'hidden' class and repeated classes(replace=...) calls in
+        this codebase was not reliably taking effect. A raw 'display: none' style is the
+        floor -- there's no lower-level way to hide a DOM element that a framework could
+        still override out from under us.
+
+    Every caller (build time in _position_row, and every tick in auto_run.py's update_ui())
+    MUST go through this one function -- never call row.classes(replace=...) or
+    row.set_visibility(...) on a position row directly."""
+    is_red = _trade_is_red(side, buy_mode, trade)
+    color = '#ef4444' if is_red else '#22c55e'  # Tailwind red-500 / green-500
+    row.style(f'border-left-color: {color} !important')
+    if trade is not None:
+        row.style('display: block !important')
+        row.set_visibility(True)
+    else:
+        row.style('display: none !important')
+        row.set_visibility(False)
 
 def _position_row(side, on_close=None):
     """One row of the Open Positions section. Only visible while that side has an active

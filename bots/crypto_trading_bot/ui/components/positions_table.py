@@ -443,10 +443,15 @@ def _max_pl(
     mp_str = ml_str = '—'
     if entry <= 0 or qty <= 0:
         return mp_str, ml_str
+
+    def _pnl(price: float) -> float:
+        raw = (price - entry) if is_long else (entry - price)
+        return raw * qty - price * qty * taker
+
     if stop:
-        ml = abs(entry - stop) * qty + stop * qty * taker
-        ml_str = f'-${ml:,.4f}'
+        pnl = _pnl(stop)
+        ml_str = f'{"+" if pnl >= 0 else "-"}${abs(pnl):,.4f}'
     if tgt:
-        mp = abs(tgt - entry) * qty - tgt * qty * taker
-        mp_str = f'+${mp:,.4f}' if mp > 0 else f'${mp:,.4f}'
+        pnl = _pnl(tgt)
+        mp_str = f'{"+" if pnl >= 0 else "-"}${abs(pnl):,.4f}'
     return mp_str, ml_str
