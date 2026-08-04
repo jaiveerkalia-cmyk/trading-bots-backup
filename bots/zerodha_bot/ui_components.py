@@ -86,6 +86,93 @@ def _bind_btn_color(button, side, red_color='red', green_color='green'):
     hook = ui.label('').classes('hidden')
     hook.bind_text_from(params, 'options_buy_mode', backward=_apply)
 
+# --- ORDER-SANITY WARNING SYSTEM ---
+# Shared by the unified Open Short/Long entry cards, Premium Exit cards, and Index Exit cards.
+# None of these BLOCK the action -- they show a confirmation dialog ('Proceed Anyway' /
+# 'Cancel') so a legitimate edge case is never locked out, but an obvious mistake (a trigger
+# that will fire the instant it's armed, or a stop/target value that's wildly far from the
+# current price) gets a chance to be caught first.
+
+def _confirm_warning(message, on_proceed):
+    """Shows a warning dialog with the given message (one or more lines); calls on_proceed()
+    ONLY if the person clicks 'Proceed Anyway'. Clicking 'Cancel' (or closing the dialog)
+    leaves everything untouched -- nothing is armed/set until confirmed."""
+    with ui.dialog() as dialog, ui.card().classes('p-4 gap-3 max-w-md'):
+        ui.label('⚠️ Check Your Order').classes('font-bold text-orange-700 text-sm')
+        for line in message.split('\n\n'):
+            ui.label(line).classes('text-xs text-gray-700')
+        with ui.row().classes('w-full gap-2 justify-end mt-2'):
+            ui.button('Cancel', on_click=dialog.close).props('flat').classes('text-gray-600')
+            def proceed():
+                dialog.close()
+                on_proceed()
+            ui.button('Proceed Anyway', color='orange', on_click=proceed)
+    dialog.open()
+
+def _unified_instant_fire_warning(side, order_type, buy_mode, idx_ltp, trigger_price):
+    """For the unified Open Short/Long entry card. Returns a warning message if arming this
+    Limit/Stop-Market trigger RIGHT NOW would fire immediately as a market order on the very
+    next tick -- i.e. the exact condition LogicEngine._check_unified_open checks is already
+    true. Mirrors that function's direction rules exactly (Sell Mode vs Buy Mode, Call vs
+    Put) so this warning is never wrong about what will actually happen. In that case the
+    person most likely meant the OTHER order type, since Limit and Stop-Market are
+    opposite-direction triggers for the same side/mode."""
+    if trigger_price <= 0 or idx_ltp <= 0: return None
+    fires_now = False
+    if not buy_mode:
+        if order_type == 'Stop-Market':
+            fires_now = (idx_ltp <= trigger_price) if side == 'Call' else (idx_ltp >= trigger_price)
+        elif order_type == 'Limit':
+            fires_now = (idx_ltp >= trigger_price) if side == 'Call' else (idx_ltp <= trigger_price)
+    else:
+        if order_type == 'Stop-Market':
+            fires_now = (idx_ltp >= trigger_price) if side == 'Call' else (idx_ltp <= trigger_price)
+        elif order_type == 'Limit':
+            fires_now = (idx_ltp <= trigger_price) if side == 'Call' else (idx_ltp >= trigger_price)
+    if not fires_now: return None
+    other = 'Stop-Market' if order_type == 'Limit' else 'Limit'
+    return (f"This {order_type} trigger ({trigger_price}) will fire IMMEDIATELY as a market order, "
+            f"since the index is already at {idx_ltp:.2f}. Did you mean to place a {other} order instead?")
+
+def _premium_instant_fire_warning(is_stop, is_buy_trade, value, current):
+    """For Premium Exit Stop/Target. Returns a warning if this value has ALREADY been crossed
+    by the live option premium, so it would close the position the instant it's set. Premium
+    exit direction depends only on the trade's own direction (BUY vs SELL) -- NOT on Call vs
+    Put -- exactly mirroring LogicEngine._check_exits's PREMIUM EXITS branch."""
+    if value <= 0 or current <= 0: return None
+    if is_stop:
+        crossed = (current <= value) if is_buy_trade else (current >= value)
+    else:
+        crossed = (current >= value) if is_buy_trade else (current <= value)
+    if not crossed: return None
+    kind = 'Stop' if is_stop else 'Target'
+    return f"{kind} value ({value}) has already been reached by the current premium ({current:.2f}) -- this will fire IMMEDIATELY."
+
+def _index_instant_fire_warning(is_stop, side, buy_mode, value, current):
+    """For Index Exit Stop/Target. Returns a warning if this value has ALREADY been crossed by
+    the live index price, so it would close the position the instant it's set. Index exit
+    direction depends on BOTH side (Call/Put) and the global options_buy_mode toggle, exactly
+    mirroring LogicEngine._check_exits's INDEX EXITS branch."""
+    if value <= 0 or current <= 0: return None
+    if not buy_mode:
+        if side == 'Call': crossed = (current >= value) if is_stop else (current <= value)
+        else: crossed = (current <= value) if is_stop else (current >= value)
+    else:
+        if side == 'Call': crossed = (current <= value) if is_stop else (current >= value)
+        else: crossed = (current >= value) if is_stop else (current <= value)
+    if not crossed: return None
+    kind = 'Stop' if is_stop else 'Target'
+    return f"{kind} value ({value}) has already been reached by the current index price ({current:.2f}) -- this will fire IMMEDIATELY."
+
+def _pct_away_warning(value, current, kind_label):
+    """Generic 'sanity check' warning shared by Premium and Index Exit: flags a Stop/Target
+    value that's more than 10% away from the current price, regardless of direction -- a
+    likely typo (e.g. an extra/missing digit) rather than an intentional wide stop."""
+    if value <= 0 or current <= 0: return None
+    pct = abs(value - current) / current
+    if pct <= 0.10: return None
+    return f"{kind_label} value ({value}) is {pct*100:.0f}% away from the current price ({current:.2f})."
+
 # --- CONTROL CARDS ---
 
 def entry_card(side, label, mode_key, input_key, on_open=None, on_close=None):
@@ -188,15 +275,29 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
         def fire_or_arm():
             if params[order_key] == 'Market':
                 if on_fire_market: on_fire_market()
-            else:
+                return
+
+            order_type = params[order_key]
+            try: trigger_price = float(params[trig_key])
+            except (ValueError, TypeError): trigger_price = 0
+            idx_ltp = shared_state.get(params['trading_index'], {}).get('ltp', 0)
+            buy_mode = params.get('options_buy_mode', False)
+
+            def _do_arm():
                 # Stamp the arm time so the timing-boundary check in
                 # LogicEngine._check_unified_open requires the NEXT candle close after this
                 # moment, not any boundary crossing (fixes: arming during a boundary-minute
                 # firing on the very next tick instead of waiting a full period).
                 params[f'{prefix}_armed_at'] = datetime.now()
                 params[armed_key] = True
-                status.set_text(f"ARMED: {params[order_key]} @ {params[trig_key]} ({params[fire_key]})")
+                status.set_text(f"ARMED: {order_type} @ {trigger_price} ({params[fire_key]})")
                 ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} ARMED", type='positive')
+
+            warning = _unified_instant_fire_warning(side, order_type, buy_mode, idx_ltp, trigger_price)
+            if warning:
+                _confirm_warning(warning, _do_arm)
+            else:
+                _do_arm()
 
         def cancel():
             # Full reset: trigger price + every other field back to default (not just disarm).
@@ -292,9 +393,24 @@ def index_exit_component(side, label, time_key, value_key, active_key):
             ui.radio(UI_OPTS['index_times'], value=params[time_key]).bind_value(params, time_key).props('inline dense scale=0.8')
         status = ui.label().classes('w-full text-center text-[10px] font-bold text-green-800 bg-green-100 rounded')
         status.bind_visibility_from(params, active_key)
-        def activate():
+        def _do_activate():
             params[active_key] = True; status.set_text(f"ON: {params[value_key]}")
             ui.notify(f"{side} Index {label} SET", type='positive')
+        def activate():
+            try: value = float(params[value_key])
+            except (ValueError, TypeError): value = 0
+            idx_ltp = shared_state.get(params['trading_index'], {}).get('ltp', 0)
+            buy_mode = params.get('options_buy_mode', False)
+            is_stop = (label == 'Stop')
+            warnings = []
+            w1 = _index_instant_fire_warning(is_stop, side, buy_mode, value, idx_ltp)
+            if w1: warnings.append(w1)
+            w2 = _pct_away_warning(value, idx_ltp, label)
+            if w2: warnings.append(w2)
+            if warnings:
+                _confirm_warning('\n\n'.join(warnings), _do_activate)
+            else:
+                _do_activate()
         def reset():
             params[active_key] = False; params[value_key] = 0
             ui.notify(f"{side} Index {label} RESET", type='info')
@@ -351,10 +467,26 @@ def premium_exit_card(side):
                 stop_status = ui.label().classes('w-full text-center text-[10px] font-bold text-red-800 bg-red-100 rounded')
                 stop_status.bind_visibility_from(params, f'{s}_prem_stop_active')
                 def make_stop_handlers(sd, ss):
-                    def activate():
+                    def _do_activate():
                         params[f'{sd}_prem_stop_active'] = True
                         ss.set_text(f"ON: {params[f'{sd}_prem_stop_val']}")
                         ui.notify(f"{sd} Prem Stop SET", type='positive')
+                    def activate():
+                        try: value = float(params[f'{sd}_prem_stop_val'])
+                        except (ValueError, TypeError): value = 0
+                        trade = shared_state['active_trades'].get(side)
+                        warnings = []
+                        if trade is not None:
+                            is_buy_trade = trade.get('direction', 'SELL') == 'BUY'
+                            current = trade['main']['current_price']
+                            w1 = _premium_instant_fire_warning(True, is_buy_trade, value, current)
+                            if w1: warnings.append(w1)
+                            w2 = _pct_away_warning(value, current, 'Stop')
+                            if w2: warnings.append(w2)
+                        if warnings:
+                            _confirm_warning('\n\n'.join(warnings), _do_activate)
+                        else:
+                            _do_activate()
                     def reset():
                         params[f'{sd}_prem_stop_active'] = False
                         params[f'{sd}_prem_stop_val'] = 0
@@ -375,10 +507,26 @@ def premium_exit_card(side):
                 tgt_status = ui.label().classes('w-full text-center text-[10px] font-bold text-green-800 bg-green-100 rounded')
                 tgt_status.bind_visibility_from(params, f'{s}_prem_tgt_active')
                 def make_tgt_handlers(sd, ts):
-                    def activate():
+                    def _do_activate():
                         params[f'{sd}_prem_tgt_active'] = True
                         ts.set_text(f"ON: {params[f'{sd}_prem_target_val']}")
                         ui.notify(f"{sd} Prem Target SET", type='positive')
+                    def activate():
+                        try: value = float(params[f'{sd}_prem_target_val'])
+                        except (ValueError, TypeError): value = 0
+                        trade = shared_state['active_trades'].get(side)
+                        warnings = []
+                        if trade is not None:
+                            is_buy_trade = trade.get('direction', 'SELL') == 'BUY'
+                            current = trade['main']['current_price']
+                            w1 = _premium_instant_fire_warning(False, is_buy_trade, value, current)
+                            if w1: warnings.append(w1)
+                            w2 = _pct_away_warning(value, current, 'Target')
+                            if w2: warnings.append(w2)
+                        if warnings:
+                            _confirm_warning('\n\n'.join(warnings), _do_activate)
+                        else:
+                            _do_activate()
                     def reset():
                         params[f'{sd}_prem_tgt_active'] = False
                         params[f'{sd}_prem_target_val'] = 0
