@@ -374,10 +374,17 @@ class LogicEngine:
         fire_15m = (curr_min % 15 == 0) and self.last_trigger_time['15m'] != curr_min
         fire_60m = (curr_min == 0) and self.last_trigger_time['60m'] != curr_min
 
-        # 15:19 Auto-Squareoff (SAVES PNL)
-        if now.time() >= AUTO_SQUAREOFF_TIME and now.time() < dtime(15, 20) and not shared_state['auto_sq_done']:
+        # 15:19 Auto-Squareoff. NOTE: in the current wiring this branch is effectively
+        # unreachable in practice, since run_bot_logic() (auto_run.py) only calls
+        # check_triggers() while now.time() < AutoConfig.SQ_OFF_TIME -- the actual EOD save
+        # happens in AutoController.run_loop()'s own priority block instead. Kept here as a
+        # defensive fallback (e.g. if that gating is ever changed) and updated to share the
+        # SAME 'daily_pnl_written' flag as every other close_all_positions(save_pnl=True)
+        # call, so that even if this branch ever does run, final_daily_pnl.csv still only
+        # gets written once per day, never twice.
+        if now.time() >= AUTO_SQUAREOFF_TIME and now.time() < dtime(15, 20) and not shared_state.get('daily_pnl_written', False):
             self.close_all_positions("15:19 Auto-SQ", save_pnl=True)
-            shared_state['auto_sq_done'] = True
+            shared_state['daily_pnl_written'] = True
             self.log_action("⚠️ 15:19 Day End Executed")
 
         if shared_state['active_trades']['Call'] is None and params['short_trigger_active']:
@@ -665,12 +672,20 @@ class LogicEngine:
         try: target = float(params['global_target_value']) if str(params['global_target_value']).strip() != '' else 0.0
         except ValueError: target = 0.0
 
+        # save_pnl=False on both: positions are still closed immediately here (that's a real
+        # trading action, not deferred), but the daily PnL CSV write is intentionally NOT done
+        # here. It's written exactly once per day, at the 15:19 EOD routine in
+        # AutoController.run_loop() (auto_run.py), which will correctly include whatever PnL
+        # this event locked in, since close_position() already appended it to
+        # shared_state['pnl']['trades_history']. Previously this wrote immediately (whenever
+        # the limit was hit intraday) AND the EOD routine wrote again at 15:19 since it had no
+        # way of knowing a report was already saved -- two rows per day for one session.
         if params['global_stop_active'] and stop > 0 and total <= -stop:
-            self.close_all_positions("Global Stop", save_pnl=True)
+            self.close_all_positions("Global Stop", save_pnl=False)
             self.trading_active = False
             self.play_sound('error')
         if params['global_tgt_active'] and target > 0 and total >= target:
-            self.close_all_positions("Global Target", save_pnl=True)
+            self.close_all_positions("Global Target", save_pnl=False)
             self.trading_active = False
             self.play_sound('error')
 

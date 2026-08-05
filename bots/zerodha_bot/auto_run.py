@@ -684,12 +684,17 @@ class AutoController:
                 self.clear_leg_fields('Put')
                 self.state = 'DONE'
                 self.log("🛑 Global Stop Hit. Triggers DISARMED.")
-                if not shared_state.get('daily_pnl_written', False):
-                    try:
-                        self.logic.close_all_positions("Global Stop", save_pnl=True)
-                        shared_state['daily_pnl_written'] = True
-                        shared_state['sound_queue'].append('error')
-                    except: pass
+                # Positions close immediately, but save_pnl=False: the daily PnL CSV is
+                # written exactly once, at the 15:19 EOD routine above (gated by
+                # daily_pnl_written), so it only ever gets one row per day regardless of
+                # whether this Auto Pilot global stop, the manual Global Stop/Target UI
+                # limits, or a manual Close All triggered the closure. Previously this wrote
+                # immediately AND set daily_pnl_written=True, which skipped the later EOD
+                # write -- now every closure path behaves the same way.
+                try:
+                    self.logic.close_all_positions("Global Stop", save_pnl=False)
+                    shared_state['sound_queue'].append('error')
+                except: pass
                 shared_state['active_trades']['Call'] = None
                 shared_state['active_trades']['Put'] = None
 
@@ -1306,9 +1311,13 @@ def handle_fire_market(side):
     ui.notify(m, type='positive' if s else 'negative')
 
 def handle_close_all():
-    """Wrapper to ensure CLOSE ALL button wipes both sides of the UI."""
+    """Wrapper to ensure CLOSE ALL button wipes both sides of the UI. save_pnl=False: the
+    daily PnL CSV (final_daily_pnl.csv) is written exactly once per day, at the 15:19 EOD
+    routine in AutoController.run_loop(), regardless of what closed positions intraday --
+    manual Close All, Global Stop/Target, or Auto Pilot's own global stop. Positions still
+    close immediately here; only the aggregate daily report write is deferred."""
     try:
-        logic.close_all_positions("Manual Close All", save_pnl=True)
+        logic.close_all_positions("Manual Close All", save_pnl=False)
         controller.clear_leg_fields('Call')
         controller.clear_leg_fields('Put')
         ui.notify("All Positions Closed manually", type='info')
