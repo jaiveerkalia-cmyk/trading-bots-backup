@@ -1221,6 +1221,24 @@ def run_trading_process():
                     return 0.0
             return 0.0
 
+        def wait_for_option_ltp(strike, opt_type, max_wait=3.0, poll_interval=0.1):
+            ltp = get_option_ltp(strike, opt_type)
+            if ltp > 0:
+                return ltp
+
+            deadline = time.time() + max_wait
+            while time.time() < deadline:
+                for tok, (s, t, sym) in token_to_sym.items():
+                    if s == strike and t == opt_type:
+                        with tick_lock:
+                            ltp = live_market_data.get(tok, 0.0)
+                        if ltp > 0:
+                            return ltp
+                        break
+                time.sleep(poll_interval)
+
+            return get_option_ltp(strike, opt_type)
+
         def get_option_sym(strike, opt_type):
             # Get trading symbol from cache
             for tok, (s, t, sym) in token_to_sym.items():
@@ -1275,19 +1293,22 @@ def run_trading_process():
             print(f"[{get_now_str()}] {action_str} {label} | ATM: {atm} | offset: +{offset} | CE strike: {entry_call_strike}", flush=True)
 
             # Subscribe only if not already in cache for this exact strike
+            subscribed_now = False
             if get_option_sym(entry_call_strike, 'CE') is None:
                 if not subscribe_option(entry_call_strike, 'CE'):
                     print(f"[{get_now_str()}] {action_str} {label} skipped  -  subscription failed for {entry_call_strike}", flush=True)
                     return False
-                time.sleep(3)  # allow websocket to deliver first tick
-
+                subscribed_now = True
             sym = get_option_sym(entry_call_strike, 'CE')
-            ltp = get_option_ltp(entry_call_strike, 'CE')   # WS first, REST fallback built-in
+            ltp = wait_for_option_ltp(entry_call_strike, 'CE') if subscribed_now else get_option_ltp(entry_call_strike, 'CE')
             if ltp == 0:
                 print(f"[{get_now_str()}] {action_str} {label} skipped  -  LTP is 0 (WS + REST both failed)", flush=True)
                 return False
 
-            place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE)
+            order_ok = place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE)
+            if not order_ok:
+                print(f"[{get_now_str()}] {action_str} {label} skipped  -  order placement failed for {sym}", flush=True)
+                return False
             exec_price = get_quote_price(kite, sym, order_side, exchange=OPT_EXCHANGE) if LIVE_MODE else ltp
 
             entry_call_price      = exec_price
@@ -1321,19 +1342,22 @@ def run_trading_process():
             print(f"[{get_now_str()}] {action_str} {label} | ATM: {atm} | offset: +{offset} | PE strike: {entry_put_strike}", flush=True)
 
             # Subscribe only if not already in cache for this exact strike
+            subscribed_now = False
             if get_option_sym(entry_put_strike, 'PE') is None:
                 if not subscribe_option(entry_put_strike, 'PE'):
                     print(f"[{get_now_str()}] {action_str} {label} skipped  -  subscription failed for {entry_put_strike}", flush=True)
                     return False
-                time.sleep(3)  # allow websocket to deliver first tick
-
+                subscribed_now = True
             sym = get_option_sym(entry_put_strike, 'PE')
-            ltp = get_option_ltp(entry_put_strike, 'PE')   # WS first, REST fallback built-in
+            ltp = wait_for_option_ltp(entry_put_strike, 'PE') if subscribed_now else get_option_ltp(entry_put_strike, 'PE')
             if ltp == 0:
                 print(f"[{get_now_str()}] {action_str} {label} skipped  -  LTP is 0 (WS + REST both failed)", flush=True)
                 return False
 
-            place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE)
+            order_ok = place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE)
+            if not order_ok:
+                print(f"[{get_now_str()}] {action_str} {label} skipped  -  order placement failed for {sym}", flush=True)
+                return False
             exec_price = get_quote_price(kite, sym, order_side, exchange=OPT_EXCHANGE) if LIVE_MODE else ltp
 
             entry_put_price      = exec_price

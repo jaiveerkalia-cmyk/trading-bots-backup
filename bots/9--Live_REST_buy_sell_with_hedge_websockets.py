@@ -100,11 +100,11 @@ DAY_CONFIGURATION = {
         'index_based_entry': True, 'atr_entry_multiplier': 2},
 
     # Thursday (SENSEX)
-    3: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:14', 'entry_gap': 10, 'strike_gap': 2, 'lots': 3, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
+    3: {'target_index': 'SENSEX', 'start': '09:16', 'exit': '15:14', 'entry_gap': 10, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': True, 'atr_ema_window': 20,
-        'atr_stop_per_lot': 10, 'atr_entry_gap': 20, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
+        'atr_stop_per_lot': 10, 'atr_entry_gap': 15, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
         'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': True,
-        'index_based_entry': True, 'atr_entry_multiplier': 2},
+        'index_based_entry': False, 'atr_entry_multiplier': 2},
 
    # Friday (NIFTY)
    4: {'target_index': 'NIFTY', 'start': '10:00', 'exit': '14:45', 'entry_gap': 5, 'strike_gap': 0, 'lots': 6, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
@@ -332,6 +332,68 @@ def get_ltp_safe(kite, symbol_list):
         except: time.sleep(1)
     return {}
 
+def get_initial_spot_price(kite, spot_symbol, start_time_str):
+    """Fetches the start spot price with live retries, then falls back to the start-minute candle open."""
+    live_retry_started_at = time.time()
+    live_retry_limit_seconds = 60
+    live_retry_delays = [1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    live_attempts = len(live_retry_delays) + 1
+
+    for attempt in range(live_attempts):
+        try:
+            ltp_data = kite.ltp([spot_symbol])
+            spot_ltp = float(ltp_data.get(spot_symbol, {}).get('last_price', 0) or 0)
+            if spot_ltp > 0:
+                print(f"[{get_now_str()}] Initial spot LTP fetched from live quote on attempt {attempt + 1}: {spot_ltp}", flush=True)
+                return spot_ltp
+            print(f"[{get_now_str()}] Initial spot LTP attempt {attempt + 1}/{live_attempts} returned invalid price: {spot_ltp}", flush=True)
+        except Exception as e:
+            print(f"[{get_now_str()}] Initial spot LTP attempt {attempt + 1}/{live_attempts} failed: {e}", flush=True)
+
+        elapsed = time.time() - live_retry_started_at
+        if elapsed >= live_retry_limit_seconds or attempt >= len(live_retry_delays):
+            break
+
+        sleep_seconds = min(live_retry_delays[attempt], max(0, live_retry_limit_seconds - elapsed))
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    try:
+        start_hour, start_minute = map(int, start_time_str.split(':'))
+        today = datetime.now(IST).date()
+        candle_start = IST.localize(datetime.combine(today, datetime.min.time()).replace(hour=start_hour, minute=start_minute, second=0, microsecond=0))
+        candle_end = candle_start + pd.Timedelta(minutes=1)
+        candle_ready_at = candle_start + pd.Timedelta(minutes=1, seconds=10)
+
+        while datetime.now(IST) < candle_ready_at:
+            wait_seconds = min(1, max(0, (candle_ready_at - datetime.now(IST)).total_seconds()))
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+
+        for attempt in range(5):
+            try:
+                quote = kite.quote(spot_symbol)
+                instrument_token = quote.get(spot_symbol, {}).get('instrument_token')
+                if not instrument_token:
+                    print(f"[{get_now_str()}] Historical spot fallback attempt {attempt + 1}/5 failed: instrument token missing for {spot_symbol}", flush=True)
+                else:
+                    candles = kite.historical_data(instrument_token, candle_start, candle_end, 'minute')
+                    if candles:
+                        spot_open = float(candles[0].get('open', 0) or 0)
+                        if spot_open > 0:
+                            print(f"[{get_now_str()}] Initial spot price fetched from historical {start_time_str} candle open on attempt {attempt + 1}: {spot_open}", flush=True)
+                            return spot_open
+                        print(f"[{get_now_str()}] Historical spot fallback attempt {attempt + 1}/5 returned invalid open price: {spot_open}", flush=True)
+                    else:
+                        print(f"[{get_now_str()}] Historical spot fallback attempt {attempt + 1}/5 returned no candles for {spot_symbol}", flush=True)
+            except Exception as e:
+                print(f"[{get_now_str()}] Historical spot fallback attempt {attempt + 1}/5 failed: {e}", flush=True)
+
+            time.sleep(1)
+    except Exception as e:
+        print(f"[{get_now_str()}] Historical spot fallback setup failed for {spot_symbol}: {e}", flush=True)
+
+    return 0
 def wait_for_next_check_interval(interval_minutes):
     """Sleeps until the next interval boundary, aligned to minute starts."""
     interval_minutes = max(1, int(interval_minutes))
@@ -785,7 +847,7 @@ def run_trading_process():
             
         # 6. Levels
         print(f"\n[{get_now_str()}] --- CALCULATING LEVELS ---", flush=True)
-        spot_ltp = get_ltp_safe(kite, [spot_sym_full]).get(spot_sym_full, {}).get('last_price', 0)
+        spot_ltp = get_initial_spot_price(kite, spot_sym_full, config['start'])
         
         if spot_ltp == 0:
             print(f"[{get_now_str()}] Error: Could not fetch Spot Price for {spot_sym_full}", flush=True)
