@@ -190,11 +190,11 @@ params = {
     # used by logic_engine._check_unified_open to require the fire_on boundary to be crossed
     # AFTER arming, not merely "any boundary crossing", so a card armed during a boundary
     # minute doesn't fire on the very next tick.
-    'call_order_type': 'Market', 'call_trigger_price': 0, 'call_strike_offset': 1,
+    'call_order_type': 'Market', 'call_trigger_price': 0, 'call_strike_offset': 2,
     'call_fire_on': 'Live', 'call_qty': 4, 'call_armed': False, 'call_armed_at': None,
     'call_new_stop': '', 'call_new_target': '',
 
-    'put_order_type': 'Market', 'put_trigger_price': 0, 'put_strike_offset': 1,
+    'put_order_type': 'Market', 'put_trigger_price': 0, 'put_strike_offset': 2,
     'put_fire_on': 'Live', 'put_qty': 4, 'put_armed': False, 'put_armed_at': None,
     'put_new_stop': '', 'put_new_target': '',
 }
