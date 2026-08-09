@@ -3,6 +3,7 @@ from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_sta
 from datetime import datetime
 import pandas as pd
 import uuid
+from pattern_engine import PATTERN_REGISTRY
 
 # --- SHARED HELPERS ---
 
@@ -1141,6 +1142,58 @@ def render_orderbook():
             )
         empty_lbl.bind_visibility_from(params, 'call_armed', backward=_nothing_active)
         ui_refs['orderbook_empty'] = empty_lbl
+
+# --- CANDLESTICK PATTERN INDICATORS (pattern_engine.py) ---
+
+def _pattern_row(key, meta):
+    """One card per registered pattern (bullish_engulfing, bearish_engulfing, and any future
+    entries added to pattern_engine.PATTERN_REGISTRY -- this loop picks them all up
+    automatically, no UI change needed to add a new pattern). On/off switch defaults to
+    whatever params currently holds (True by default, per pattern). Interval multi-select
+    defaults to ['5m']. 'Engulf candle count' controls how many subsequent closed candles are
+    combined into one synthetic candle before checking the engulfing condition against the
+    base candle (see pattern_engine.py for the exact mechanics); default 1 = standard
+    single-candle engulfing."""
+    enabled_key = meta['enabled_param']; intervals_key = meta['intervals_param']; count_key = meta['count_param']
+    with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 rounded-lg'):
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label(meta['label']).classes('font-bold text-sm text-gray-800')
+            ui.switch(value=params.get(enabled_key, True)).bind_value(params, enabled_key).props('dense color=green')
+
+        with ui.row().classes('w-full items-center gap-2'):
+            ui.label('Intervals:').classes('text-xs text-gray-500 w-16')
+            ui.select(UI_OPTS['pattern_intervals'], value=params.get(intervals_key, ['5m']), multiple=True) \
+                .bind_value(params, intervals_key).props('outlined dense bg-color=white use-chips').classes('grow')
+
+        with ui.row().classes('w-full items-center gap-2'):
+            ui.label('Engulf candle count:').classes('text-xs text-gray-500')
+            _num_stepper(params, count_key, step=1, label='Count')
+
+        status = ui.label('No signal yet.').classes('text-[10px] text-gray-400')
+
+        def _refresh(_e=None, k=key, lbl=status):
+            sig = shared_state.get('pattern_last_signal', {}).get(k)
+            if sig:
+                lbl.set_text(f"Last: {sig['interval']} candle @ {sig['candle_start']} (fired {sig['time']})")
+        _refresh()
+        ui.timer(2.0, _refresh)
+
+def render_pattern_indicators():
+    """'CANDLESTICK PATTERN INDICATORS' section, placed below Open Orders. One card per
+    pattern registered in pattern_engine.PATTERN_REGISTRY, plus a shared fetch-delay input
+    (seconds to wait after a candle boundary closes before fetching it via the historical
+    API -- gives the broker's candle data time to finalize; applies to every pattern/interval).
+    Detection itself runs from auto_run.run_bot_logic() via PatternEngine.check_patterns()."""
+    with ui.card().classes('w-full bg-white p-3 gap-3 rounded-xl shadow-sm mb-4 border border-gray-200'):
+        with ui.row().classes('w-full justify-between items-center'):
+            ui.label('CANDLESTICK PATTERN INDICATORS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
+
+        with ui.row().classes('w-full items-center gap-2'):
+            ui.label('Fetch Delay (sec, after candle close):').classes('text-xs text-gray-600')
+            ui.input().bind_value(params, 'pattern_fetch_delay_sec').props('outlined dense bg-color=white').classes('w-24')
+
+        for key, meta in PATTERN_REGISTRY.items():
+            _pattern_row(key, meta)
 
 # --- ORDER HISTORY (full options_tradebook.csv) ---
 

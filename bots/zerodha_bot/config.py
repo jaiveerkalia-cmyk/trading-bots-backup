@@ -90,6 +90,12 @@ shared_state = {
     # alert_lower_active flags). Lives in shared_state (not params) since these are
     # dynamic runtime instances, matching the existing active_trades/option_chain pattern.
     'alerts': [],
+
+    # --- Candlestick Pattern Indicators (pattern_engine.py) ---
+    # Per-interval diagnostic info: {'1m'|'5m'|'15m'|'1h': {'boundary_time','status','updated'} or None}
+    'pattern_debug': {},
+    # Per-pattern last fired signal (for UI display): {'bullish_engulfing'|'bearish_engulfing': {...}}
+    'pattern_last_signal': {},
 }
 
 # --- UI REFERENCES ---
@@ -134,6 +140,7 @@ UI_OPTS = {
     'order_types': ['Market', 'Limit', 'Stop-Market'],
     'fire_on_opts': ['Live', '1m', '5m', '15m', '60m'],
     'alert_sounds': list(ALERT_SOUND_URLS.keys()),
+    'pattern_intervals': ['1m', '5m', '15m', '1h'],
 }
 
 # --- USER PARAMETERS ---
@@ -197,4 +204,24 @@ params = {
     'put_order_type': 'Market', 'put_trigger_price': 0, 'put_strike_offset': 2,
     'put_fire_on': 'Live', 'put_qty': 4, 'put_armed': False, 'put_armed_at': None,
     'put_new_stop': '', 'put_new_target': '',
+
+    # --- Candlestick Pattern Indicators (pattern_engine.py) ---
+    # Seconds to wait AFTER a candle boundary closes before fetching it via historical API
+    # (gives the broker's candle data time to finalize). Applies to all patterns/intervals.
+    'pattern_fetch_delay_sec': 3,
+
+    # Bullish Engulfing: prev (base) candle red, current/synthetic candle green, and the
+    # synthetic candle's body fully engulfs the base candle's body.
+    'bullish_engulfing_enabled': True,
+    'bullish_engulfing_intervals': ['5m'],
+    # Engulf candle count: 1 = standard single-candle engulfing. N = combine the N most
+    # recently closed candles into one synthetic candle (open=first's open, close=last's
+    # close) and check that against the base candle immediately preceding the window.
+    'bullish_engulfing_count': 1,
+
+    # Bearish Engulfing: prev (base) candle green, current/synthetic candle red, and the
+    # synthetic candle's body fully engulfs the base candle's body.
+    'bearish_engulfing_enabled': True,
+    'bearish_engulfing_intervals': ['5m'],
+    'bearish_engulfing_count': 1,
 }

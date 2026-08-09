@@ -51,6 +51,7 @@ from auth_manager import get_kite_session
 from ticker_engine import TickerClient
 from instrument_manager import InstrumentManager
 from logic_engine import LogicEngine
+from pattern_engine import PatternEngine
 
 # ==========================================
 #      CONFIGURATION & CONSTANTS
@@ -820,6 +821,7 @@ if not kite: sys.exit(1)
 ticker = TickerClient(api_key, access_token)
 inst_manager = InstrumentManager(kite)
 logic = LogicEngine(ticker, inst_manager)
+pattern_engine = PatternEngine(inst_manager)
 controller = AutoController(logic, inst_manager)
 daily_logger = DailyLogger() 
 #ticker.start()
@@ -1427,6 +1429,7 @@ async def run_bot_logic():
                     if datetime.today().weekday() not in [5, 6]:
                         if now.time() < AutoConfig.SQ_OFF_TIME:
                             logic.check_triggers()
+                            pattern_engine.check_patterns()
                         else:
                             if params['short_trigger_active'] or params['long_trigger_active']:
                                 params['short_trigger_active'] = False
@@ -1485,8 +1488,10 @@ def index():
     # Open Positions (kept alongside the banner CALL/PUT POSITION cards)
     comp.render_open_positions(on_close_call=lambda: handle_close('Call'), on_close_put=lambda: handle_close('Put'))
 
-    # Order Book (pending Limit/Stop-Market triggers, table-styled) and Order History (full tradebook)
+    # Order Book (pending Limit/Stop-Market triggers, table-styled), Candlestick Pattern
+    # Indicators (below Open Orders), and Order History (full tradebook)
     comp.render_orderbook()
+    comp.render_pattern_indicators()
     comp.render_order_history()
 
     # 2. LOCAL TIMER
