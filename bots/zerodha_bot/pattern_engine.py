@@ -82,6 +82,8 @@ PATTERN_REGISTRY = {
         'intervals_param': 'bullish_engulfing_intervals',
         'count_param': 'bullish_engulfing_count',
         'detector': _detect_bullish_engulfing,
+        # UI card color (ui_components._pattern_row): light green for bullish setups.
+        'color': 'green',
     },
     'bearish_engulfing': {
         'label': 'Bearish Engulfing',
@@ -89,6 +91,8 @@ PATTERN_REGISTRY = {
         'intervals_param': 'bearish_engulfing_intervals',
         'count_param': 'bearish_engulfing_count',
         'detector': _detect_bearish_engulfing,
+        # UI card color (ui_components._pattern_row): light red for bearish setups.
+        'color': 'red',
     },
 }
 

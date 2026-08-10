@@ -841,14 +841,20 @@ def _position_row(side, on_close=None):
 
     Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
     call_index_stop_active etc, the same params the 'Exit based on Index' cards use) rather
-    than the PnL-based Auto Close values, and always check on live price: toggling either
-    switch forces the corresponding *_index_stop_time/*_index_target_time to 'Current'."""
+    than the PnL-based Auto Close values.
+
+    IMPORTANT: the switches here ONLY toggle *_index_stop_active/*_index_tgt_active. They no
+    longer touch *_index_stop_time/*_index_target_time (Current/1m/5m) -- a previous version
+    force-reset the period to 'Current' on every toggle, which silently discarded a 1m/5m
+    selection made in the separate 'Exit based on Index' card and made the exit check live on
+    every tick instead of waiting for the actual 1m/5m candle close (symptom: position closes
+    mid-candle instead of exactly at the candle close). The period is only ever changed via
+    the radio in index_exit_component, and whatever it's set to is respected here. A small
+    '(Current)'/'(1m)'/'(5m)' label next to each switch shows the currently active period at
+    a glance."""
     prefix = 'call' if side == 'Call' else 'put'
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
-
-    def force_live(_e=None, key=None):
-        params[key] = 'Current'
 
     with ui.card().classes('w-full bg-white border-l-4 border-gray-300 border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         ui_refs[f'{prefix}_pos_row'] = row
@@ -889,10 +895,12 @@ def _position_row(side, on_close=None):
 
         with ui.row().classes('w-full gap-3 items-center pt-2 border-t border-gray-200 flex-wrap'):
             ui.label('Idx Stop').classes('text-[10px] text-gray-500')
-            ui.switch(on_change=lambda e, k=stop_time_key: force_live(e, k)).bind_value(params, stop_active_key).props('dense color=red size=sm')
+            ui.label().bind_text_from(params, stop_time_key, backward=lambda v: f"({v})").classes('text-[9px] text-gray-400 -ml-2')
+            ui.switch().bind_value(params, stop_active_key).props('dense color=red size=sm')
             ui.input().bind_value(params, stop_val_key).props('outlined dense bg-color=white').classes('w-24')
             ui.label('Idx Target').classes('text-[10px] text-gray-500')
-            ui.switch(on_change=lambda e, k=tgt_time_key: force_live(e, k)).bind_value(params, tgt_active_key).props('dense color=green size=sm')
+            ui.label().bind_text_from(params, tgt_time_key, backward=lambda v: f"({v})").classes('text-[9px] text-gray-400 -ml-2')
+            ui.switch().bind_value(params, tgt_active_key).props('dense color=green size=sm')
             ui.input().bind_value(params, tgt_val_key).props('outlined dense bg-color=white').classes('w-24')
             ui.space()
             ui.button('CLOSE', color='red', on_click=on_close).classes('h-7 text-xs px-4 rounded font-bold')
@@ -1153,9 +1161,16 @@ def _pattern_row(key, meta):
     defaults to ['5m']. 'Engulf candle count' controls how many subsequent closed candles are
     combined into one synthetic candle before checking the engulfing condition against the
     base candle (see pattern_engine.py for the exact mechanics); default 1 = standard
-    single-candle engulfing."""
+    single-candle engulfing.
+
+    Background color comes from meta['color'] (registered per-pattern in
+    pattern_engine.PATTERN_REGISTRY: light green for bullish setups, light red for bearish)
+    so a future pattern just needs a 'color' entry there to get a themed card -- no UI change
+    needed. 'flex-1' (not 'w-full') so multiple cards sit side by side in the row built by
+    render_pattern_indicators, instead of stacking top to bottom."""
     enabled_key = meta['enabled_param']; intervals_key = meta['intervals_param']; count_key = meta['count_param']
-    with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 rounded-lg'):
+    color = meta.get('color', 'gray')
+    with ui.card().classes(f'flex-1 min-w-[300px] p-3 gap-2 bg-{color}-50 border border-{color}-200 rounded-lg'):
         with ui.row().classes('w-full items-center justify-between'):
             ui.label(meta['label']).classes('font-bold text-sm text-gray-800')
             ui.switch(value=params.get(enabled_key, True)).bind_value(params, enabled_key).props('dense color=green')
@@ -1180,10 +1195,13 @@ def _pattern_row(key, meta):
 
 def render_pattern_indicators():
     """'CANDLESTICK PATTERN INDICATORS' section, placed below Open Orders. One card per
-    pattern registered in pattern_engine.PATTERN_REGISTRY, plus a shared fetch-delay input
-    (seconds to wait after a candle boundary closes before fetching it via the historical
-    API -- gives the broker's candle data time to finalize; applies to every pattern/interval).
-    Detection itself runs from auto_run.run_bot_logic() via PatternEngine.check_patterns()."""
+    pattern registered in pattern_engine.PATTERN_REGISTRY, laid out SIDE BY SIDE in a row
+    (wraps to a new line on narrow screens instead of overflowing), each themed per its
+    registered color (bullish=light green, bearish=light red -- see _pattern_row), plus a
+    shared fetch-delay input (seconds to wait after a candle boundary closes before fetching
+    it via the historical API -- gives the broker's candle data time to finalize; applies to
+    every pattern/interval). Detection itself runs from auto_run.run_bot_logic() via
+    PatternEngine.check_patterns()."""
     with ui.card().classes('w-full bg-white p-3 gap-3 rounded-xl shadow-sm mb-4 border border-gray-200'):
         with ui.row().classes('w-full justify-between items-center'):
             ui.label('CANDLESTICK PATTERN INDICATORS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
@@ -1192,8 +1210,9 @@ def render_pattern_indicators():
             ui.label('Fetch Delay (sec, after candle close):').classes('text-xs text-gray-600')
             ui.input().bind_value(params, 'pattern_fetch_delay_sec').props('outlined dense bg-color=white').classes('w-24')
 
-        for key, meta in PATTERN_REGISTRY.items():
-            _pattern_row(key, meta)
+        with ui.row().classes('w-full gap-3 items-stretch flex-wrap'):
+            for key, meta in PATTERN_REGISTRY.items():
+                _pattern_row(key, meta)
 
 # --- ORDER HISTORY (full options_tradebook.csv) ---
 
