@@ -228,13 +228,23 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     Title, trigger-direction hint, AND card colors are all reactive to options_buy_mode (see
     _unified_card_title / _side_colors) so the card never uses Sell Mode's wording or colors
     while Buy Mode is active: in Buy Mode, Buy Call is green (bullish) and Buy Put is red
-    (bearish) -- the opposite of Sell Mode's fixed Call=red/Put=green scheme."""
+    (bearish) -- the opposite of Sell Mode's fixed Call=red/Put=green scheme.
+
+    Trigger Price is bound to a local staged 'draft' dict, NOT directly to params: while the
+    card is armed, LogicEngine._check_unified_open polls params[trig_key] every tick (every
+    tick if fire_on='Live', the default) to decide whether to fire an entry. A direct live
+    bind would let an in-progress edit fire an entry at an unintended intermediate price.
+    Editing the trigger price now has zero live effect; the new value is only committed into
+    params[trig_key] when Arm is clicked (which also re-arms with the fresh value if the card
+    was already armed). Strike offset and Qty are NOT staged this way since they're only read
+    once, at the moment an order actually fires -- never polled live against a threshold."""
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
     stop_key = f'{prefix}_new_stop'; target_key = f'{prefix}_new_target'
 
     init_color_class, init_btn_color = _side_colors(side, params.get('options_buy_mode', False), weight='100')
+    draft = {'trigger': params.get(trig_key, 0)}
 
     with ui.card().classes(f'w-full p-4 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-4 gap-2 {'bg-red-100 border-red-300' if is_red else 'bg-green-100 border-green-300'} border shadow-md rounded-xl")
@@ -258,8 +268,9 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             # NOTE: intentionally NOT disabled for Market (previously used bind_enabled_from,
             # which could leave a typed value uncommitted after a disable->enable toggle on some
             # NiceGUI/Quasar versions). Always-editable avoids that class of binding bug; the
-            # value is simply ignored by the firing logic when order type is Market.
-            ui.input('Trigger Price').bind_value(params, trig_key).props('outlined dense bg-color=white').classes('grow')
+            # value is simply ignored by the firing logic when order type is Market. Bound to
+            # 'draft', not params directly -- see docstring above.
+            ui.input('Trigger Price').bind_value(draft, 'trigger').props('outlined dense bg-color=white').classes('grow')
             _num_stepper(params, strike_key, step=1, label='Strike (0=ATM,1=ITM,-1=OTM)')
 
         with ui.row().classes('w-full gap-2'):
@@ -279,16 +290,19 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
                 return
 
             order_type = params[order_key]
-            try: trigger_price = float(params[trig_key])
-            except (ValueError, TypeError): trigger_price = 0
+            try: trigger_price = float(draft['trigger'])
+            except (ValueError, TypeError):
+                ui.notify(f"Invalid {side} Trigger Price", type='negative'); return
             idx_ltp = shared_state.get(params['trading_index'], {}).get('ltp', 0)
             buy_mode = params.get('options_buy_mode', False)
 
             def _do_arm():
-                # Stamp the arm time so the timing-boundary check in
+                # Commit the staged trigger price into params NOW (atomically, not live while
+                # typing), then stamp the arm time so the timing-boundary check in
                 # LogicEngine._check_unified_open requires the NEXT candle close after this
                 # moment, not any boundary crossing (fixes: arming during a boundary-minute
                 # firing on the very next tick instead of waiting a full period).
+                params[trig_key] = trigger_price
                 params[f'{prefix}_armed_at'] = datetime.now()
                 params[armed_key] = True
                 status.set_text(f"ARMED: {order_type} @ {trigger_price} ({params[fire_key]})")
@@ -303,6 +317,7 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
         def cancel():
             # Full reset: trigger price + every other field back to default (not just disarm).
             _reset_unified_card_defaults(prefix)
+            draft['trigger'] = 0
             ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} Cancelled & Reset", type='info')
 
         with ui.row().classes('w-full gap-2'):
@@ -315,8 +330,18 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
 def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_active_key):
     """Card background is mode-aware via _side_colors/_bind_card_colors: Sell Mode unchanged
     (Call=red, Put=green); Buy Mode flips (Buy Call=green, Buy Put=red), matching every other
-    per-side card in the app."""
+    per-side card in the app.
+
+    Profit/Loss inputs are bound to a local staged 'draft' dict, NOT directly to params.
+    Typing is free-form and has zero live effect; the new value is only written into
+    params[target_val_key]/params[stop_val_key] -- and the active flag set -- atomically when
+    SET is clicked. Previously these inputs were bound straight to params via bind_value,
+    which pushes every keystroke live; since logic_engine._check_exits polls these exact keys
+    every tick with NO period gating at all, an in-progress edit (e.g. typing "10000" over
+    "12000") could pass through an intermediate value like "1000" that the live PnL already
+    exceeded, closing the position mid-edit instead of at the intended final value."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
+    draft = {'target': params.get(target_val_key, 0), 'stop': params.get(stop_val_key, 0)}
     with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl")
 
@@ -324,21 +349,37 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
 
         with ui.row().classes('w-full items-center gap-1'):
             ui.label('Profit').classes('text-[10px] w-8 font-bold text-green-700')
-            ui.input().bind_value(params, target_val_key).props('outlined dense prefix="₹" bg-color=white').classes('grow')
+            ui.input().bind_value(draft, 'target').props('outlined dense prefix="₹" bg-color=white').classes('grow')
             st_tgt = ui.label('ON').classes('text-[9px] text-white bg-green-600 rounded px-1 hidden')
             st_tgt.bind_visibility_from(params, target_active_key)
-            def set_tgt(): params[target_active_key] = True; ui.notify(f"{side} Profit Set", type='positive')
-            def rst_tgt(): params[target_active_key] = False; params[target_val_key] = 0; ui.notify(f"{side} Profit Reset", type='info')
+            def set_tgt():
+                try:
+                    value = float(draft['target'])
+                except (ValueError, TypeError):
+                    ui.notify(f"Invalid {side} Profit Value", type='negative'); return
+                params[target_val_key] = value; params[target_active_key] = True
+                ui.notify(f"{side} Profit Set", type='positive')
+            def rst_tgt():
+                params[target_active_key] = False; params[target_val_key] = 0; draft['target'] = 0
+                ui.notify(f"{side} Profit Reset", type='info')
             ui.button('SET', on_click=set_tgt, color='green-8').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
             ui.button('RESET', on_click=rst_tgt, color='grey').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
 
         with ui.row().classes('w-full items-center gap-1'):
             ui.label('Loss').classes('text-[10px] w-8 font-bold text-red-700')
-            ui.input().bind_value(params, stop_val_key).props('outlined dense prefix="₹" bg-color=white').classes('grow')
+            ui.input().bind_value(draft, 'stop').props('outlined dense prefix="₹" bg-color=white').classes('grow')
             st_stp = ui.label('ON').classes('text-[9px] text-white bg-red-600 rounded px-1 hidden')
             st_stp.bind_visibility_from(params, stop_active_key)
-            def set_stp(): params[stop_active_key] = True; ui.notify(f"{side} Loss Set", type='positive')
-            def rst_stp(): params[stop_active_key] = False; params[stop_val_key] = 0; ui.notify(f"{side} Loss Reset", type='info')
+            def set_stp():
+                try:
+                    value = float(draft['stop'])
+                except (ValueError, TypeError):
+                    ui.notify(f"Invalid {side} Loss Value", type='negative'); return
+                params[stop_val_key] = value; params[stop_active_key] = True
+                ui.notify(f"{side} Loss Set", type='positive')
+            def rst_stp():
+                params[stop_active_key] = False; params[stop_val_key] = 0; draft['stop'] = 0
+                ui.notify(f"{side} Loss Reset", type='info')
             ui.button('SET', on_click=set_stp, color='red-8').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
             ui.button('RESET', on_click=rst_stp, color='grey').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
 
@@ -365,16 +406,26 @@ def open_logic_card(title, side, mode_key, amt_key, strike_key, active_key):
             ui.button('Reset', on_click=reset).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
 
 def global_control_card(label, value_key, active_key):
+    """Value input is bound to a local staged 'draft' dict, NOT directly to params -- see
+    auto_close_card's docstring for why (logic_engine._check_global_limits polls this key
+    every tick with no period gating, so a direct live bind lets an in-progress edit trigger
+    a global close-all on an intermediate keystroke value)."""
+    draft = {'value': params.get(value_key, 0)}
     with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 shadow-sm rounded-xl'):
         ui.label(label).classes('font-bold text-sm text-gray-700')
-        ui.input().bind_value(params, value_key).props('outlined dense bg-color=white prefix="₹"').classes('w-full')
+        ui.input().bind_value(draft, 'value').props('outlined dense bg-color=white prefix="₹"').classes('w-full')
         status = ui.label().classes('w-full text-center text-xs font-bold text-white bg-blue-600 rounded p-1 shadow-sm')
         status.bind_visibility_from(params, active_key)
         def activate():
-            params[active_key] = True; status.set_text(f"ACTIVE: {params[value_key]}")
+            try:
+                value = float(draft['value'])
+            except (ValueError, TypeError):
+                ui.notify(f"Invalid {label} Value", type='negative'); return
+            params[value_key] = value; params[active_key] = True
+            status.set_text(f"ACTIVE: {value}")
             ui.notify(f"{label} SET", type='positive')
         def reset():
-            params[active_key] = False; params[value_key] = 0
+            params[active_key] = False; params[value_key] = 0; draft['value'] = 0
             ui.notify(f"{label} RESET", type='info')
         with ui.row().classes('w-full gap-2'):
             ui.button('Set', color='blue-7', on_click=activate).classes('grow h-8 text-xs rounded-lg')
@@ -383,23 +434,35 @@ def global_control_card(label, value_key, active_key):
 def index_exit_component(side, label, time_key, value_key, active_key):
     """Card background is mode-aware via _side_colors/_bind_card_colors: Sell Mode unchanged
     (Call=red, Put=green); Buy Mode flips (Buy Call=green, Buy Put=red), matching every other
-    per-side card in the app."""
+    per-side card in the app.
+
+    Value input is bound to a local staged 'draft' dict, NOT directly to params -- typing has
+    zero live effect; the new value is only written into params[value_key] (and the active
+    flag set) atomically when Set is clicked/confirmed. Previously the input was bound
+    straight to params, and since logic_engine._check_exits polls this exact key every tick
+    whenever the period is 'Current' (the default), an in-progress edit could trigger a close
+    on an intermediate keystroke value. The period radio itself is unaffected (a click is
+    already atomic, no typing risk) and stays bound directly to params."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
+    draft = {'value': params.get(value_key, 0)}
     with ui.card().classes(f'w-full p-3 gap-1 {init_color_class} border rounded-lg') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg")
 
         ui.label(label).classes('font-bold text-xs text-gray-600')
         with ui.row().classes('items-center justify-between w-full'):
-            ui.input().bind_value(params, value_key).props('outlined dense bg-color=white').classes('w-24')
+            ui.input().bind_value(draft, 'value').props('outlined dense bg-color=white').classes('w-24')
             ui.radio(UI_OPTS['index_times'], value=params[time_key]).bind_value(params, time_key).props('inline dense scale=0.8')
         status = ui.label().classes('w-full text-center text-[10px] font-bold text-green-800 bg-green-100 rounded')
         status.bind_visibility_from(params, active_key)
-        def _do_activate():
-            params[active_key] = True; status.set_text(f"ON: {params[value_key]}")
+        def _do_activate(value):
+            params[value_key] = value; params[active_key] = True
+            status.set_text(f"ON: {value}")
             ui.notify(f"{side} Index {label} SET", type='positive')
         def activate():
-            try: value = float(params[value_key])
-            except (ValueError, TypeError): value = 0
+            try:
+                value = float(draft['value'])
+            except (ValueError, TypeError):
+                ui.notify(f"Invalid {side} Index {label} Value", type='negative'); return
             idx_ltp = shared_state.get(params['trading_index'], {}).get('ltp', 0)
             buy_mode = params.get('options_buy_mode', False)
             is_stop = (label == 'Stop')
@@ -409,11 +472,11 @@ def index_exit_component(side, label, time_key, value_key, active_key):
             w2 = _pct_away_warning(value, idx_ltp, label)
             if w2: warnings.append(w2)
             if warnings:
-                _confirm_warning('\n\n'.join(warnings), _do_activate)
+                _confirm_warning('\n\n'.join(warnings), lambda v=value: _do_activate(v))
             else:
-                _do_activate()
+                _do_activate(value)
         def reset():
-            params[active_key] = False; params[value_key] = 0
+            params[active_key] = False; params[value_key] = 0; draft['value'] = 0
             ui.notify(f"{side} Index {label} RESET", type='info')
         with ui.row().classes('w-full gap-1 mt-1'):
             ui.button('Set', color='black', on_click=activate).props('outline').classes('grow h-6 text-[10px] rounded')
@@ -425,9 +488,15 @@ def premium_exit_card(side):
     (loss on short), Target = premium falls (profit on short); in Buy Mode these invert since
     a long position profits as premium rises. Card + both sub-card backgrounds and the header
     label color are also mode-aware via _side_colors/_bind_card_colors (Sell Mode unchanged:
-    Call=red, Put=green; Buy Mode flips: Buy Call=green, Buy Put=red)."""
+    Call=red, Put=green; Buy Mode flips: Buy Call=green, Buy Put=red).
+
+    Stop/Target value inputs are bound to a local staged 'draft' dict, NOT directly to
+    params -- same fix as index_exit_component/auto_close_card, for the same reason
+    (logic_engine._check_exits' PREMIUM EXITS branch polls these keys every tick whenever the
+    period is 'Current')."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     s = side.lower()
+    draft = {'stop': params.get(f'{s}_prem_stop_val', 0), 'target': params.get(f'{s}_prem_target_val', 0)}
 
     def _outer_cls(is_red):
         return f"w-full p-3 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl"
@@ -463,18 +532,21 @@ def premium_exit_card(side):
                 _bind_card_colors(stop_card, side, _sub_cls)
                 ui.label('Stop').classes('font-bold text-xs text-gray-600')
                 with ui.row().classes('items-center justify-between w-full'):
-                    ui.input().bind_value(params, f'{s}_prem_stop_val').props('outlined dense bg-color=white').classes('w-24')
+                    ui.input().bind_value(draft, 'stop').props('outlined dense bg-color=white').classes('w-24')
                     ui.radio(UI_OPTS['index_times'], value=params[f'{s}_prem_stop_time']).bind_value(params, f'{s}_prem_stop_time').props('inline dense scale=0.8')
                 stop_status = ui.label().classes('w-full text-center text-[10px] font-bold text-red-800 bg-red-100 rounded')
                 stop_status.bind_visibility_from(params, f'{s}_prem_stop_active')
                 def make_stop_handlers(sd, ss):
-                    def _do_activate():
+                    def _do_activate(value):
+                        params[f'{sd}_prem_stop_val'] = value
                         params[f'{sd}_prem_stop_active'] = True
-                        ss.set_text(f"ON: {params[f'{sd}_prem_stop_val']}")
+                        ss.set_text(f"ON: {value}")
                         ui.notify(f"{sd} Prem Stop SET", type='positive')
                     def activate():
-                        try: value = float(params[f'{sd}_prem_stop_val'])
-                        except (ValueError, TypeError): value = 0
+                        try:
+                            value = float(draft['stop'])
+                        except (ValueError, TypeError):
+                            ui.notify(f"Invalid {sd} Prem Stop Value", type='negative'); return
                         trade = shared_state['active_trades'].get(side)
                         warnings = []
                         if trade is not None:
@@ -485,12 +557,13 @@ def premium_exit_card(side):
                             w2 = _pct_away_warning(value, current, 'Stop')
                             if w2: warnings.append(w2)
                         if warnings:
-                            _confirm_warning('\n\n'.join(warnings), _do_activate)
+                            _confirm_warning('\n\n'.join(warnings), lambda v=value: _do_activate(v))
                         else:
-                            _do_activate()
+                            _do_activate(value)
                     def reset():
                         params[f'{sd}_prem_stop_active'] = False
                         params[f'{sd}_prem_stop_val'] = 0
+                        draft['stop'] = 0
                         ui.notify(f"{sd} Prem Stop RESET", type='info')
                     return activate, reset
                 act_s, rst_s = make_stop_handlers(s, stop_status)
@@ -503,18 +576,21 @@ def premium_exit_card(side):
                 _bind_card_colors(tgt_card, side, _sub_cls)
                 ui.label('Tgt').classes('font-bold text-xs text-gray-600')
                 with ui.row().classes('items-center justify-between w-full'):
-                    ui.input().bind_value(params, f'{s}_prem_target_val').props('outlined dense bg-color=white').classes('w-24')
+                    ui.input().bind_value(draft, 'target').props('outlined dense bg-color=white').classes('w-24')
                     ui.radio(UI_OPTS['index_times'], value=params[f'{s}_prem_target_time']).bind_value(params, f'{s}_prem_target_time').props('inline dense scale=0.8')
                 tgt_status = ui.label().classes('w-full text-center text-[10px] font-bold text-green-800 bg-green-100 rounded')
                 tgt_status.bind_visibility_from(params, f'{s}_prem_tgt_active')
                 def make_tgt_handlers(sd, ts):
-                    def _do_activate():
+                    def _do_activate(value):
+                        params[f'{sd}_prem_target_val'] = value
                         params[f'{sd}_prem_tgt_active'] = True
-                        ts.set_text(f"ON: {params[f'{sd}_prem_target_val']}")
+                        ts.set_text(f"ON: {value}")
                         ui.notify(f"{sd} Prem Target SET", type='positive')
                     def activate():
-                        try: value = float(params[f'{sd}_prem_target_val'])
-                        except (ValueError, TypeError): value = 0
+                        try:
+                            value = float(draft['target'])
+                        except (ValueError, TypeError):
+                            ui.notify(f"Invalid {sd} Prem Target Value", type='negative'); return
                         trade = shared_state['active_trades'].get(side)
                         warnings = []
                         if trade is not None:
@@ -525,12 +601,13 @@ def premium_exit_card(side):
                             w2 = _pct_away_warning(value, current, 'Target')
                             if w2: warnings.append(w2)
                         if warnings:
-                            _confirm_warning('\n\n'.join(warnings), _do_activate)
+                            _confirm_warning('\n\n'.join(warnings), lambda v=value: _do_activate(v))
                         else:
-                            _do_activate()
+                            _do_activate(value)
                     def reset():
                         params[f'{sd}_prem_tgt_active'] = False
                         params[f'{sd}_prem_target_val'] = 0
+                        draft['target'] = 0
                         ui.notify(f"{sd} Prem Target RESET", type='info')
                     return activate, reset
                 act_t, rst_t = make_tgt_handlers(s, tgt_status)
@@ -840,21 +917,52 @@ def _position_row(side, on_close=None):
     tick from auto_run.py's update_ui(), so they can never drift out of sync.
 
     Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
-    call_index_stop_active etc, the same params the 'Exit based on Index' cards use) rather
-    than the PnL-based Auto Close values.
+    call_index_stop_active etc, the same params the 'Exit based on Index' cards use).
 
-    IMPORTANT: the switches here ONLY toggle *_index_stop_active/*_index_tgt_active. They no
-    longer touch *_index_stop_time/*_index_target_time (Current/1m/5m) -- a previous version
-    force-reset the period to 'Current' on every toggle, which silently discarded a 1m/5m
-    selection made in the separate 'Exit based on Index' card and made the exit check live on
-    every tick instead of waiting for the actual 1m/5m candle close (symptom: position closes
-    mid-candle instead of exactly at the candle close). The period is only ever changed via
-    the radio in index_exit_component, and whatever it's set to is respected here. A small
-    '(Current)'/'(1m)'/'(5m)' label next to each switch shows the currently active period at
-    a glance."""
+    IMPORTANT (two separate fixes layered here):
+    1. The switches ONLY toggle *_index_stop_active/*_index_tgt_active. They no longer touch
+       *_index_stop_time/*_index_target_time (Current/1m/5m) -- a previous version force-reset
+       the period to 'Current' on every toggle, which silently discarded a 1m/5m selection
+       made in the separate 'Exit based on Index' card. A small '(Current)'/'(1m)'/'(5m)'
+       label next to each switch shows the currently active period at a glance.
+    2. The value inputs are bound to a local staged 'draft' dict, NOT directly to params --
+       same reasoning as auto_close_card/index_exit_component: typing has zero live effect.
+       Turning a switch ON commits the CURRENT (complete) draft value into params atomically
+       at that moment (reading a finished value on a single click, not a live keystroke
+       stream), so there's no window where an in-progress edit could be read by
+       logic_engine._check_exits and close the position early. If the draft value is invalid
+       (<=0) when trying to turn a switch on, the switch reverts to off and the attempt is
+       rejected with a notification."""
     prefix = 'call' if side == 'Call' else 'put'
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
+
+    stop_draft = {'value': params.get(stop_val_key, 0)}
+    tgt_draft = {'value': params.get(tgt_val_key, 0)}
+
+    def _toggle_stop(e):
+        if e.value:
+            try:
+                value = float(stop_draft['value'])
+            except (ValueError, TypeError):
+                value = 0
+            if value <= 0:
+                ui.notify(f"Enter a valid {side} Idx Stop value first", type='negative')
+                params[stop_active_key] = False
+                return
+            params[stop_val_key] = value
+
+    def _toggle_tgt(e):
+        if e.value:
+            try:
+                value = float(tgt_draft['value'])
+            except (ValueError, TypeError):
+                value = 0
+            if value <= 0:
+                ui.notify(f"Enter a valid {side} Idx Target value first", type='negative')
+                params[tgt_active_key] = False
+                return
+            params[tgt_val_key] = value
 
     with ui.card().classes('w-full bg-white border-l-4 border-gray-300 border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         ui_refs[f'{prefix}_pos_row'] = row
@@ -896,12 +1004,12 @@ def _position_row(side, on_close=None):
         with ui.row().classes('w-full gap-3 items-center pt-2 border-t border-gray-200 flex-wrap'):
             ui.label('Idx Stop').classes('text-[10px] text-gray-500')
             ui.label().bind_text_from(params, stop_time_key, backward=lambda v: f"({v})").classes('text-[9px] text-gray-400 -ml-2')
-            ui.switch().bind_value(params, stop_active_key).props('dense color=red size=sm')
-            ui.input().bind_value(params, stop_val_key).props('outlined dense bg-color=white').classes('w-24')
+            ui.switch(on_change=_toggle_stop).bind_value(params, stop_active_key).props('dense color=red size=sm')
+            ui.input().bind_value(stop_draft, 'value').props('outlined dense bg-color=white').classes('w-24')
             ui.label('Idx Target').classes('text-[10px] text-gray-500')
             ui.label().bind_text_from(params, tgt_time_key, backward=lambda v: f"({v})").classes('text-[9px] text-gray-400 -ml-2')
-            ui.switch().bind_value(params, tgt_active_key).props('dense color=green size=sm')
-            ui.input().bind_value(params, tgt_val_key).props('outlined dense bg-color=white').classes('w-24')
+            ui.switch(on_change=_toggle_tgt).bind_value(params, tgt_active_key).props('dense color=green size=sm')
+            ui.input().bind_value(tgt_draft, 'value').props('outlined dense bg-color=white').classes('w-24')
             ui.space()
             ui.button('CLOSE', color='red', on_click=on_close).classes('h-7 text-xs px-4 rounded font-bold')
 
