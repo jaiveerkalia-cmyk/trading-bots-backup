@@ -200,12 +200,12 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                     ):
                         with ui.row().classes('items-center gap-1'):
                             ui.label('Max Loss').classes('text-gray-500')
-                            ml_l = ui.label(ml_str).classes('font-mono text-red-400')
+                            ml_l = ui.label(ml_str).classes(f'font-mono {_pl_col(ml_str)}')
                             ml_refs[sid] = ml_l
 
                         with ui.row().classes('items-center gap-1'):
                             ui.label('Max Profit').classes('text-gray-500')
-                            mp_l = ui.label(mp_str).classes('font-mono text-green-400')
+                            mp_l = ui.label(mp_str).classes(f'font-mono {_pl_col(mp_str)}')
                             mp_refs[sid] = mp_l
 
                     # ── Row 4: controls ───────────────────────────────────────
@@ -417,8 +417,14 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
             tgt     = float((slot or {}).get('target_price') or 0) or None
             is_long = pos.get('side') == 'long'
             mp_str, ml_str = _max_pl(entry, stp, tgt, qty, taker, is_long)
-            if sid in ml_refs: ml_refs[sid].set_text(ml_str)
-            if sid in mp_refs: mp_refs[sid].set_text(mp_str)
+            if sid in ml_refs:
+                ml_refs[sid].set_text(ml_str)
+                ml_refs[sid].classes(remove='text-green-400 text-red-400 text-gray-500',
+                                      add=_pl_col(ml_str))
+            if sid in mp_refs:
+                mp_refs[sid].set_text(mp_str)
+                mp_refs[sid].classes(remove='text-green-400 text-red-400 text-gray-500',
+                                      add=_pl_col(mp_str))
 
     return {'update': update}
 
@@ -427,6 +433,14 @@ def _stat(label: str, value: str, value_cls: str = 'text-gray-200') -> None:
     with ui.row().classes('items-center gap-1'):
         ui.label(label).classes('text-gray-500')
         ui.label(value).classes(f'font-mono {value_cls}')
+
+
+def _pl_col(s: str) -> str:
+    if s.startswith('+'):
+        return 'text-green-400'
+    if s.startswith('-'):
+        return 'text-red-400'
+    return 'text-gray-500'
 
 
 def _pct_qty(state, slot_id: str, pct: float) -> float:

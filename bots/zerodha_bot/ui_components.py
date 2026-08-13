@@ -23,6 +23,32 @@ def _num_stepper(target, key, step=1, label=''):
         ui.input(label).bind_value(target, key).props('outlined dense bg-color=white').classes('grow text-center')
         ui.button(icon='add', on_click=inc).props('flat dense round size=sm').classes('text-gray-600 bg-gray-100')
 
+def _sync_draft_from_params(draft, draft_key, params_key, interval=1.0):
+    """Keeps a staged 'draft' input value (see the draft-and-commit pattern used throughout
+    this file, e.g. auto_close_card/index_exit_component/unified_entry_card) in sync with
+    EXTERNAL changes to params[params_key] -- most importantly
+    auto_run.AutoController.clear_leg_fields() resetting it back to 0/"" after a position is
+    closed (manually, or auto-closed by the engine), but also any Reset click from a
+    DIFFERENT UI instance that happens to share the same params key (e.g. the Open Positions
+    quick Idx Stop/Target controls and the separate 'Exit based on Index' card both write
+    call_index_stop_val).
+
+    This does NOT reintroduce the mid-typing bug the draft pattern was built to fix: typing
+    only ever writes to 'draft', never to params, so params[params_key] only ever changes
+    from an external source or from this same card's own commit handler (SET/Arm/switch-on)
+    -- and a commit handler already leaves draft holding the exact value it just committed,
+    so mirroring params back into draft at that moment is a harmless no-op. Only a genuine
+    EXTERNAL change (detected by comparing against the last-seen value) ever moves the
+    draft, and it's always safe to reflect immediately since it never originates from an
+    in-progress keystroke."""
+    last = {'value': params.get(params_key, 0)}
+    def _sync():
+        current = params.get(params_key, 0)
+        if current != last['value']:
+            last['value'] = current
+            draft[draft_key] = current
+    ui.timer(interval, _sync)
+
 def _side_is_red(side, buy_mode):
     """Single source of truth for Call/Put color direction across EVERY card in the app.
     Sell Mode (unchanged): Call=red (short-side), Put=green (long-side).
@@ -236,8 +262,11 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     bind would let an in-progress edit fire an entry at an unintended intermediate price.
     Editing the trigger price now has zero live effect; the new value is only committed into
     params[trig_key] when Arm is clicked (which also re-arms with the fresh value if the card
-    was already armed). Strike offset and Qty are NOT staged this way since they're only read
-    once, at the moment an order actually fires -- never polled live against a threshold."""
+    was already armed). _sync_draft_from_params keeps the field in sync with EXTERNAL resets
+    (e.g. Close -> auto_run.clear_leg_fields() zeroing params[trig_key]) so the field visibly
+    clears after closing, without reintroducing the mid-typing bug. Strike offset and Qty are
+    NOT staged this way since they're only read once, at the moment an order actually fires
+    -- never polled live against a threshold."""
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
@@ -245,6 +274,7 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
 
     init_color_class, init_btn_color = _side_colors(side, params.get('options_buy_mode', False), weight='100')
     draft = {'trigger': params.get(trig_key, 0)}
+    _sync_draft_from_params(draft, 'trigger', trig_key)
 
     with ui.card().classes(f'w-full p-4 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-4 gap-2 {'bg-red-100 border-red-300' if is_red else 'bg-green-100 border-green-300'} border shadow-md rounded-xl")
@@ -335,13 +365,16 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
     Profit/Loss inputs are bound to a local staged 'draft' dict, NOT directly to params.
     Typing is free-form and has zero live effect; the new value is only written into
     params[target_val_key]/params[stop_val_key] -- and the active flag set -- atomically when
-    SET is clicked. Previously these inputs were bound straight to params via bind_value,
-    which pushes every keystroke live; since logic_engine._check_exits polls these exact keys
-    every tick with NO period gating at all, an in-progress edit (e.g. typing "10000" over
-    "12000") could pass through an intermediate value like "1000" that the live PnL already
-    exceeded, closing the position mid-edit instead of at the intended final value."""
+    SET is clicked. logic_engine._check_exits polls these exact keys every tick with NO
+    period gating at all, so a direct live bind previously let an in-progress edit (e.g.
+    typing "10000" over "12000") pass through an intermediate value like "1000" that the live
+    PnL already exceeded, closing the position mid-edit. _sync_draft_from_params keeps the
+    field in sync with EXTERNAL resets (e.g. Close -> auto_run.clear_leg_fields() zeroing
+    these params) so the field visibly clears after closing, without reintroducing that bug."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'target': params.get(target_val_key, 0), 'stop': params.get(stop_val_key, 0)}
+    _sync_draft_from_params(draft, 'target', target_val_key)
+    _sync_draft_from_params(draft, 'stop', stop_val_key)
     with ui.card().classes(f'w-full p-3 gap-2 {init_color_class} border shadow-sm rounded-xl') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl")
 
@@ -408,9 +441,10 @@ def open_logic_card(title, side, mode_key, amt_key, strike_key, active_key):
 def global_control_card(label, value_key, active_key):
     """Value input is bound to a local staged 'draft' dict, NOT directly to params -- see
     auto_close_card's docstring for why (logic_engine._check_global_limits polls this key
-    every tick with no period gating, so a direct live bind lets an in-progress edit trigger
-    a global close-all on an intermediate keystroke value)."""
+    every tick with no period gating). _sync_draft_from_params keeps the field in sync with
+    EXTERNAL resets without reintroducing the mid-typing bug -- see that helper's docstring."""
     draft = {'value': params.get(value_key, 0)}
+    _sync_draft_from_params(draft, 'value', value_key)
     with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 shadow-sm rounded-xl'):
         ui.label(label).classes('font-bold text-sm text-gray-700')
         ui.input().bind_value(draft, 'value').props('outlined dense bg-color=white prefix="₹"').classes('w-full')
@@ -438,13 +472,17 @@ def index_exit_component(side, label, time_key, value_key, active_key):
 
     Value input is bound to a local staged 'draft' dict, NOT directly to params -- typing has
     zero live effect; the new value is only written into params[value_key] (and the active
-    flag set) atomically when Set is clicked/confirmed. Previously the input was bound
-    straight to params, and since logic_engine._check_exits polls this exact key every tick
-    whenever the period is 'Current' (the default), an in-progress edit could trigger a close
-    on an intermediate keystroke value. The period radio itself is unaffected (a click is
-    already atomic, no typing risk) and stays bound directly to params."""
+    flag set) atomically when Set is clicked/confirmed. logic_engine._check_exits polls this
+    exact key every tick whenever the period is 'Current' (the default), so a direct live
+    bind previously let an in-progress edit trigger a close on an intermediate keystroke
+    value. _sync_draft_from_params keeps the field in sync with EXTERNAL resets (e.g. Close
+    -> auto_run.clear_leg_fields(), or the Open Positions quick control sharing this same
+    params_key) so the field visibly clears/updates without reintroducing that bug. The
+    period radio itself is unaffected (a click is already atomic, no typing risk) and stays
+    bound directly to params."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'value': params.get(value_key, 0)}
+    _sync_draft_from_params(draft, 'value', value_key)
     with ui.card().classes(f'w-full p-3 gap-1 {init_color_class} border rounded-lg') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-3 gap-1 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border rounded-lg")
 
@@ -493,10 +531,13 @@ def premium_exit_card(side):
     Stop/Target value inputs are bound to a local staged 'draft' dict, NOT directly to
     params -- same fix as index_exit_component/auto_close_card, for the same reason
     (logic_engine._check_exits' PREMIUM EXITS branch polls these keys every tick whenever the
-    period is 'Current')."""
+    period is 'Current'). _sync_draft_from_params keeps both fields in sync with EXTERNAL
+    resets (e.g. Close -> auto_run.clear_leg_fields()) without reintroducing that bug."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     s = side.lower()
     draft = {'stop': params.get(f'{s}_prem_stop_val', 0), 'target': params.get(f'{s}_prem_target_val', 0)}
+    _sync_draft_from_params(draft, 'stop', f'{s}_prem_stop_val')
+    _sync_draft_from_params(draft, 'target', f'{s}_prem_target_val')
 
     def _outer_cls(is_red):
         return f"w-full p-3 gap-2 {'bg-red-50 border-red-200' if is_red else 'bg-green-50 border-green-200'} border shadow-sm rounded-xl"
@@ -919,7 +960,7 @@ def _position_row(side, on_close=None):
     Stop/Target here control the INDEX-PRICE-based exit (call_index_stop_val/
     call_index_stop_active etc, the same params the 'Exit based on Index' cards use).
 
-    IMPORTANT (two separate fixes layered here):
+    IMPORTANT (fixes layered here):
     1. The switches ONLY toggle *_index_stop_active/*_index_tgt_active. They no longer touch
        *_index_stop_time/*_index_target_time (Current/1m/5m) -- a previous version force-reset
        the period to 'Current' on every toggle, which silently discarded a 1m/5m selection
@@ -932,13 +973,18 @@ def _position_row(side, on_close=None):
        stream), so there's no window where an in-progress edit could be read by
        logic_engine._check_exits and close the position early. If the draft value is invalid
        (<=0) when trying to turn a switch on, the switch reverts to off and the attempt is
-       rejected with a notification."""
+       rejected with a notification.
+    3. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
+       Close -> auto_run.clear_leg_fields(), or the separate 'Exit based on Index' card
+       sharing this same params key) without reintroducing the mid-typing bug."""
     prefix = 'call' if side == 'Call' else 'put'
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
 
     stop_draft = {'value': params.get(stop_val_key, 0)}
     tgt_draft = {'value': params.get(tgt_val_key, 0)}
+    _sync_draft_from_params(stop_draft, 'value', stop_val_key)
+    _sync_draft_from_params(tgt_draft, 'value', tgt_val_key)
 
     def _toggle_stop(e):
         if e.value:
