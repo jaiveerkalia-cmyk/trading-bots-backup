@@ -200,6 +200,34 @@ def _pct_away_warning(value, current, kind_label):
     if pct <= 0.10: return None
     return f"{kind_label} value ({value}) is {pct*100:.0f}% away from the current price ({current:.2f})."
 
+def _position_type_label(side, buy_mode):
+    """Short natural-language label for a side's position, matching the wording already used
+    in unified_entry_card's title (_unified_card_title) so warnings read consistently with
+    the panel titles already on screen: Sell Mode -> 'Short'/'Long' (Call=Short, Put=Long);
+    Buy Mode -> 'Call (Bullish)'/'Put (Bearish)', since Buy Mode doesn't have a short/long
+    distinction (both sides are bought options) but Call/Put + bias is still the meaningful
+    distinction there."""
+    if not buy_mode:
+        return 'Short' if side == 'Call' else 'Long'
+    return 'Call (Bullish)' if side == 'Call' else 'Put (Bearish)'
+
+def _no_position_warning(side, buy_mode):
+    """Warns when Profit/Loss/Stop/Target is being set for a side that has NO open position
+    right now. Setting one anyway doesn't error (logic_engine's exit checks simply skip a
+    side entirely while shared_state['active_trades'][side] is None) but it sits there inert
+    and could unexpectedly apply to a DIFFERENT future position opened later on this same
+    side -- the likely real mistake is editing the wrong panel while looking at the OTHER
+    side's currently-open position. Only names the other side in the message when it's
+    actually the one that's open right now, so the hint is never a guess."""
+    if shared_state['active_trades'].get(side) is not None:
+        return None
+    this_label = _position_type_label(side, buy_mode)
+    other_side = 'Put' if side == 'Call' else 'Call'
+    if shared_state['active_trades'].get(other_side) is not None:
+        other_label = _position_type_label(other_side, buy_mode)
+        return f"No {this_label} position is open. Are you trying to set this for the {other_label} position instead?"
+    return f"No {this_label} position is open right now."
+
 # --- CONTROL CARDS ---
 
 def entry_card(side, label, mode_key, input_key, on_open=None, on_close=None):
@@ -370,7 +398,11 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
     typing "10000" over "12000") pass through an intermediate value like "1000" that the live
     PnL already exceeded, closing the position mid-edit. _sync_draft_from_params keeps the
     field in sync with EXTERNAL resets (e.g. Close -> auto_run.clear_leg_fields() zeroing
-    these params) so the field visibly clears after closing, without reintroducing that bug."""
+    these params) so the field visibly clears after closing, without reintroducing that bug.
+
+    SET also warns (via _no_position_warning, same 'Proceed Anyway' dialog used elsewhere) if
+    this side has no open position right now -- likely means the person meant the other
+    panel."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'target': params.get(target_val_key, 0), 'stop': params.get(stop_val_key, 0)}
     _sync_draft_from_params(draft, 'target', target_val_key)
@@ -385,13 +417,19 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
             ui.input().bind_value(draft, 'target').props('outlined dense prefix="₹" bg-color=white').classes('grow')
             st_tgt = ui.label('ON').classes('text-[9px] text-white bg-green-600 rounded px-1 hidden')
             st_tgt.bind_visibility_from(params, target_active_key)
+            def _do_set_tgt(value):
+                params[target_val_key] = value; params[target_active_key] = True
+                ui.notify(f"{side} Profit Set", type='positive')
             def set_tgt():
                 try:
                     value = float(draft['target'])
                 except (ValueError, TypeError):
                     ui.notify(f"Invalid {side} Profit Value", type='negative'); return
-                params[target_val_key] = value; params[target_active_key] = True
-                ui.notify(f"{side} Profit Set", type='positive')
+                warning = _no_position_warning(side, params.get('options_buy_mode', False))
+                if warning:
+                    _confirm_warning(warning, lambda v=value: _do_set_tgt(v))
+                else:
+                    _do_set_tgt(value)
             def rst_tgt():
                 params[target_active_key] = False; params[target_val_key] = 0; draft['target'] = 0
                 ui.notify(f"{side} Profit Reset", type='info')
@@ -403,13 +441,19 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
             ui.input().bind_value(draft, 'stop').props('outlined dense prefix="₹" bg-color=white').classes('grow')
             st_stp = ui.label('ON').classes('text-[9px] text-white bg-red-600 rounded px-1 hidden')
             st_stp.bind_visibility_from(params, stop_active_key)
+            def _do_set_stp(value):
+                params[stop_val_key] = value; params[stop_active_key] = True
+                ui.notify(f"{side} Loss Set", type='positive')
             def set_stp():
                 try:
                     value = float(draft['stop'])
                 except (ValueError, TypeError):
                     ui.notify(f"Invalid {side} Loss Value", type='negative'); return
-                params[stop_val_key] = value; params[stop_active_key] = True
-                ui.notify(f"{side} Loss Set", type='positive')
+                warning = _no_position_warning(side, params.get('options_buy_mode', False))
+                if warning:
+                    _confirm_warning(warning, lambda v=value: _do_set_stp(v))
+                else:
+                    _do_set_stp(value)
             def rst_stp():
                 params[stop_active_key] = False; params[stop_val_key] = 0; draft['stop'] = 0
                 ui.notify(f"{side} Loss Reset", type='info')
@@ -442,7 +486,10 @@ def global_control_card(label, value_key, active_key):
     """Value input is bound to a local staged 'draft' dict, NOT directly to params -- see
     auto_close_card's docstring for why (logic_engine._check_global_limits polls this key
     every tick with no period gating). _sync_draft_from_params keeps the field in sync with
-    EXTERNAL resets without reintroducing the mid-typing bug -- see that helper's docstring."""
+    EXTERNAL resets without reintroducing the mid-typing bug -- see that helper's docstring.
+
+    No _no_position_warning check here (unlike the per-side cards): this is global, applying
+    to combined Call+Put PnL rather than one specific side's position."""
     draft = {'value': params.get(value_key, 0)}
     _sync_draft_from_params(draft, 'value', value_key)
     with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 shadow-sm rounded-xl'):
@@ -479,7 +526,12 @@ def index_exit_component(side, label, time_key, value_key, active_key):
     -> auto_run.clear_leg_fields(), or the Open Positions quick control sharing this same
     params_key) so the field visibly clears/updates without reintroducing that bug. The
     period radio itself is unaffected (a click is already atomic, no typing risk) and stays
-    bound directly to params."""
+    bound directly to params.
+
+    Set also warns (via _no_position_warning) if this side has no open position right now --
+    checked alongside the existing instant-fire/pct-away warnings (index price is always
+    available regardless of whether a position is open, so those remain independently
+    useful)."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'value': params.get(value_key, 0)}
     _sync_draft_from_params(draft, 'value', value_key)
@@ -505,6 +557,8 @@ def index_exit_component(side, label, time_key, value_key, active_key):
             buy_mode = params.get('options_buy_mode', False)
             is_stop = (label == 'Stop')
             warnings = []
+            w0 = _no_position_warning(side, buy_mode)
+            if w0: warnings.append(w0)
             w1 = _index_instant_fire_warning(is_stop, side, buy_mode, value, idx_ltp)
             if w1: warnings.append(w1)
             w2 = _pct_away_warning(value, idx_ltp, label)
@@ -532,7 +586,12 @@ def premium_exit_card(side):
     params -- same fix as index_exit_component/auto_close_card, for the same reason
     (logic_engine._check_exits' PREMIUM EXITS branch polls these keys every tick whenever the
     period is 'Current'). _sync_draft_from_params keeps both fields in sync with EXTERNAL
-    resets (e.g. Close -> auto_run.clear_leg_fields()) without reintroducing that bug."""
+    resets (e.g. Close -> auto_run.clear_leg_fields()) without reintroducing that bug.
+
+    The instant-fire/pct-away warnings need a live trade to read its current premium from, so
+    they're only computed when one exists; when this side has NO open trade, Set instead
+    warns via _no_position_warning (same 'Proceed Anyway' dialog) -- previously that case
+    silently set the value with no warning at all."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     s = side.lower()
     draft = {'stop': params.get(f'{s}_prem_stop_val', 0), 'target': params.get(f'{s}_prem_target_val', 0)}
@@ -597,6 +656,9 @@ def premium_exit_card(side):
                             if w1: warnings.append(w1)
                             w2 = _pct_away_warning(value, current, 'Stop')
                             if w2: warnings.append(w2)
+                        else:
+                            w0 = _no_position_warning(side, params.get('options_buy_mode', False))
+                            if w0: warnings.append(w0)
                         if warnings:
                             _confirm_warning('\n\n'.join(warnings), lambda v=value: _do_activate(v))
                         else:
@@ -641,6 +703,9 @@ def premium_exit_card(side):
                             if w1: warnings.append(w1)
                             w2 = _pct_away_warning(value, current, 'Target')
                             if w2: warnings.append(w2)
+                        else:
+                            w0 = _no_position_warning(side, params.get('options_buy_mode', False))
+                            if w0: warnings.append(w0)
                         if warnings:
                             _confirm_warning('\n\n'.join(warnings), lambda v=value: _do_activate(v))
                         else:
@@ -976,7 +1041,12 @@ def _position_row(side, on_close=None):
        rejected with a notification.
     3. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
        Close -> auto_run.clear_leg_fields(), or the separate 'Exit based on Index' card
-       sharing this same params key) without reintroducing the mid-typing bug."""
+       sharing this same params key) without reintroducing the mid-typing bug.
+
+    No _no_position_warning check here (unlike auto_close_card/index_exit_component/
+    premium_exit_card): this whole row only exists/renders while a trade IS open on this
+    side (_set_position_row_style hides it entirely otherwise), so the situation that warning
+    guards against can't happen from this particular UI surface."""
     prefix = 'call' if side == 'Call' else 'put'
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
