@@ -1036,10 +1036,19 @@ def _position_row(side, on_close=None):
        Turning a switch ON commits the CURRENT (complete) draft value into params atomically
        at that moment (reading a finished value on a single click, not a live keystroke
        stream), so there's no window where an in-progress edit could be read by
-       logic_engine._check_exits and close the position early. If the draft value is invalid
-       (<=0) when trying to turn a switch on, the switch reverts to off and the attempt is
-       rejected with a notification.
-    3. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
+       logic_engine._check_exits and close the position early.
+    3. If the draft value is invalid (<=0) when trying to turn a switch on, the switch must
+       revert to off. This reverts BOTH params[*_active_key] AND the switch element's own
+       bound value via .set_value(False): NiceGUI syncs a bound switch's own .value back into
+       params on a periodic cycle, independent of this handler. Reverting only the params
+       side left a stale True sitting in the switch's own value, which that periodic sync
+       then re-pushed into params moments later -- silently overriding the revert and
+       activating the stop/target despite the warning notification (symptom: 'Enter a valid
+       ... value first' shown, but the stop got set anyway). .set_value() corrects the
+       switch's own value (and the client display) through NiceGUI's normal update path, so
+       there's nothing stale left for a later sync to re-push. This is not mode-specific --
+       it affects Call/Put and Sell/Buy Mode identically.
+    4. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
        Close -> auto_run.clear_leg_fields(), or the separate 'Exit based on Index' card
        sharing this same params key) without reintroducing the mid-typing bug.
 
@@ -1056,6 +1065,9 @@ def _position_row(side, on_close=None):
     _sync_draft_from_params(stop_draft, 'value', stop_val_key)
     _sync_draft_from_params(tgt_draft, 'value', tgt_val_key)
 
+    # stop_switch/tgt_switch are assigned further below, but referenced here inside these
+    # handlers -- safe, since Python closures resolve free variables at CALL time (when the
+    # user actually clicks), by which point both switches already exist.
     def _toggle_stop(e):
         if e.value:
             try:
@@ -1065,6 +1077,7 @@ def _position_row(side, on_close=None):
             if value <= 0:
                 ui.notify(f"Enter a valid {side} Idx Stop value first", type='negative')
                 params[stop_active_key] = False
+                stop_switch.set_value(False)
                 return
             params[stop_val_key] = value
 
@@ -1077,6 +1090,7 @@ def _position_row(side, on_close=None):
             if value <= 0:
                 ui.notify(f"Enter a valid {side} Idx Target value first", type='negative')
                 params[tgt_active_key] = False
+                tgt_switch.set_value(False)
                 return
             params[tgt_val_key] = value
 
@@ -1120,11 +1134,11 @@ def _position_row(side, on_close=None):
         with ui.row().classes('w-full gap-3 items-center pt-2 border-t border-gray-200 flex-wrap'):
             ui.label('Idx Stop').classes('text-[10px] text-gray-500')
             ui.label().bind_text_from(params, stop_time_key, backward=lambda v: f"({v})").classes('text-[9px] text-gray-400 -ml-2')
-            ui.switch(on_change=_toggle_stop).bind_value(params, stop_active_key).props('dense color=red size=sm')
+            stop_switch = ui.switch(on_change=_toggle_stop).bind_value(params, stop_active_key).props('dense color=red size=sm')
             ui.input().bind_value(stop_draft, 'value').props('outlined dense bg-color=white').classes('w-24')
             ui.label('Idx Target').classes('text-[10px] text-gray-500')
             ui.label().bind_text_from(params, tgt_time_key, backward=lambda v: f"({v})").classes('text-[9px] text-gray-400 -ml-2')
-            ui.switch(on_change=_toggle_tgt).bind_value(params, tgt_active_key).props('dense color=green size=sm')
+            tgt_switch = ui.switch(on_change=_toggle_tgt).bind_value(params, tgt_active_key).props('dense color=green size=sm')
             ui.input().bind_value(tgt_draft, 'value').props('outlined dense bg-color=white').classes('w-24')
             ui.space()
             ui.button('CLOSE', color='red', on_click=on_close).classes('h-7 text-xs px-4 rounded font-bold')
