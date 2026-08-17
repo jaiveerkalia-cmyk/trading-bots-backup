@@ -1043,12 +1043,20 @@ def _position_row(side, on_close=None):
        params on a periodic cycle, independent of this handler. Reverting only the params
        side left a stale True sitting in the switch's own value, which that periodic sync
        then re-pushed into params moments later -- silently overriding the revert and
-       activating the stop/target despite the warning notification (symptom: 'Enter a valid
-       ... value first' shown, but the stop got set anyway). .set_value() corrects the
+       activating the stop/target despite the warning notification. .set_value() corrects the
        switch's own value (and the client display) through NiceGUI's normal update path, so
-       there's nothing stale left for a later sync to re-push. This is not mode-specific --
-       it affects Call/Put and Sell/Buy Mode identically.
-    4. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
+       there's nothing stale left for a later sync to re-push. Not mode-specific -- affects
+       Call/Put and Sell/Buy Mode identically.
+    4. Before actually rejecting an invalid value, a SINGLE short retry (0.3s later, via a
+       one-shot ui.timer) re-checks the draft once more before giving up. This exists because
+       clicking the switch immediately after typing a value can occasionally race the input's
+       own client->server update against the switch's click event -- the draft briefly still
+       held its old (often empty/zero) value at the exact moment the switch handler first
+       ran, so a genuinely-valid entry was rejected on the first click and only succeeded on
+       a second manual retry. The 0.3s grace window resolves that automatically and silently
+       (no error shown) in the common case where it was just a timing race; only a value
+       that's STILL invalid after the retry produces the warning and reverts the switch.
+    5. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
        Close -> auto_run.clear_leg_fields(), or the separate 'Exit based on Index' card
        sharing this same params key) without reintroducing the mid-typing bug.
 
@@ -1069,30 +1077,44 @@ def _position_row(side, on_close=None):
     # handlers -- safe, since Python closures resolve free variables at CALL time (when the
     # user actually clicks), by which point both switches already exist.
     def _toggle_stop(e):
-        if e.value:
+        if not e.value:
+            return  # turning off never needs a value check
+        def _finalize(retried=False):
             try:
                 value = float(stop_draft['value'])
             except (ValueError, TypeError):
                 value = 0
             if value <= 0:
+                if not retried:
+                    # Give the input's own client->server update a brief window to land, in
+                    # case it hasn't propagated into stop_draft yet -- see docstring point 4.
+                    ui.timer(0.3, lambda: _finalize(True), once=True)
+                    return
                 ui.notify(f"Enter a valid {side} Idx Stop value first", type='negative')
                 params[stop_active_key] = False
                 stop_switch.set_value(False)
                 return
             params[stop_val_key] = value
+        _finalize()
 
     def _toggle_tgt(e):
-        if e.value:
+        if not e.value:
+            return  # turning off never needs a value check
+        def _finalize(retried=False):
             try:
                 value = float(tgt_draft['value'])
             except (ValueError, TypeError):
                 value = 0
             if value <= 0:
+                if not retried:
+                    ui.timer(0.3, lambda: _finalize(True), once=True)
+                    return
                 ui.notify(f"Enter a valid {side} Idx Target value first", type='negative')
                 params[tgt_active_key] = False
                 tgt_switch.set_value(False)
                 return
             params[tgt_val_key] = value
+        _finalize()
 
     with ui.card().classes('w-full bg-white border-l-4 border-gray-300 border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         ui_refs[f'{prefix}_pos_row'] = row
