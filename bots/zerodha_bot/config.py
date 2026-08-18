@@ -89,10 +89,14 @@ shared_state = {
     # this list (one-shot, same semantics as the old single-slot alert_upper_active/
     # alert_lower_active flags). Lives in shared_state (not params) since these are
     # dynamic runtime instances, matching the existing active_trades/option_chain pattern.
+    # ALSO fully cleared (regardless of fired/pending state) at the 15:19 EOD routine in
+    # auto_run.AutoController.run_loop() -- see that method's docstring/comments -- since a
+    # price alert set during today's session has no business firing against tomorrow's
+    # price action.
     'alerts': [],
 
     # --- Candlestick Pattern Indicators (pattern_engine.py) ---
-    # Per-interval diagnostic info: {'1m'|'5m'|'15m'|'1h': {'boundary_time','status','updated'} or None}
+    # Per-interval diagnostic info: {'1m'|'5m'|'15m'|'30m'|'1h': {'boundary_time','status','updated'} or None}
     'pattern_debug': {},
     # Per-pattern last fired signal (for UI display): {'bullish_engulfing'|'bearish_engulfing': {...}}
     'pattern_last_signal': {},
@@ -140,7 +144,7 @@ UI_OPTS = {
     'order_types': ['Market', 'Limit', 'Stop-Market'],
     'fire_on_opts': ['Live', '1m', '5m', '15m', '60m'],
     'alert_sounds': list(ALERT_SOUND_URLS.keys()),
-    'pattern_intervals': ['1m', '5m', '15m', '1h'],
+    'pattern_intervals': ['1m', '5m', '15m', '30m', '1h'],
 }
 
 # --- USER PARAMETERS ---
@@ -213,7 +217,7 @@ params = {
     # Bullish Engulfing: prev (base) candle red, current/synthetic candle green, and the
     # synthetic candle's body fully engulfs the base candle's body.
     'bullish_engulfing_enabled': True,
-    'bullish_engulfing_intervals': ['5m'],
+    'bullish_engulfing_intervals': ['5m', '15m', '30m', '1h'],
     # Engulf candle count: 1 = standard single-candle engulfing. N = combine the N most
     # recently closed candles into one synthetic candle (open=first's open, close=last's
     # close) and check that against the base candle immediately preceding the window.
@@ -222,6 +226,6 @@ params = {
     # Bearish Engulfing: prev (base) candle green, current/synthetic candle red, and the
     # synthetic candle's body fully engulfs the base candle's body.
     'bearish_engulfing_enabled': True,
-    'bearish_engulfing_intervals': ['5m'],
+    'bearish_engulfing_intervals': ['5m', '15m', '30m', '1h'],
     'bearish_engulfing_count': 1,
 }

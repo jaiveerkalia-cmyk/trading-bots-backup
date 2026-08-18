@@ -4,7 +4,7 @@ pattern_engine.py
 Candlestick pattern detection engine (Bullish/Bearish Engulfing, extensible).
 
 Runs alongside logic_engine.check_triggers() from auto_run.run_bot_logic().
-For each configured interval (1m/5m/15m/1h):
+For each configured interval (1m/5m/15m/30m/1h):
   - Detects when that interval's candle boundary has just closed.
   - Waits `params['pattern_fetch_delay_sec']` seconds.
   - Fetches historical candles via KiteConnect and matches EXACT required
@@ -29,6 +29,7 @@ INTERVAL_DELTA = {
     '1m': timedelta(minutes=1),
     '5m': timedelta(minutes=5),
     '15m': timedelta(minutes=15),
+    '30m': timedelta(minutes=30),
     '1h': timedelta(hours=1),
 }
 
@@ -36,6 +37,7 @@ INTERVAL_KITE = {
     '1m': 'minute',
     '5m': '5minute',
     '15m': '15minute',
+    '30m': '30minute',
     '1h': '60minute',
 }
 
@@ -110,17 +112,28 @@ class PatternEngine:
             shared_state['pattern_last_signal'] = {}
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_boundary(interval, now):
+        """True exactly on the tick(s) where `interval`'s candle boundary has just closed.
+        Generic (not a hardcoded per-interval dict) so any interval added to INTERVAL_DELTA
+        in the future (e.g. a new '2h' or '10m') is handled automatically without needing a
+        matching manual entry here: for sub-hour intervals, the boundary is every N minutes;
+        for hour-or-longer intervals, it's additionally gated on the hour count dividing
+        evenly (e.g. a hypothetical 2h interval would only fire on even hours)."""
+        total_min = int(INTERVAL_DELTA[interval].total_seconds() // 60)
+        if total_min <= 0:
+            return False
+        if total_min < 60:
+            return now.minute % total_min == 0
+        hours = total_min // 60
+        return now.minute == 0 and (hours <= 1 or now.hour % hours == 0)
+
+    # ------------------------------------------------------------------
     def check_patterns(self):
         now = datetime.now()
-        curr_min = now.minute
         boundary_time = now.replace(second=0, microsecond=0)
 
-        is_boundary = {
-            '1m': True,
-            '5m': (curr_min % 5 == 0),
-            '15m': (curr_min % 15 == 0),
-            '1h': (curr_min == 0),
-        }
+        is_boundary = {iv: self._is_boundary(iv, now) for iv in INTERVAL_DELTA}
 
         for interval in INTERVAL_DELTA:
             if is_boundary[interval] and self.last_armed_boundary[interval] != boundary_time:
