@@ -1418,10 +1418,10 @@ def _pattern_row(key, meta):
     entries added to pattern_engine.PATTERN_REGISTRY -- this loop picks them all up
     automatically, no UI change needed to add a new pattern). On/off switch defaults to
     whatever params currently holds (True by default, per pattern). Interval multi-select
-    defaults to ['5m']. 'Engulf candle count' controls how many subsequent closed candles are
-    combined into one synthetic candle before checking the engulfing condition against the
-    base candle (see pattern_engine.py for the exact mechanics); default 1 = standard
-    single-candle engulfing.
+    defaults to ['5m', '15m', '30m', '1h']. 'Engulf candle count' controls how many
+    subsequent closed candles are combined into one synthetic candle before checking the
+    engulfing condition against the base candle (see pattern_engine.py for the exact
+    mechanics); default 1 = standard single-candle engulfing.
 
     Background color comes from meta['color'] (registered per-pattern in
     pattern_engine.PATTERN_REGISTRY: light green for bullish setups, light red for bearish)
@@ -1437,7 +1437,7 @@ def _pattern_row(key, meta):
 
         with ui.row().classes('w-full items-center gap-2'):
             ui.label('Intervals:').classes('text-xs text-gray-500 w-16')
-            ui.select(UI_OPTS['pattern_intervals'], value=params.get(intervals_key, ['5m']), multiple=True) \
+            ui.select(UI_OPTS['pattern_intervals'], value=params.get(intervals_key, ['5m', '15m', '30m', '1h']), multiple=True) \
                 .bind_value(params, intervals_key).props('outlined dense bg-color=white use-chips').classes('grow')
 
         with ui.row().classes('w-full items-center gap-2'):
