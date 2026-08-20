@@ -503,6 +503,16 @@ class AutoController:
                     shared_state['daily_pnl_written'] = True
                     shared_state['sound_queue'].append('close')
                 except: shared_state['daily_pnl_written'] = True
+
+                # Clear all pending price alerts (Active Alerts section) -- they were set
+                # against today's session; carrying them into tomorrow could fire against a
+                # completely different day's price action. Reuses the same once-per-day
+                # daily_pnl_written gate as the rest of this EOD routine, so it only runs
+                # once, not every tick during the [15:19, 15:40) window.
+                if shared_state.get('alerts'):
+                    cleared_count = len(shared_state['alerts'])
+                    shared_state['alerts'] = []
+                    self.log(f"🔔 Cleared {cleared_count} pending price alert(s) at Day End.")
             
             if shared_state['active_trades']['Call'] is not None: shared_state['active_trades']['Call'] = None
             if shared_state['active_trades']['Put'] is not None: shared_state['active_trades']['Put'] = None
