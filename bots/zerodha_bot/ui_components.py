@@ -1427,7 +1427,11 @@ def _pattern_row(key, meta):
     pattern_engine.PATTERN_REGISTRY: light green for bullish setups, light red for bearish)
     so a future pattern just needs a 'color' entry there to get a themed card -- no UI change
     needed. 'flex-1' (not 'w-full') so multiple cards sit side by side in the row built by
-    render_pattern_indicators, instead of stacking top to bottom."""
+    render_pattern_indicators, instead of stacking top to bottom.
+
+    Detection now runs independently for BOTH indices (NIFTY and SENSEX) regardless of the
+    globally selected trading_index (see pattern_engine.py), so the 'Last' status line below
+    shows WHICH index the most recent signal fired on."""
     enabled_key = meta['enabled_param']; intervals_key = meta['intervals_param']; count_key = meta['count_param']
     color = meta.get('color', 'gray')
     with ui.card().classes(f'flex-1 min-w-[300px] p-3 gap-2 bg-{color}-50 border border-{color}-200 rounded-lg'):
@@ -1449,7 +1453,7 @@ def _pattern_row(key, meta):
         def _refresh(_e=None, k=key, lbl=status):
             sig = shared_state.get('pattern_last_signal', {}).get(k)
             if sig:
-                lbl.set_text(f"Last: {sig['interval']} candle @ {sig['candle_start']} (fired {sig['time']})")
+                lbl.set_text(f"Last: {sig.get('index', '-')} {sig['interval']} candle @ {sig['candle_start']} (fired {sig['time']})")
         _refresh()
         ui.timer(2.0, _refresh)
 
@@ -1461,7 +1465,8 @@ def render_pattern_indicators():
     shared fetch-delay input (seconds to wait after a candle boundary closes before fetching
     it via the historical API -- gives the broker's candle data time to finalize; applies to
     every pattern/interval). Detection itself runs from auto_run.run_bot_logic() via
-    PatternEngine.check_patterns()."""
+    PatternEngine.check_patterns(), independently for both NIFTY and SENSEX regardless of the
+    globally selected trading_index."""
     with ui.card().classes('w-full bg-white p-3 gap-3 rounded-xl shadow-sm mb-4 border border-gray-200'):
         with ui.row().classes('w-full justify-between items-center'):
             ui.label('CANDLESTICK PATTERN INDICATORS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
