@@ -157,6 +157,18 @@ params = {
     # exclusive with Auto Pilot. Default False = identical to prior selling-only behavior.
     'options_buy_mode': False,
 
+    # Enter via Stop: global toggle, default ON. When on, any Stop-Market unified entry, OR
+    # any Index/Premium STOP (never Target) whose period is candle-close-based (1m/5m/15m/60m
+    # for entries; 1m/5m for index/premium stops -- never 'Current'/'Live'), is intercepted at
+    # the moment its condition is confirmed true: instead of acting immediately, the bot
+    # fetches that just-closed candle and arms a real Stop-Market order one tick beyond its
+    # high or low (mirroring the ORIGINAL condition's breakout direction -- downside cross ->
+    # stop below the candle's low; upside cross -> stop above the candle's high), then
+    # live-monitors that new level every tick until price actually trades through it. See
+    # stop_via_candle_engine.py. When off, behavior is identical to before this feature
+    # existed (immediate action at candle close).
+    'enter_via_stop': True,
+
     'call_target_active': False, 'call_stop_active': False,
     'put_target_active': False, 'put_stop_active': False,
 

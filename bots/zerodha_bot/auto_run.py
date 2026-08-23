@@ -52,6 +52,7 @@ from ticker_engine import TickerClient
 from instrument_manager import InstrumentManager
 from logic_engine import LogicEngine
 from pattern_engine import PatternEngine
+from stop_via_candle_engine import StopViaCandleEngine
 
 # ==========================================
 #      CONFIGURATION & CONSTANTS
@@ -832,6 +833,8 @@ ticker = TickerClient(api_key, access_token)
 inst_manager = InstrumentManager(kite)
 logic = LogicEngine(ticker, inst_manager)
 pattern_engine = PatternEngine(inst_manager)
+stop_via_candle_engine = StopViaCandleEngine(inst_manager, logic)
+logic.stop_via_candle_engine = stop_via_candle_engine
 controller = AutoController(logic, inst_manager)
 daily_logger = DailyLogger() 
 #ticker.start()
@@ -1126,6 +1129,16 @@ def custom_render_master_banner(update_lots_callback):
                     on_change=lambda e: params.update({'hedgeless_mode': e.value == 'On'})
                 ).props('dense').classes('text-xs')
                 hedgeless_toggle.bind_enabled_from(params, 'options_buy_mode', backward=lambda v: not v)
+            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
+                with ui.column().classes('gap-0'):
+                    ui.label('ENTER VIA STOP').classes('font-bold text-teal-900 text-[10px] leading-none')
+                    ui.label('1m/5m/15m/60m -> real stop').classes('text-[8px] font-mono text-teal-600 leading-none')
+                # Default ON (params['enter_via_stop'] defaults True in config.py). Live-bound
+                # directly to params -- unlike the numeric draft-and-commit fields elsewhere in
+                # this app, this is a plain boolean read at decision points (logic_engine.py /
+                # stop_via_candle_engine.py), never polled against a numeric threshold, so a
+                # direct bind carries none of the mid-edit risk that pattern exists to avoid.
+                ui.switch(value=params.get('enter_via_stop', True)).bind_value(params, 'enter_via_stop').props('dense color=teal')
 
         with ui.card().classes('w-full p-1 px-3 bg-gray-100 border-t border-gray-300 rounded-none'):
             with ui.row().classes('items-center gap-2'):
@@ -1444,7 +1457,14 @@ async def run_bot_logic():
                             if params['short_trigger_active'] or params['long_trigger_active']:
                                 params['short_trigger_active'] = False
                                 params['long_trigger_active'] = False
-                    
+
+                    # Enter via Stop: live-monitors/executes any deferred candle-stop jobs
+                    # every tick, regardless of weekday/SQ_OFF_TIME gating above -- a job
+                    # already armed should keep being checked so it's never silently
+                    # abandoned; if its position closes via the EOD routine or any other
+                    # route in the meantime, the engine drops that job harmlessly on its own.
+                    stop_via_candle_engine.check()
+
                     logic.update_pnl()
                     
                     # WIPE FIELDS FOR ANY CLOSES

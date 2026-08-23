@@ -63,6 +63,10 @@ class LogicEngine:
         self.last_trigger_time = {'1m': None, '5m': None, '15m': None, '60m': None, 'chart': None}
         self.alert_triggered = {'upper': False, 'lower': False}
         self.trading_active = True
+        # Enter via Stop (stop_via_candle_engine.py): wired in from auto_run.py after both are
+        # constructed. Stays None if never wired -- every call site below checks for that and
+        # falls straight through to the original immediate-action behavior.
+        self.stop_via_candle_engine = None
 
     def log_action(self, message, details=""):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -402,7 +406,7 @@ class LogicEngine:
         else:
             shared_state['unified_debug']['Put'] = None
 
-        self._check_exits(idx_ltp, fire_1m, fire_5m)
+        self._check_exits(now, idx_ltp, fire_1m, fire_5m)
         self._check_global_limits()
         self._check_alerts(idx_ltp, fire_1m, fire_5m)
 
@@ -457,7 +461,13 @@ class LogicEngine:
         after waiting for the NEXT candle close as the trader intends. Fixed by stamping
         params['{prefix}_armed_at'] with the datetime the card was armed (unified_entry_card /
         MODIFY-CONFIRM in ui_components.py), and requiring 'now' to be strictly after that
-        timestamp AND in a later boundary-minute than when it was armed."""
+        timestamp AND in a later boundary-minute than when it was armed.
+
+        Enter via Stop (stop_via_candle_engine.py): when a Stop-Market condition (never Market
+        or Limit) is confirmed true on a candle-close timeframe (never 'Live'), and
+        params['enter_via_stop'] is on and the engine is wired, the entry is handed off to the
+        candle-stop engine instead of being opened immediately -- see the should_fire block
+        below. Falls through to the exact original immediate-open behavior otherwise."""
         prefix = 'call' if side == 'Call' else 'put'
         order_type = params.get(f'{prefix}_order_type', 'Market')
         fire_on = params.get(f'{prefix}_fire_on', 'Live')
@@ -487,6 +497,11 @@ class LogicEngine:
         else: timing_ok = True
 
         should_fire = False
+        # Only meaningful when should_fire is set via a Stop-Market branch below: True = the
+        # confirmed condition was a downside cross (idx_ltp <= trigger_price), False = upside
+        # cross (idx_ltp >= trigger_price). None for Market/Limit. Used by the "Enter via
+        # Stop" hand-off below to know which side of the closed candle to arm against.
+        is_downside_breakout = None
         reason = f"{order_type} @ {trigger_price} ({fire_on})"
         skip_reason = None
 
@@ -503,8 +518,8 @@ class LogicEngine:
             # --- Sell Mode (existing, unchanged) ---
             if order_type == 'Stop-Market':
                 # Breakout confirmation in the direction of the trade's original bias.
-                if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
-                elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
+                if side == 'Call' and idx_ltp <= trigger_price: should_fire = True; is_downside_breakout = True
+                elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True; is_downside_breakout = False
             elif order_type == 'Limit':
                 # Wait for a better (opposite-direction) entry price.
                 if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
@@ -513,8 +528,8 @@ class LogicEngine:
             # --- Options Buy Mode: directions flipped. Call = buy CE on breakout above;
             # Put = buy PE on breakdown below. ---
             if order_type == 'Stop-Market':
-                if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
-                elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
+                if side == 'Call' and idx_ltp >= trigger_price: should_fire = True; is_downside_breakout = False
+                elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True; is_downside_breakout = True
             elif order_type == 'Limit':
                 if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
                 elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
@@ -532,6 +547,29 @@ class LogicEngine:
             return
 
         if should_fire:
+            # --- Enter via Stop: intercept Stop-Market entries confirmed on a candle-close
+            # timeframe (never Market/Limit, never 'Live'). Instead of opening now, hand off
+            # to the candle-stop engine, which arms a real Stop-Market trigger one tick beyond
+            # the just-closed candle's high/low (mirroring this condition's breakout
+            # direction) and opens the position only once price actually trades through it. ---
+            defer_via_stop = (
+                order_type == 'Stop-Market' and is_downside_breakout is not None and fire_on != 'Live'
+                and params.get('enter_via_stop', True) and self.stop_via_candle_engine is not None
+            )
+            if defer_via_stop:
+                self.stop_via_candle_engine.defer_entry(
+                    side=side, prefix=prefix, interval=fire_on, now=now,
+                    index_name=params['trading_index'], is_downside=is_downside_breakout,
+                    qty=qty, strike_offset=strike_offset,
+                    new_stop=params.get(f'{prefix}_new_stop', ''),
+                    new_target=params.get(f'{prefix}_new_target', ''),
+                    reason=reason,
+                )
+                params[f'{prefix}_armed'] = False
+                params[f'{prefix}_armed_at'] = None
+                shared_state['unified_debug'][side] = None
+                return
+
             self.log_action(f"⚡ UNIFIED TRIGGER FIRED: {side} ({reason})")
             success, msg = self.open_position(side, reason=reason, qty_override=qty, strike_offset=strike_offset)
             if success:
@@ -558,7 +596,49 @@ class LogicEngine:
                 shared_state['unified_debug'][side] = None
                 self.play_sound('error')
 
-    def _check_exits(self, idx_ltp, fire_1m, fire_5m):
+    def _fire_or_defer_stop(self, kind, side, val, period, is_downside, reason, now=None):
+        """Shared by the Index Stop and Premium Stop branches of _check_exits ONLY -- never
+        the Target branches, which are untouched and always close immediately regardless of
+        enter_via_stop.
+
+        If Enter via Stop is on, the candle-stop engine is wired, AND this stop's period is
+        candle-close-based (1m/5m, not 'Current'), hands off to the deferred flow instead of
+        closing the position immediately: disables this stop's own active flag (one-shot
+        hand-off, exactly like a successful unified entry disarms itself) so it can't
+        re-trigger on a later boundary, and lets the candle-stop engine arm a real Stop-Market
+        trigger just beyond the closed candle's high/low. Falls through to the exact original
+        close_position(...) call otherwise -- zero behavior change whenever Enter via Stop is
+        off or the engine isn't wired."""
+        eligible = (
+            period != 'Current'
+            and params.get('enter_via_stop', True)
+            and self.stop_via_candle_engine is not None
+        )
+        if not eligible:
+            self.close_position(side, reason)
+            return
+
+        now = now or datetime.now()
+        if kind == 'index_stop':
+            self.stop_via_candle_engine.defer_index_stop(
+                side=side, interval=period, now=now, index_name=params['trading_index'],
+                is_downside=is_downside, reason=reason,
+            )
+            params[f'{side.lower()}_index_stop_active'] = False
+        elif kind == 'premium_stop':
+            trade = shared_state['active_trades'][side]
+            if trade is None:
+                # Defensive only -- callers already confirmed a trade exists before calling.
+                self.close_position(side, reason)
+                return
+            self.stop_via_candle_engine.defer_premium_stop(
+                side=side, interval=period, now=now,
+                trade_token=trade['main']['token'], trade_symbol=trade['main']['symbol'],
+                is_downside=is_downside, reason=reason,
+            )
+            params[f'{side.lower()}_prem_stop_active'] = False
+
+    def _check_exits(self, now, idx_ltp, fire_1m, fire_5m):
         buy_mode = params.get('options_buy_mode', False)
         for side in ['Call', 'Put']:
             trade = shared_state['active_trades'][side]
@@ -595,12 +675,14 @@ class LogicEngine:
             if not buy_mode:
                 # --- Sell Mode (existing, unchanged) ---
                 if side == 'Call':
-                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=False, reason=f"Idx Stop {s_val}", now=now)
                     if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
                         self.close_position(side, f"Idx Target {t_val}")
                         self._cancel_opposite_pending(side, f"Idx Target {t_val}")
                 else:
-                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=True, reason=f"Idx Stop {s_val}", now=now)
                     if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
                         self.close_position(side, f"Idx Target {t_val}")
                         self._cancel_opposite_pending(side, f"Idx Target {t_val}")
@@ -608,12 +690,14 @@ class LogicEngine:
                 # --- Options Buy Mode: directions flipped (Call profits as idx rises,
                 # Put profits as idx falls). ---
                 if side == 'Call':
-                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=True, reason=f"Idx Stop {s_val}", now=now)
                     if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
                         self.close_position(side, f"Idx Target {t_val}")
                         self._cancel_opposite_pending(side, f"Idx Target {t_val}")
                 else:
-                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val: self.close_position(side, f"Idx Stop {s_val}")
+                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=False, reason=f"Idx Stop {s_val}", now=now)
                     if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
                         self.close_position(side, f"Idx Target {t_val}")
                         self._cancel_opposite_pending(side, f"Idx Target {t_val}")
@@ -641,7 +725,7 @@ class LogicEngine:
                 # --- Sell Mode (existing, unchanged) ---
                 # Stop: premium rises above stop value (loss on short)
                 if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp >= ps_val:
-                    self.close_position(side, f"Prem Stop {ps_val}")
+                    self._fire_or_defer_stop('premium_stop', side, ps_val, params[ps_key], is_downside=False, reason=f"Prem Stop {ps_val}", now=now)
 
                 trade = shared_state['active_trades'][side]
                 if not trade: continue
@@ -654,7 +738,7 @@ class LogicEngine:
                 # --- Options Buy Mode: comparisons flipped ---
                 # Stop: premium falls below stop value (loss on long)
                 if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp <= ps_val:
-                    self.close_position(side, f"Prem Stop {ps_val}")
+                    self._fire_or_defer_stop('premium_stop', side, ps_val, params[ps_key], is_downside=True, reason=f"Prem Stop {ps_val}", now=now)
 
                 trade = shared_state['active_trades'][side]
                 if not trade: continue
