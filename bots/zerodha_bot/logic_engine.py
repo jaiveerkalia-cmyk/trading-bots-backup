@@ -67,6 +67,12 @@ class LogicEngine:
         # constructed. Stays None if never wired -- every call site below checks for that and
         # falls straight through to the original immediate-action behavior.
         self.stop_via_candle_engine = None
+        # Global field-clear callback (auto_run.AutoController.clear_leg_fields): wired in
+        # from auto_run.py after the controller is constructed. Stays None if never wired --
+        # _check_global_limits() below checks for that before calling it. Wired this way
+        # (rather than importing AutoController here) to avoid a circular import, matching the
+        # same loosely-coupled pattern already used for stop_via_candle_engine.
+        self.clear_leg_fields_callback = None
 
     def log_action(self, message, details=""):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -749,6 +755,24 @@ class LogicEngine:
                     self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
 
     def _check_global_limits(self):
+        """Manual 'Global Stop Loss' / 'Global Target' cards (params['global_stop_value']/
+        'global_target_value', combined realized+unrealized PnL across BOTH sides).
+
+        On hit, in addition to the existing close_all_positions() + trading_active=False:
+          - Every per-side field on BOTH Call and Put -- PnL/Index/Premium stop-target
+            values+active-flags, and any pending Unified Entry order (armed/trigger_price/
+            armed_at/new_stop/new_target) -- is wiped via clear_leg_fields_callback, wired in
+            from auto_run.AutoController.clear_leg_fields. This matches what Auto Pilot's own
+            internal global stop already does in AutoController.run_loop() (SECOND_LEG block)
+            -- previously this manual path only closed positions, leaving every field/pending
+            order behind (misleadingly still showing 'active'/'armed' in the UI even though
+            trading_active=False silently blocked anything from actually firing again).
+          - Both sides deliberately, not just whichever side had a position open: an armed
+            entry order on the OTHER side (no position yet) is just as much a 'still open
+            order' that needs cancelling as an active exit order on the side that just closed.
+          - Any pending/armed Enter via Stop job (stop_via_candle_engine.py) is also cancelled
+            outright via cancel_all(), rather than left to expire on its own later.
+        """
         total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
 
         try: stop = float(params['global_stop_value']) if str(params['global_stop_value']).strip() != '' else 0.0
@@ -766,12 +790,27 @@ class LogicEngine:
         # way of knowing a report was already saved -- two rows per day for one session.
         if params['global_stop_active'] and stop > 0 and total <= -stop:
             self.close_all_positions("Global Stop", save_pnl=False)
+            self._clear_all_fields_and_orders("Global Stop")
             self.trading_active = False
             self.play_sound('error')
         if params['global_tgt_active'] and target > 0 and total >= target:
             self.close_all_positions("Global Target", save_pnl=False)
+            self._clear_all_fields_and_orders("Global Target")
             self.trading_active = False
             self.play_sound('error')
+
+    def _clear_all_fields_and_orders(self, reason):
+        """Wipes every per-side field on BOTH Call and Put (via clear_leg_fields_callback, if
+        wired) and cancels any pending/armed Enter via Stop job (via
+        stop_via_candle_engine.cancel_all(), if wired). Shared by both branches of
+        _check_global_limits() above. Both callbacks are no-ops if never wired (e.g. a future
+        caller that constructs LogicEngine standalone), so this is always safe to call."""
+        if self.clear_leg_fields_callback:
+            self.clear_leg_fields_callback('Call')
+            self.clear_leg_fields_callback('Put')
+            self.log_action(f"🧹 {reason}: cleared all fields & cancelled all open orders (both sides)")
+        if self.stop_via_candle_engine is not None:
+            self.stop_via_candle_engine.cancel_all(reason)
 
     def _check_alerts(self, idx_ltp, fire_1m, fire_5m):
         """Multi-alert system: shared_state['alerts'] holds any number of independent price

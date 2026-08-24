@@ -32,6 +32,10 @@ no UI surface. If the underlying position closes/opens via some other route whil
 pending or armed, that job is dropped silently on its next check (no double action). If
 candle data never arrives within the retry window, the job is dropped with a log entry and
 no trade is taken.
+
+cancel_all() lets an external "kill everything" event (global stop/target, close all, etc)
+explicitly drop every pending/armed job immediately, without executing anything -- see
+LogicEngine._check_global_limits() for the main caller.
 """
 
 from datetime import datetime, timedelta
@@ -141,6 +145,22 @@ class StopViaCandleEngine:
                 # else: resolved (fired, or silently dropped because the underlying
                 # position already changed via another route) -- don't keep it
         self.jobs = remaining
+
+    # ------------------------------------------------------------------
+    def cancel_all(self, reason="Cancelled"):
+        """Drops every pending/armed job immediately WITHOUT executing anything -- used when
+        a global stop/target (or any other 'kill everything' event) fires. A still-pending
+        Enter via Stop order has no business surviving that, even though open_position()
+        would harmlessly reject it anyway once trading_active is False (this makes the
+        cancellation explicit and visible in the log instead of leaving it to expire/fail
+        silently later)."""
+        if not self.jobs:
+            return
+        for job in self.jobs:
+            self.logic_engine.log_action(
+                f"🚫 ENTER VIA STOP cancelled: {job['side']} {job['kind']} ({job['interval']}) - {reason}"
+            )
+        self.jobs = []
 
     # ------------------------------------------------------------------
     def _try_fetch(self, job, now):
