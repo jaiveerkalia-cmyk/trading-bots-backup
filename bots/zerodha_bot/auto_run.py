@@ -1193,22 +1193,6 @@ def custom_render_master_banner(update_lots_callback):
                     ui.label('RUNNING PnL').classes('text-[10px] font-bold text-gray-400')
                     ui_refs['put_pnl'] = ui.label('₹ 0').classes('text-xl font-bold text-gray-400 font-mono')
 
-def render_chart_row():
-    with ui.card().classes('w-full h-64 p-2 border-x border-gray-300 rounded-none shadow-sm'):
-        ui.label('Real-Time PnL Curve').classes('text-xs font-bold text-gray-500 mb-2')
-        ui_refs['pnl_chart'] = ui.echart({
-            'tooltip': {'trigger': 'axis'},
-            'grid': {'top': 30, 'bottom': 20, 'left': 50, 'right': 20},
-            'xAxis': {'type': 'category', 'data': [], 'axisLine': {'lineStyle': {'color': '#9ca3af'}}},
-            'yAxis': {'type': 'value', 'scale': True, 'splitLine': {'lineStyle': {'color': '#e5e7eb'}}},
-            'backgroundColor': '#f9fafb',
-            'dataZoom': [{'type': 'inside', 'start': 0, 'end': 100}, {'type': 'slider'}],
-            'series': [{
-                'name': 'Total PnL', 'type': 'line', 'data': [], 'smooth': True, 'showSymbol': False,
-                'lineStyle': {'color': '#f97316', 'width': 2}, 'areaStyle': {'color': '#ffedd5', 'opacity': 0.5},
-                'markPoint': {'data': [], 'symbolSize': 25, 'label': {'fontSize': 8, 'color': 'white'}}
-            }]
-        })
 
 comp.render_master_banner = custom_render_master_banner
 
@@ -1526,7 +1510,7 @@ def index():
     comp.render_master_banner(update_lots)
     
     with ui.row().classes('w-full px-0 gap-0'): 
-        render_chart_row()
+        comp.render_chart_row()
         comp.render_log_row()
 
     with ui.row().classes('w-full no-wrap items-start gap-4 p-2'):

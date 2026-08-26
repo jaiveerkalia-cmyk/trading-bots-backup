@@ -15,26 +15,33 @@ This engine then:
      same reliability pattern pattern_engine.py uses, but implemented independently here so
      nothing in that file is touched or shared (avoids any risk of interfering with pattern
      detection's own state).
-  2. Arms a real Stop-Market trigger 1 tick beyond that candle's high or low, mirroring the
-     direction of the ORIGINAL condition's breakout: a downside cross -> stop below the
+  2. Computes a real Stop-Market trigger 1 tick beyond that candle's high or low, mirroring
+     the direction of the ORIGINAL condition's breakout: a downside cross -> stop below the
      candle's low; an upside cross -> stop above the candle's high. Index-level tick = 0.5;
      premium-level tick = 0.05.
-  3. Live-monitors that new trigger every tick (like a normal Stop-Market order) until price
-     actually trades through it, then executes the real action (open_position for entries,
-     close_position for index/premium stops) via the LogicEngine instance it was given.
+  3. HANDS OFF immediately: writes that new trigger straight into the SAME params the
+     original order/stop used (Unified Entry trigger_price/order_type/fire_on, or Index/
+     Premium Stop val/time), re-arms/re-activates it there, and drops its own internal job.
+     From that moment on the order is a completely normal, live ('Live'/'Current') armed
+     order -- monitored and fired by the EXISTING logic_engine.py paths
+     (_check_unified_open / _check_exits), and visible/editable/cancelable through the
+     EXACT SAME UI (Open Short/Long card, Order Book) as any manually-armed order. This
+     engine does not live-monitor or fire anything itself once handed off -- there is
+     nothing left here to duplicate that.
 
 Deferring is a one-shot hand-off: the original order/stop is disarmed/disabled at the moment
-it's handed off (mirroring what the original code already did on successful execution), so
-there's no double-firing and no lingering "still armed" UI state.
+it's first deferred (mirroring what the original code already did on successful execution),
+so there's no double-firing while the candle is being fetched.
 
-Jobs are tracked entirely in-memory on this class instance (self.jobs) -- no shared_state,
-no UI surface. If the underlying position closes/opens via some other route while a job is
-pending or armed, that job is dropped silently on its next check (no double action). If
-candle data never arrives within the retry window, the job is dropped with a log entry and
-no trade is taken.
+Jobs only exist in the brief 'awaiting_fetch' window (a few seconds, gated by
+FETCH_DELAY_SEC) between deferral and hand-off. If the user cancels/resets/modifies the
+ORIGINAL order (or the underlying position closes/opens via another route) during that
+window, cancel_pending()/the re-arm guard in _handoff() ensure the pending job never
+resurrects or clobbers it. If candle data never arrives within the retry window, the job is
+dropped with a log entry and no trade is taken.
 
 cancel_all() lets an external "kill everything" event (global stop/target, close all, etc)
-explicitly drop every pending/armed job immediately, without executing anything -- see
+explicitly drop every pending job immediately, without executing anything -- see
 LogicEngine._check_global_limits() for the main caller.
 """
 
@@ -135,25 +142,31 @@ class StopViaCandleEngine:
         now = datetime.now()
         remaining = []
         for job in self.jobs:
-            if job['status'] == 'awaiting_fetch':
-                self._try_fetch(job, now)
-                if job['status'] != 'dropped':
-                    remaining.append(job)
-            elif job['status'] == 'armed':
-                if not self._try_execute(job, now):
-                    remaining.append(job)
-                # else: resolved (fired, or silently dropped because the underlying
-                # position already changed via another route) -- don't keep it
+            # 'awaiting_fetch' is the only status a job can have now -- once the candle is
+            # fetched, _try_fetch hands off and the job is dropped in the same pass (see
+            # below). Nothing is ever kept around in an 'armed'/live-monitored state here.
+            self._try_fetch(job, now)
+            if job['status'] != 'dropped':
+                remaining.append(job)
         self.jobs = remaining
 
     # ------------------------------------------------------------------
+    def cancel_pending(self, kind, side):
+        """Called from the UI whenever the person cancels/resets/modifies the ORIGINAL
+        order/stop that a job might currently be deferred for (Open Short/Long Cancel or
+        Order Book REMOVE for entries; Index/Premium Stop Reset or Order Book REMOVE for
+        stops). Drops any matching still-pending job so it can never later resurrect (or, if
+        the person immediately re-armed with different values, clobber) an order the person
+        just changed their mind about. A no-op if no matching job exists -- always safe to
+        call unconditionally from these handlers."""
+        before = len(self.jobs)
+        self.jobs = [j for j in self.jobs if not (j['kind'] == kind and j['side'] == side)]
+        if len(self.jobs) < before:
+            self.logic_engine.log_action(f"🚫 ENTER VIA STOP: pending {side} {kind} cancelled (order changed)")
+
     def cancel_all(self, reason="Cancelled"):
-        """Drops every pending/armed job immediately WITHOUT executing anything -- used when
-        a global stop/target (or any other 'kill everything' event) fires. A still-pending
-        Enter via Stop order has no business surviving that, even though open_position()
-        would harmlessly reject it anyway once trading_active is False (this makes the
-        cancellation explicit and visible in the log instead of leaving it to expire/fail
-        silently later)."""
+        """Drops every pending job immediately WITHOUT executing anything -- used when a
+        global stop/target (or any other 'kill everything' event) fires."""
         if not self.jobs:
             return
         for job in self.jobs:
@@ -223,18 +236,11 @@ class StopViaCandleEngine:
             return
 
         tick = PREMIUM_TICK if job['kind'] == 'premium_stop' else INDEX_TICK
-        if job['is_downside']:
-            job['trigger_price'] = low - tick
-        else:
-            job['trigger_price'] = high + tick
+        trigger_price = (low - tick) if job['is_downside'] else (high + tick)
+        job['trigger_price'] = trigger_price
 
-        job['status'] = 'armed'
-        direction_txt = 'below candle low' if job['is_downside'] else 'above candle high'
-        self.logic_engine.log_action(
-            f"🕯️ STOP ARMED: {job['side']} {job['kind']} @ {job['trigger_price']:.2f} "
-            f"({direction_txt}, {interval})",
-            job['reason']
-        )
+        self._handoff(job, trigger_price)
+        job['status'] = 'dropped'
 
     def _maybe_give_up(self, job, now, status_msg):
         if job['first_attempt_at'] and (now - job['first_attempt_at']).total_seconds() > MAX_RETRY_SECONDS:
@@ -244,73 +250,69 @@ class StopViaCandleEngine:
             job['status'] = 'dropped'
 
     # ------------------------------------------------------------------
-    def _try_execute(self, job, now):
-        """Returns True if the job is resolved (fired, or silently dropped) and should be
-        removed from the active list; False if it should keep being monitored."""
+    def _handoff(self, job, trigger_price):
+        """Writes the newly-computed trigger straight into the same params the original
+        order/stop used, re-arming/re-activating it there as a normal LIVE order -- from
+        this point on it is monitored and fired entirely by the existing
+        _check_unified_open()/_check_exits() paths in logic_engine.py, and it is the SAME
+        order the person sees/edits/cancels in the Open Short/Long card and Order Book (no
+        separate 'deferred order' UI surface needed).
+
+        Guarded against a race with the UI: if the person has ALREADY manually re-armed/
+        re-activated this exact side+kind in the moments since it was disarmed at deferral
+        time (e.g. re-armed the card by hand while the candle was being fetched), that manual
+        action wins -- the hand-off is skipped rather than silently overwriting it."""
         side = job['side']
         kind = job['kind']
+        direction_txt = 'below candle low' if job['is_downside'] else 'above candle high'
 
         if kind == 'entry':
-            if shared_state['active_trades'][side] is not None:
-                # Position already opened via another route in the meantime -- drop silently.
-                return True
-            live_price = shared_state.get(job['index_name'], {}).get('ltp', 0)
-            if live_price <= 0:
-                return False
-            crossed = (live_price <= job['trigger_price']) if job['is_downside'] else (live_price >= job['trigger_price'])
-            if not crossed:
-                return False
-            success, msg = self.logic_engine.open_position(
-                side,
-                reason=f"{job['reason']} (via candle-stop @ {job['trigger_price']:.2f})",
-                qty_override=job['qty'], strike_offset=job['strike_offset']
+            prefix = job['prefix']
+            if params.get(f'{prefix}_armed', False):
+                self.logic_engine.log_action(
+                    f"ℹ️ ENTER VIA STOP: {side} entry hand-off skipped - order was re-armed manually"
+                )
+                return
+            params[f'{prefix}_order_type'] = 'Stop-Market'
+            params[f'{prefix}_trigger_price'] = trigger_price
+            params[f'{prefix}_fire_on'] = 'Live'
+            params[f'{prefix}_strike_offset'] = job['strike_offset']
+            params[f'{prefix}_qty'] = job['qty']
+            params[f'{prefix}_new_stop'] = job['new_stop']
+            params[f'{prefix}_new_target'] = job['new_target']
+            params[f'{prefix}_armed_at'] = datetime.now()
+            params[f'{prefix}_armed'] = True
+            self.logic_engine.log_action(
+                f"🕯️ STOP ARMED (live): {side} entry Stop-Market @ {trigger_price:.2f} ({direction_txt})",
+                job['reason']
             )
-            if success:
-                prefix = job['prefix']
-                try:
-                    new_stop = float(job['new_stop'])
-                    if new_stop > 0:
-                        params[f'{prefix}_stop_val'] = new_stop
-                        params[f'{prefix}_stop_active'] = True
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    new_target = float(job['new_target'])
-                    if new_target > 0:
-                        params[f'{prefix}_target_val'] = new_target
-                        params[f'{prefix}_target_active'] = True
-                except (ValueError, TypeError):
-                    pass
-            else:
-                self.logic_engine.log_action(f"⚠️ Deferred entry stop fired but open failed: {msg}")
-            return True
 
         elif kind == 'index_stop':
-            if shared_state['active_trades'][side] is None:
-                return True  # already closed via another route
-            live_price = shared_state.get(job['index_name'], {}).get('ltp', 0)
-            if live_price <= 0:
-                return False
-            crossed = (live_price <= job['trigger_price']) if job['is_downside'] else (live_price >= job['trigger_price'])
-            if not crossed:
-                return False
-            self.logic_engine.close_position(
-                side, f"{job['reason']} (via candle-stop @ {job['trigger_price']:.2f})"
+            active_key = f'{side.lower()}_index_stop_active'
+            if params.get(active_key, False):
+                self.logic_engine.log_action(
+                    f"ℹ️ ENTER VIA STOP: {side} Idx Stop hand-off skipped - stop was re-activated manually"
+                )
+                return
+            params[f'{side.lower()}_index_stop_val'] = trigger_price
+            params[f'{side.lower()}_index_stop_time'] = 'Current'
+            params[active_key] = True
+            self.logic_engine.log_action(
+                f"🕯️ STOP ARMED (live): {side} Idx Stop @ {trigger_price:.2f} ({direction_txt})",
+                job['reason']
             )
-            return True
 
         elif kind == 'premium_stop':
-            if shared_state['active_trades'][side] is None:
-                return True  # already closed via another route
-            live_price = shared_state.get('option_chain', {}).get(job['token'], {}).get('ltp', 0)
-            if live_price <= 0:
-                return False
-            crossed = (live_price <= job['trigger_price']) if job['is_downside'] else (live_price >= job['trigger_price'])
-            if not crossed:
-                return False
-            self.logic_engine.close_position(
-                side, f"{job['reason']} (via candle-stop @ {job['trigger_price']:.2f})"
+            active_key = f'{side.lower()}_prem_stop_active'
+            if params.get(active_key, False):
+                self.logic_engine.log_action(
+                    f"ℹ️ ENTER VIA STOP: {side} Prem Stop hand-off skipped - stop was re-activated manually"
+                )
+                return
+            params[f'{side.lower()}_prem_stop_val'] = trigger_price
+            params[f'{side.lower()}_prem_stop_time'] = 'Current'
+            params[active_key] = True
+            self.logic_engine.log_action(
+                f"🕯️ STOP ARMED (live): {side} Prem Stop @ {trigger_price:.2f} ({direction_txt})",
+                job['reason']
             )
-            return True
-
-        return True  # unknown kind -- drop defensively, never get stuck

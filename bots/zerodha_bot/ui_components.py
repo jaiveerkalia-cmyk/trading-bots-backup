@@ -5,6 +5,22 @@ import pandas as pd
 import uuid
 from pattern_engine import PATTERN_REGISTRY
 
+# --- Enter via Stop engine hook (wired in from auto_run.py after construction) ---
+# Kept as a plain module-level reference (mirrors the comp.render_master_banner override
+# pattern already used from auto_run.py) rather than importing stop_via_candle_engine here,
+# to avoid a circular import (that module imports config, not ui_components). Stays None if
+# never wired -- every call site below checks for that and is a harmless no-op otherwise.
+_stop_via_candle_engine = None
+
+def _cancel_engine_job_if_any(kind, side):
+    """Cancels any still-pending Enter via Stop job for this (kind, side) -- called from
+    every UI action that cancels/resets/modifies the order or stop that job would otherwise
+    hand off into. A job only exists for the few seconds between deferral and hand-off (see
+    stop_via_candle_engine.py); once handed off, it has already become a normal params-backed
+    order and there is nothing left here to cancel. Always safe to call unconditionally."""
+    if _stop_via_candle_engine is not None:
+        _stop_via_candle_engine.cancel_pending(kind, side)
+
 # --- SHARED HELPERS ---
 
 def _num_stepper(target, key, step=1, label=''):
@@ -244,7 +260,14 @@ def entry_card(side, label, mode_key, input_key, on_open=None, on_close=None):
 
 def _reset_unified_card_defaults(prefix):
     """Fully resets a unified Open Short/Long card (Cancel button) back to defaults:
-    disarms, clears the trigger price, and restores order type/strike/qty/fire-on/stop/target."""
+    disarms, clears the trigger price, and restores order type/strike/qty/fire-on/stop/target.
+
+    Also cancels any still-pending Enter via Stop job for this side (see
+    _cancel_engine_job_if_any): a job only lives for the few seconds between deferral and
+    hand-off, but without this a job in that window could later hand off and silently
+    re-arm an order the person just cancelled."""
+    side = 'Call' if prefix == 'call' else 'Put'
+    _cancel_engine_job_if_any('entry', side)
     params[f'{prefix}_armed'] = False
     params[f'{prefix}_armed_at'] = None
     params[f'{prefix}_order_type'] = 'Market'
@@ -292,9 +315,12 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     params[trig_key] when Arm is clicked (which also re-arms with the fresh value if the card
     was already armed). _sync_draft_from_params keeps the field in sync with EXTERNAL resets
     (e.g. Close -> auto_run.clear_leg_fields() zeroing params[trig_key]) so the field visibly
-    clears after closing, without reintroducing the mid-typing bug. Strike offset and Qty are
-    NOT staged this way since they're only read once, at the moment an order actually fires
-    -- never polled live against a threshold."""
+    clears after closing, without reintroducing the mid-typing bug -- this ALSO picks up the
+    stop_via_candle_engine's hand-off (it writes a fresh trigger_price directly into params
+    once armed), so the card automatically shows the NEW live order the moment hand-off
+    happens, with no separate 'deferred order' display needed. Strike offset and Qty are NOT
+    staged this way since they're only read once, at the moment an order actually fires --
+    never polled live against a threshold."""
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
@@ -524,14 +550,17 @@ def index_exit_component(side, label, time_key, value_key, active_key):
     bind previously let an in-progress edit trigger a close on an intermediate keystroke
     value. _sync_draft_from_params keeps the field in sync with EXTERNAL resets (e.g. Close
     -> auto_run.clear_leg_fields(), or the Open Positions quick control sharing this same
-    params_key) so the field visibly clears/updates without reintroducing that bug. The
-    period radio itself is unaffected (a click is already atomic, no typing risk) and stays
-    bound directly to params.
+    params_key) so the field visibly clears/updates without reintroducing that bug -- this
+    ALSO picks up the stop_via_candle_engine's hand-off for the Stop card (it writes a fresh
+    value/'Current' period directly into params once armed), so this card automatically shows
+    the NEW live stop the moment hand-off happens. The period radio itself is unaffected (a
+    click is already atomic, no typing risk) and stays bound directly to params.
 
     Set also warns (via _no_position_warning) if this side has no open position right now --
     checked alongside the existing instant-fire/pct-away warnings (index price is always
     available regardless of whether a position is open, so those remain independently
-    useful)."""
+    useful). Reset ALSO cancels any still-pending Enter via Stop job for the Stop card only
+    (see _cancel_engine_job_if_any) -- Target is never deferred, so nothing to cancel there."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'value': params.get(value_key, 0)}
     _sync_draft_from_params(draft, 'value', value_key)
@@ -545,6 +574,8 @@ def index_exit_component(side, label, time_key, value_key, active_key):
         status = ui.label().classes('w-full text-center text-[10px] font-bold text-green-800 bg-green-100 rounded')
         status.bind_visibility_from(params, active_key)
         def _do_activate(value):
+            if label == 'Stop':
+                _cancel_engine_job_if_any('index_stop', side)
             params[value_key] = value; params[active_key] = True
             status.set_text(f"ON: {value}")
             ui.notify(f"{side} Index {label} SET", type='positive')
@@ -568,6 +599,8 @@ def index_exit_component(side, label, time_key, value_key, active_key):
             else:
                 _do_activate(value)
         def reset():
+            if label == 'Stop':
+                _cancel_engine_job_if_any('index_stop', side)
             params[active_key] = False; params[value_key] = 0; draft['value'] = 0
             ui.notify(f"{side} Index {label} RESET", type='info')
         with ui.row().classes('w-full gap-1 mt-1'):
@@ -586,12 +619,15 @@ def premium_exit_card(side):
     params -- same fix as index_exit_component/auto_close_card, for the same reason
     (logic_engine._check_exits' PREMIUM EXITS branch polls these keys every tick whenever the
     period is 'Current'). _sync_draft_from_params keeps both fields in sync with EXTERNAL
-    resets (e.g. Close -> auto_run.clear_leg_fields()) without reintroducing that bug.
+    resets (e.g. Close -> auto_run.clear_leg_fields()) without reintroducing that bug -- this
+    ALSO picks up the stop_via_candle_engine's hand-off for the Stop side.
 
     The instant-fire/pct-away warnings need a live trade to read its current premium from, so
     they're only computed when one exists; when this side has NO open trade, Set instead
     warns via _no_position_warning (same 'Proceed Anyway' dialog) -- previously that case
-    silently set the value with no warning at all."""
+    silently set the value with no warning at all. The Stop sub-card's Reset ALSO cancels any
+    still-pending Enter via Stop job (see _cancel_engine_job_if_any) -- Target is never
+    deferred, so nothing to cancel on that side."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     s = side.lower()
     draft = {'stop': params.get(f'{s}_prem_stop_val', 0), 'target': params.get(f'{s}_prem_target_val', 0)}
@@ -638,6 +674,7 @@ def premium_exit_card(side):
                 stop_status.bind_visibility_from(params, f'{s}_prem_stop_active')
                 def make_stop_handlers(sd, ss):
                     def _do_activate(value):
+                        _cancel_engine_job_if_any('premium_stop', side)
                         params[f'{sd}_prem_stop_val'] = value
                         params[f'{sd}_prem_stop_active'] = True
                         ss.set_text(f"ON: {value}")
@@ -664,6 +701,7 @@ def premium_exit_card(side):
                         else:
                             _do_activate(value)
                     def reset():
+                        _cancel_engine_job_if_any('premium_stop', side)
                         params[f'{sd}_prem_stop_active'] = False
                         params[f'{sd}_prem_stop_val'] = 0
                         draft['stop'] = 0
@@ -1186,13 +1224,19 @@ def _toggle_expansion(exp):
 def _orderbook_table_row(side, prefix):
     """One expandable row for a pending unified Open Short/Long entry trigger (Limit/Stop-
     Market only; Market fires immediately and never appears here). The header line stays
-    live-bound to the underlying params (no manual refresh needed). MODIFY opens a staged
-    edit panel (trigger price, strike/qty with -/+ steppers, fire-on, stop, target) bound to
-    a local draft, not the live params directly -- edits only take effect after CONFIRM.
-    CONFIRM re-stamps armed_at (see logic_engine._check_unified_open) so a modified order's
-    timing window restarts from the moment it was confirmed, not the original arm time.
-    REMOVE fully resets that side's card back to defaults immediately (no confirm needed,
-    matching the existing Cancel behavior elsewhere).
+    live-bound to the underlying params (no manual refresh needed) -- this ALSO means it
+    automatically picks up the stop_via_candle_engine's hand-off, since hand-off writes a
+    fresh trigger_price/order_type/fire_on directly into these same params and re-arms; there
+    is no separate 'deferred order' row, this row simply reflects whatever the live armed
+    order currently is. MODIFY opens a staged edit panel (trigger price, strike/qty with -/+
+    steppers, fire-on, stop, target) bound to a local draft, not the live params directly --
+    edits only take effect after CONFIRM, which ALSO cancels any still-pending Enter via Stop
+    job for this side first (see _cancel_engine_job_if_any) so a job mid-candle-fetch can
+    never clobber a manual edit moments later. CONFIRM re-stamps armed_at (see
+    logic_engine._check_unified_open) so a modified order's timing window restarts from the
+    moment it was confirmed, not the original arm time. REMOVE fully resets that side's card
+    back to defaults immediately (no confirm needed, matching the existing Cancel behavior
+    elsewhere) via _reset_unified_card_defaults, which itself cancels any pending job.
 
     Side label (SELL/BUY) is mode-aware: Sell Mode entry orders open a SHORT position (so the
     order itself is a SELL), Buy Mode entry orders open a LONG position (so the order itself
@@ -1262,6 +1306,7 @@ def _orderbook_table_row(side, prefix):
                     ui.input('Target (optional)').bind_value(draft, 'new_target').props('outlined dense bg-color=white').classes('grow')
 
                 def confirm_changes():
+                    _cancel_engine_job_if_any('entry', side)
                     params[f'{prefix}_order_type'] = draft['order_type']
                     params[f'{prefix}_trigger_price'] = draft['trigger_price']
                     params[f'{prefix}_strike_offset'] = draft['strike_offset']
@@ -1282,7 +1327,7 @@ def _orderbook_table_row(side, prefix):
                     ui.button('CONFIRM', color='green', on_click=confirm_changes).classes('grow h-8 text-xs rounded-lg font-bold')
                     ui.button('Cancel', on_click=discard_changes).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
 
-def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_target=False):
+def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_target=False, engine_kind=None):
     """One expandable row for an active conditional EXIT order tied to an open position --
     from the Open Positions Idx Stop/Target quick controls, or the Premium/Index-based exit
     cards. Visible only while active. Columns match the SAME layout as the entry-order rows
@@ -1292,7 +1337,12 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
     flag only if no trade is present. Symbol and Qty are read from the live open position
     itself (not guessed), so they always match the real trade. MODIFY edits the value/period
     inline; REMOVE deactivates and clears the value, mirroring the Reset behavior already in
-    premium_exit_card/index_exit_component."""
+    premium_exit_card/index_exit_component.
+
+    'engine_kind' identifies which stop_via_candle_engine job kind this row corresponds to
+    ('index_stop' or 'premium_stop'), so REMOVE/CONFIRM can cancel any still-pending job for
+    this side first -- pass None (the default) for Target rows, which are never deferred and
+    have no matching job kind to cancel."""
     opt_type = 'CE' if side == 'Call' else 'PE'
     draft = {}
 
@@ -1343,6 +1393,8 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
                     ui.space()
 
                     def remove_order():
+                        if engine_kind:
+                            _cancel_engine_job_if_any(engine_kind, side)
                         params[active_key] = False
                         params[value_key] = 0
                         ui.notify(f"{side} {order_label} Removed", type='info')
@@ -1361,6 +1413,8 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
                         ui.radio(UI_OPTS['index_times'], value=draft['time']).bind_value(draft, 'time').props('inline dense')
 
                 def confirm_changes():
+                    if engine_kind:
+                        _cancel_engine_job_if_any(engine_kind, side)
                     params[value_key] = draft['value']
                     if time_key: params[time_key] = draft['time']
                     ui.notify(f"{side} {order_label} Updated", type='positive')
@@ -1388,14 +1442,15 @@ def render_orderbook():
 
         # Exit orders: Premium-based, Index-based (this also covers the Open Positions'
         # quick Idx Stop/Target controls, since those write to the same call_index_*/
-        # put_index_* params).
-        _exit_order_row('Call', 'Prem Stop', 'call_prem_stop_val', 'call_prem_stop_active', 'call_prem_stop_time', is_target=False)
+        # put_index_* params). engine_kind is passed for Stop rows only -- Target is never
+        # deferred, so it has no matching stop_via_candle_engine job to cancel.
+        _exit_order_row('Call', 'Prem Stop', 'call_prem_stop_val', 'call_prem_stop_active', 'call_prem_stop_time', is_target=False, engine_kind='premium_stop')
         _exit_order_row('Call', 'Prem Target', 'call_prem_target_val', 'call_prem_tgt_active', 'call_prem_target_time', is_target=True)
-        _exit_order_row('Call', 'Idx Stop', 'call_index_stop_val', 'call_index_stop_active', 'call_index_stop_time', is_target=False)
+        _exit_order_row('Call', 'Idx Stop', 'call_index_stop_val', 'call_index_stop_active', 'call_index_stop_time', is_target=False, engine_kind='index_stop')
         _exit_order_row('Call', 'Idx Target', 'call_index_target_val', 'call_index_tgt_active', 'call_index_target_time', is_target=True)
-        _exit_order_row('Put', 'Prem Stop', 'put_prem_stop_val', 'put_prem_stop_active', 'put_prem_stop_time', is_target=False)
+        _exit_order_row('Put', 'Prem Stop', 'put_prem_stop_val', 'put_prem_stop_active', 'put_prem_stop_time', is_target=False, engine_kind='premium_stop')
         _exit_order_row('Put', 'Prem Target', 'put_prem_target_val', 'put_prem_tgt_active', 'put_prem_target_time', is_target=True)
-        _exit_order_row('Put', 'Idx Stop', 'put_index_stop_val', 'put_index_stop_active', 'put_index_stop_time', is_target=False)
+        _exit_order_row('Put', 'Idx Stop', 'put_index_stop_val', 'put_index_stop_active', 'put_index_stop_time', is_target=False, engine_kind='index_stop')
         _exit_order_row('Put', 'Idx Target', 'put_index_target_val', 'put_index_tgt_active', 'put_index_target_time', is_target=True)
 
         empty_lbl = ui.label('No pending orders.').classes('w-full text-center text-xs text-gray-400 italic')
