@@ -113,13 +113,24 @@ class LogicEngine:
             self.last_trigger_time['chart'] = curr_min
 
     def commission(self, amount, buy_price, sell_price):
+        """Zerodha F&O Options charges, per https://zerodha.com/charges#tab-equities
+        (verified current as of the last update to this function):
+          - Brokerage: flat Rs. 20 per executed order (charged here for BOTH legs of a
+            round trip -- entry + exit -- since this is called once per full leg's
+            buy+sell pair).
+          - STT: 0.15% of premium on the SELL side only.
+          - Exchange transaction charges (NSE): 0.03553% on premium, both sides.
+          - SEBI charges: Rs. 10/crore (0.0001%), both sides.
+          - GST: 18% on (brokerage + exchange transaction charges + SEBI charges).
+          - Stamp duty: 0.003% on premium, BUY side only.
+          - IPFT (NSE): Rs. 0.01/crore + GST on premium (0.000001%), both sides."""
         buy_turnover = amount * buy_price
         sell_turnover = amount * sell_price
         total_turnover = buy_turnover + sell_turnover
 
         brokerage = 20 + 20
         stt = 0.0015 * sell_turnover
-        exchange_txn = 0.0003503 * total_turnover
+        exchange_txn = 0.0003553 * total_turnover
         sebi = 0.000001 * total_turnover
         gst = 0.18 * (brokerage + exchange_txn + sebi)
         stamp_duty = 0.00003 * buy_turnover
@@ -329,6 +340,24 @@ class LogicEngine:
             self.log_action(f"🚫 Target hit on {side}{(' (' + reason + ')') if reason else ''}: cancelled {opp_side} orders", ', '.join(cancelled))
 
     def update_pnl(self):
+        """Updates each open trade's live 'pnl' field (shown throughout the UI as running/
+        unrealized PnL) and the aggregate shared_state['pnl']['unrealized'].
+
+        Commission is now ALWAYS included here, recomputed every tick from the CURRENT mark
+        price (not just once at entry) -- so the running PnL shown live always reflects what
+        would actually be realized if the position were closed at that exact moment, exactly
+        matching close_position()'s own commission accounting (same commission() formula,
+        same qty/buy-price/sell-price convention per leg). Previously this method only
+        computed raw mark-to-market PnL with no commission at all, so the live number always
+        overstated the true PnL by the exit (and, for hedged trades, both legs') commission
+        that close_position() would go on to actually deduct -- the live and post-close
+        numbers could visibly jump the moment a position was closed. Direction/hedge-mode
+        commission conventions mirror close_position() exactly: for a SELL leg, entry was the
+        sell and the current mark is the hypothetical buy-to-cover, so commission(qty,
+        buy_price=current, sell_price=entry); for a BUY leg, entry was the buy and current
+        mark is the hypothetical sell-to-close, so commission(qty, buy_price=entry,
+        sell_price=current). The hedge leg (when present) is always a BUY at entry that would
+        be sold to close, so commission(qty, buy_price=entry, sell_price=current) there too."""
         unrealized = 0.0
         idx_ltp = shared_state[params['trading_index']]['ltp']
         for side in ['Call', 'Put']:
@@ -350,7 +379,12 @@ class LogicEngine:
                         trade['csv_synced'] = True
                     m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
                     h_pnl = (h_ltp - trade['hedge']['entry_price']) * trade['qty'] if h_ltp > 0 else 0
-                    trade['pnl'] = m_pnl + h_pnl
+                    est_commission = 0.0
+                    if m_ltp > 0:
+                        est_commission += self.commission(trade['qty'], m_ltp, trade['main']['entry_price'])
+                    if h_ltp > 0:
+                        est_commission += self.commission(trade['qty'], trade['hedge']['entry_price'], h_ltp)
+                    trade['pnl'] = m_pnl + h_pnl - est_commission
                 else:
                     # Hedgeless: PnL is only from the main leg. Direction determines sign:
                     # SELL (existing) profits as price falls; BUY (Options Buy Mode) profits
@@ -360,11 +394,16 @@ class LogicEngine:
                         self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], 0, idx_ltp)
                         self.log_action(sync_label, f"M: {trade['main']['entry_price']:.2f}")
                         trade['csv_synced'] = True
+                    est_commission = 0.0
                     if is_buy:
                         m_pnl = (m_ltp - trade['main']['entry_price']) * trade['qty'] if m_ltp > 0 else 0
+                        if m_ltp > 0:
+                            est_commission = self.commission(trade['qty'], trade['main']['entry_price'], m_ltp)
                     else:
                         m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
-                    trade['pnl'] = m_pnl
+                        if m_ltp > 0:
+                            est_commission = self.commission(trade['qty'], m_ltp, trade['main']['entry_price'])
+                    trade['pnl'] = m_pnl - est_commission
 
                 unrealized += trade['pnl']
         shared_state['pnl']['unrealized'] = unrealized

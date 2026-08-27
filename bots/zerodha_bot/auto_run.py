@@ -835,6 +835,7 @@ logic = LogicEngine(ticker, inst_manager)
 pattern_engine = PatternEngine(inst_manager)
 stop_via_candle_engine = StopViaCandleEngine(inst_manager, logic)
 logic.stop_via_candle_engine = stop_via_candle_engine
+comp._stop_via_candle_engine = stop_via_candle_engine   # <-- ADD THIS LINE
 controller = AutoController(logic, inst_manager)
 # Global Stop/Target (LogicEngine._check_global_limits) needs to wipe every per-side field on
 # BOTH sides when it fires, matching what Auto Pilot's own internal global stop already does
