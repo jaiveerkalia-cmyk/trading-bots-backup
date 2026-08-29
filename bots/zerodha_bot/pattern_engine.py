@@ -23,7 +23,8 @@ For each (index, interval) pair:
     lows) and checked against the base candle immediately preceding that
     window.
   - On match: pushes the shared Alert Sound Profile sound, logs to the
-    activity log, and shows a toast.
+    activity log (including the base and synthetic candle OHLC values that
+    were actually compared), and shows a toast.
 
 Pattern definitions (high/low/close based, candle color is NOT considered):
   - Bullish Engulfing: synthetic candle's low breaks below the base candle's
@@ -339,7 +340,15 @@ class PatternEngine:
             shared_state.setdefault('sound_queue', [])
             shared_state['sound_queue'].append(('alert_custom', sound, dur))
 
-        msg = f"PATTERN: {index} {meta['label']} ({interval}) @ {candle_start.strftime('%H:%M')}"
+        # Base and synthetic candle OHLC values that were actually compared by the detector
+        # (meta['detector']) to produce this match -- appended to the log message so the
+        # exact numbers behind the signal are visible in the Trade Event Log, not just the
+        # pattern name/interval/time.
+        ohlc_txt = (
+            f"Base O:{base_open} H:{base_high} L:{base_low} C:{base_close} | "
+            f"Synth O:{synth_open} H:{synth_high} L:{synth_low} C:{synth_close}"
+        )
+        msg = f"PATTERN: {index} {meta['label']} ({interval}) @ {candle_start.strftime('%H:%M')} | {ohlc_txt}"
         ts = datetime.now().strftime("%H:%M:%S")
         shared_state.setdefault('activity_log', [])
         shared_state['activity_log'].insert(0, f"[{ts}] {msg}")
