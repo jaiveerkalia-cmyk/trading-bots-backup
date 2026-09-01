@@ -1,4 +1,4 @@
-from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE, FORCE_EXIT_TIME, AUTO_SQUAREOFF_TIME
+from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE, FORCE_EXIT_TIME, AUTO_SQUAREOFF_TIME, get_eval_price
 from datetime import datetime, time as dtime
 from nicegui import ui
 import pandas as pd
@@ -152,14 +152,21 @@ class LogicEngine:
 
     def open_position(self, side, manual_strike=None, reason="Manual", qty_override=None, strike_offset=None):
         if not self.trading_active: return False, "Trading Stopped"
-        index_name = params['trading_index']; index_ltp = shared_state[index_name]['ltp']
+        index_name = params['trading_index']
+        # Strike selection is ALWAYS spot-based, regardless of Futures Mode (option strikes
+        # are spot-relative, not futures-relative) -- spot_ltp drives strike math below.
+        # eval_ltp is the Futures-Mode-aware price (near-month future when the mode is on and
+        # resolved, otherwise identical to spot_ltp) used ONLY for the trade's recorded
+        # index_entry_price/index_current_price fields, never for strike calc.
+        spot_ltp = shared_state[index_name]['ltp']
+        eval_ltp = get_eval_price(index_name)
         step = INDICES[index_name]['step']; lot_size = INDICES[index_name]['lot_size']
         segment = INDICES[index_name]['segment']
         buy_mode = params.get('options_buy_mode', False)
         # Buy Mode is always hedgeless (enforced here defensively too, not just in the UI guard).
         hedgeless = True if buy_mode else params.get('hedgeless_mode', False)
 
-        if index_ltp == 0: return False, "Index Price 0"
+        if spot_ltp == 0: return False, "Index Price 0"
         if shared_state['active_trades'][side] is not None: return False, "Position Open"
 
         if manual_strike:
@@ -168,12 +175,12 @@ class LogicEngine:
             # Unified card strike selection: 0 = ATM, positive = ITM steps, negative = OTM steps.
             try: offset = float(strike_offset)
             except: offset = 0
-            atm = round(index_ltp / step) * step
+            atm = round(spot_ltp / step) * step
             main_strike = (atm - (offset * step)) if side == 'Call' else (atm + (offset * step))
         else:
             entry_mode = params['call_entry_mode'] if side == 'Call' else params['put_entry_mode']
             manual_key = 'call_manual_strike' if side == 'Call' else 'put_manual_strike'
-            if entry_mode == 'ATM': main_strike = round(index_ltp / step) * step
+            if entry_mode == 'ATM': main_strike = round(spot_ltp / step) * step
             else:
                 try: main_strike = float(params[manual_key])
                 except: return False, "Invalid Strike"
@@ -201,7 +208,7 @@ class LogicEngine:
             trade_id = str(uuid.uuid4())[:8]
             trade = {
                 'id': trade_id, 'type': opt_type, 'direction': 'BUY' if buy_mode else 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
-                'index_entry_price': index_ltp, 'index_current_price': index_ltp, 'csv_synced': False,
+                'index_entry_price': eval_ltp, 'index_current_price': eval_ltp, 'csv_synced': False,
                 'entry_time': datetime.now().strftime("%H:%M:%S"), 'trigger': reason,
                 'main': {'symbol': main_symbol, 'token': main_token, 'strike': main_strike, 'entry_price': m_pr, 'current_price': m_pr},
                 'hedge': None
@@ -209,7 +216,7 @@ class LogicEngine:
             shared_state['active_trades'][side] = trade
             self.csv_manager.log_open(trade_id, trade)
             mode_label = "BUY (Hedgeless)" if buy_mode else "HEDGELESS"
-            dtls = f"Idx: {index_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | {mode_label}"
+            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | {mode_label}"
             self.log_action(f"OPENED {side} {mode_label} ({reason})", dtls)
             self.play_sound('open')
             self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
@@ -237,14 +244,14 @@ class LogicEngine:
             trade_id = str(uuid.uuid4())[:8]
             trade = {
                 'id': trade_id, 'type': opt_type, 'direction': 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
-                'index_entry_price': index_ltp, 'index_current_price': index_ltp, 'csv_synced': False,
+                'index_entry_price': eval_ltp, 'index_current_price': eval_ltp, 'csv_synced': False,
                 'entry_time': datetime.now().strftime("%H:%M:%S"), 'trigger': reason,
                 'main': {'symbol': main_symbol, 'token': main_token, 'strike': main_strike, 'entry_price': m_pr, 'current_price': m_pr},
                 'hedge': {'symbol': hedge_symbol, 'token': hedge_token, 'strike': hedge_strike, 'entry_price': h_pr, 'current_price': h_pr}
             }
             shared_state['active_trades'][side] = trade
             self.csv_manager.log_open(trade_id, trade)
-            dtls = f"Idx: {index_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | H: {hedge_strike} ({h_pr:.2f})"
+            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | H: {hedge_strike} ({h_pr:.2f})"
             self.log_action(f"OPENED {side} ({reason})", dtls)
             self.play_sound('open')
             self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
@@ -274,7 +281,10 @@ class LogicEngine:
 
         m_curr = shared_state['option_chain'].get(m['token'], {}).get('ltp', 0)
         m_entry = m['entry_price'] if m['entry_price'] > 0 else m_curr
-        idx_curr = shared_state[params['trading_index']]['ltp']
+        # Index price shown/logged on close is Futures-Mode-aware (index_entry_price on this
+        # trade was already recorded the same way at open, in open_position() above), never
+        # affects the option PnL math below, which is always premium-based.
+        idx_curr = get_eval_price(params['trading_index'])
 
         if h:
             h_curr = shared_state['option_chain'].get(h['token'], {}).get('ltp', 0)
@@ -357,13 +367,18 @@ class LogicEngine:
         buy_price=current, sell_price=entry); for a BUY leg, entry was the buy and current
         mark is the hypothetical sell-to-close, so commission(qty, buy_price=entry,
         sell_price=current). The hedge leg (when present) is always a BUY at entry that would
-        be sold to close, so commission(qty, buy_price=entry, sell_price=current) there too."""
+        be sold to close, so commission(qty, buy_price=entry, sell_price=current) there too.
+
+        Futures Mode: trade['index_current_price'] (index-linked reference/display field
+        only, never part of the premium PnL math above/below) uses get_eval_price() so it
+        tracks the near-month future when the mode is on, exactly like index_entry_price was
+        recorded at open in open_position()."""
         unrealized = 0.0
-        idx_ltp = shared_state[params['trading_index']]['ltp']
+        idx_eval = get_eval_price(params['trading_index'])
         for side in ['Call', 'Put']:
             trade = shared_state['active_trades'][side]
             if trade:
-                trade['index_current_price'] = idx_ltp
+                trade['index_current_price'] = idx_eval
                 m_ltp = shared_state['option_chain'].get(trade['main']['token'], {}).get('ltp', 0)
                 trade['main']['current_price'] = m_ltp
                 if trade['main']['entry_price'] == 0 and m_ltp > 0: trade['main']['entry_price'] = m_ltp
@@ -374,7 +389,7 @@ class LogicEngine:
                     trade['hedge']['current_price'] = h_ltp
                     if trade['hedge']['entry_price'] == 0 and h_ltp > 0: trade['hedge']['entry_price'] = h_ltp
                     if not trade['csv_synced'] and trade['main']['entry_price'] > 0:
-                        self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], trade['hedge']['entry_price'], idx_ltp)
+                        self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], trade['hedge']['entry_price'], idx_eval)
                         self.log_action("📝 Entry Prices Confirmed", f"M: {trade['main']['entry_price']:.2f} | H: {trade['hedge']['entry_price']:.2f}")
                         trade['csv_synced'] = True
                     m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
@@ -391,7 +406,7 @@ class LogicEngine:
                     # as price rises.
                     if not trade['csv_synced'] and trade['main']['entry_price'] > 0:
                         sync_label = "📝 Entry Price Confirmed (Buy Mode)" if is_buy else "📝 Entry Price Confirmed (Hedgeless)"
-                        self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], 0, idx_ltp)
+                        self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], 0, idx_eval)
                         self.log_action(sync_label, f"M: {trade['main']['entry_price']:.2f}")
                         trade['csv_synced'] = True
                     est_commission = 0.0
@@ -411,7 +426,13 @@ class LogicEngine:
 
     def check_triggers(self):
         if not self.trading_active: return
-        now = datetime.now(); idx_ltp = shared_state[params['trading_index']]['ltp']
+        now = datetime.now()
+        # Futures Mode: every entry/exit/alert evaluation below reads the Futures-Mode-aware
+        # price (near-month future when the mode is on and resolved, otherwise identical to
+        # spot -- see config.get_eval_price()). Strike selection (inside open_position/
+        # _check_unified_open's strike_offset math) is computed separately and always stays
+        # spot-based; it is NOT affected by this variable.
+        idx_ltp = get_eval_price(params['trading_index'])
         # Strict candle-close timing: fire exactly once per minute-boundary crossing (no
         # second-based grace window). More precise (no longer fires anywhere in a 0-4 second
         # window after the minute rolls over) AND more robust (can't be missed even if a tick
@@ -512,7 +533,11 @@ class LogicEngine:
         or Limit) is confirmed true on a candle-close timeframe (never 'Live'), and
         params['enter_via_stop'] is on and the engine is wired, the entry is handed off to the
         candle-stop engine instead of being opened immediately -- see the should_fire block
-        below. Falls through to the exact original immediate-open behavior otherwise."""
+        below. Falls through to the exact original immediate-open behavior otherwise.
+
+        idx_ltp here is already the Futures-Mode-aware evaluation price (passed down from
+        check_triggers()). Strike selection in open_position() below is computed separately
+        from spot, regardless of what idx_ltp equals here."""
         prefix = 'call' if side == 'Call' else 'put'
         order_type = params.get(f'{prefix}_order_type', 'Market')
         fire_on = params.get(f'{prefix}_fire_on', 'Live')
@@ -708,6 +733,8 @@ class LogicEngine:
             if not trade: continue
 
             # --- INDEX EXITS ---
+            # idx_ltp (param) is already the Futures-Mode-aware evaluation price, passed down
+            # from check_triggers() via get_eval_price().
             try: s_val = float(params[f'{side.lower()}_index_stop_val']) if str(params[f'{side.lower()}_index_stop_val']).strip() != '' else 0.0
             except ValueError: s_val = 0.0
             try: t_val = float(params[f'{side.lower()}_index_target_val']) if str(params[f'{side.lower()}_index_target_val']).strip() != '' else 0.0
@@ -857,6 +884,9 @@ class LogicEngine:
         'period' (Current/1m/5m) and 'direction' (upper: fires when idx_ltp >= value; lower:
         fires when idx_ltp <= value). A fired alert is removed from the list (one-shot, same
         semantics as the old single-slot alert_upper_active/alert_lower_active flags).
+
+        idx_ltp here is already the Futures-Mode-aware evaluation price, passed down from
+        check_triggers().
 
         NOTE: message text intentionally avoids the word "alert" (case-insensitive). The
         global ui.notify interceptor in auto_run.py auto-queues its own generic fallback

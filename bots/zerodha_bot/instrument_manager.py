@@ -145,3 +145,53 @@ class InstrumentManager:
 
         except Exception as e:
             return None, str(e)
+
+    def get_near_month_future(self, index_name):
+        """
+        Futures Mode support (config.params['futures_mode']). Resolves the near-month
+        FUTURES contract for index_name (NIFTY/SENSEX) by reading the already-saved
+        master instruments CSV (written by fetch_and_process_instruments() during the
+        daily scan -- this method does NOT hit the network itself, so it's cheap to call
+        once per day right after that scan).
+
+        Filters the master list for:
+          - exchange == INDICES[index_name]['segment']  (e.g. 'NFO' or 'BFO', same
+            derivatives segment options live in)
+          - name == index_name                          (e.g. 'NIFTY' or 'SENSEX')
+          - instrument_type == 'FUT'
+        then picks the SOONEST expiry >= today (the "near month" contract).
+
+        Returns (token, tradingsymbol) on success, or (None, error_message) on failure --
+        same return shape as get_atm_token() above, for consistent error handling by
+        callers.
+        """
+        try:
+            if not os.path.exists(MASTER_INSTRUMENTS_FILE):
+                return None, f"Master instruments file not found: {MASTER_INSTRUMENTS_FILE}"
+
+            info = INDICES[index_name]
+            df = pd.read_csv(MASTER_INSTRUMENTS_FILE)
+
+            subset = df[
+                (df['exchange'] == info['segment']) &
+                (df['name'] == index_name) &
+                (df['instrument_type'] == 'FUT')
+            ].copy()
+
+            if subset.empty:
+                return None, f"No futures contracts found for {index_name}"
+
+            subset['expiry'] = pd.to_datetime(subset['expiry']).dt.date
+            today = date.today()
+            valid = subset[subset['expiry'] >= today].sort_values('expiry')
+
+            if valid.empty:
+                return None, f"No future-dated futures expiry found for {index_name}"
+
+            near_month = valid.iloc[0]
+            token = int(near_month['instrument_token'])
+            symbol = near_month['tradingsymbol']
+            return token, symbol
+
+        except Exception as e:
+            return None, str(e)

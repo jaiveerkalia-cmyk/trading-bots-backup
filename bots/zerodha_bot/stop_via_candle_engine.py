@@ -9,8 +9,10 @@ logic_engine.py hands the action off to this engine INSTEAD of executing it imme
 This engine then:
 
   1. Waits a short delay after the candle boundary, then fetches that just-closed candle
-     via KiteConnect's historical API (index candle for entries/index-stops; the option's
-     OWN premium candle, via its instrument token, for premium-stops). Exact-timestamp
+     via KiteConnect's historical API (index candle for entries/index-stops -- or its
+     near-month future's candle when Futures Mode is on, see config.get_eval_token(); the
+     option's OWN premium candle, via its instrument token, for premium-stops -- always
+     unaffected by Futures Mode, since it's already the option's own price). Exact-timestamp
      matching, never the still-forming candle, with a 30s retry-then-give-up cap -- the
      same reliability pattern pattern_engine.py uses, but implemented independently here so
      nothing in that file is touched or shared (avoids any risk of interfering with pattern
@@ -40,14 +42,15 @@ window, cancel_pending()/the re-arm guard in _handoff() ensure the pending job n
 resurrects or clobbers it. If candle data never arrives within the retry window, the job is
 dropped with a log entry and no trade is taken.
 
-cancel_all() lets an external "kill everything" event (global stop/target, close all, etc)
-explicitly drop every pending job immediately, without executing anything -- see
-LogicEngine._check_global_limits() for the main caller.
+cancel_all() lets an external "kill everything" event (global stop/target, close all,
+Futures Mode being toggled mid-flight, etc) explicitly drop every pending job immediately,
+without executing anything -- see LogicEngine._check_global_limits() and
+auto_run.py's Futures Mode toggle handler for the main callers.
 """
 
 from datetime import datetime, timedelta
 
-from config import shared_state, params, INDICES
+from config import shared_state, params, INDICES, get_eval_token
 
 INTERVAL_DELTA = {
     '1m': timedelta(minutes=1),
@@ -166,7 +169,8 @@ class StopViaCandleEngine:
 
     def cancel_all(self, reason="Cancelled"):
         """Drops every pending job immediately WITHOUT executing anything -- used when a
-        global stop/target (or any other 'kill everything' event) fires."""
+        global stop/target (or any other 'kill everything' event, including a Futures Mode
+        toggle flip) fires."""
         if not self.jobs:
             return
         for job in self.jobs:
@@ -188,9 +192,14 @@ class StopViaCandleEngine:
 
         try:
             if job['kind'] == 'premium_stop':
+                # Premium-stop candles are always the option's OWN token -- never affected by
+                # Futures Mode, since the option's premium isn't the index/future itself.
                 token = job['token']
             else:
-                token = INDICES[job['index_name']]['token']
+                # entry / index_stop: Futures Mode-aware (near-month future's token when the
+                # mode is on and resolved for this index, otherwise identical to the original
+                # spot INDICES[..]['token']).
+                token = get_eval_token(job['index_name'])
             from_date = job['boundary_time'] - INTERVAL_DELTA[interval] * 6
             to_date = now
             candles = self.inst_manager.kite.historical_data(

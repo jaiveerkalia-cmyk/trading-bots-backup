@@ -45,7 +45,7 @@ def safe_ui_context():
 
 # --- IMPORT EXISTING MODULES ---
 import config
-from config import shared_state, params, ui_refs, INDICES, UI_OPTS, ALERT_SOUND_URLS
+from config import shared_state, params, ui_refs, INDICES, UI_OPTS, ALERT_SOUND_URLS, get_eval_price, get_eval_token
 import ui_components as comp
 from auth_manager import get_kite_session
 from ticker_engine import TickerClient
@@ -210,7 +210,10 @@ class AutoController:
         return None
 
     def fetch_1015_candle(self, index_name):
-        token = INDICES[index_name]['token']
+        # Futures Mode (config.get_eval_token): near-month future's candle token when the
+        # mode is on and resolved, otherwise identical to the original spot
+        # INDICES[..]['token'].
+        token = get_eval_token(index_name)
         now = datetime.now()
         from_date = now.replace(hour=9, minute=0, second=0)
         to_date = now
@@ -234,7 +237,13 @@ class AutoController:
         return False
 
     def find_balanced_strikes(self, index_name, call_trig, put_trig):
-        """Finds ITM strikes. Goes deeper ITM only if one premium is 20% lower."""
+        """Finds ITM strikes. Goes deeper ITM only if one premium is 20% lower.
+        Strike selection is ALWAYS spot-based regardless of Futures Mode -- call_trig/
+        put_trig arrive here already computed from ref_high/ref_low (see arm_triggers, which
+        derives those from fetch_1015_candle's Futures-Mode-aware candle for the trigger
+        PRICE comparisons only), and the step/strike math below uses INDICES[..]['step']
+        directly (never get_eval_token/get_eval_price) since option strikes must always be
+        spot-relative."""
         self.log("🔍 Starting Premium-Balanced Strike Selection (20% Rule)...")
         print("--- STRIKE SELECTION INITIATED ---")
         
@@ -381,7 +390,10 @@ class AutoController:
         target_time = now.replace(minute=15, second=0, microsecond=0) - timedelta(hours=1)
         target_hour = target_time.hour
         
-        token = INDICES[self.today_index]['token']
+        # Futures Mode (config.get_eval_token): near-month future's candle token when the
+        # mode is on and resolved, otherwise identical to the original spot
+        # INDICES[..]['token'].
+        token = get_eval_token(self.today_index)
         # Fetch enough history to find the specific candle
         candles = self.fetch_with_retry(token, now - timedelta(hours=4), now, "60minute")
         
@@ -635,7 +647,7 @@ class AutoController:
                 shared_state['active_trades'][self.active_side] = None
                 
                 self.clear_leg_fields(closed_side)
-                idx_ltp = shared_state[self.today_index]['ltp']
+                idx_ltp = get_eval_price(self.today_index)
                 self.recalc_reversal_strikes(idx_ltp) 
                 
                 if closed_side == 'Call': params['long_trigger_active'] = True
@@ -643,7 +655,12 @@ class AutoController:
                 return
 
             # --- INDEX STOP ---
-            idx_ltp = shared_state[self.today_index]['ltp']
+            # Futures Mode (config.get_eval_price): near-month future's LTP when the mode is
+            # on and resolved, otherwise identical to the original spot
+            # shared_state[..]['ltp']. Only affects the comparison PRICE here -- strike
+            # selection elsewhere in this class (find_balanced_strikes/recalc_reversal_strikes)
+            # is untouched and always stays spot-based.
+            idx_ltp = get_eval_price(self.today_index)
             idx_stop_hit = False
             
             try: call_stop_val = float(params.get('call_index_stop_val', 999999)) if str(params.get('call_index_stop_val', '')).strip() != '' else 999999.0
@@ -713,7 +730,10 @@ class AutoController:
     def process_hourly_trailing(self, trade, side):
         self.log(f"🔍 Checking Hourly Trailing Logic for {side}...")
 
-        token = INDICES[self.today_index]['token']
+        # Futures Mode (config.get_eval_token): near-month future's candle token when the
+        # mode is on and resolved, otherwise identical to the original spot
+        # INDICES[..]['token'].
+        token = get_eval_token(self.today_index)
         now = datetime.now()
         
         # Explicitly fetch the candle that closed 1 minute ago (the previous hour)
@@ -851,228 +871,255 @@ daily_logger = DailyLogger()
 
 def update_ui():
     """Updates all UI elements."""
-    
-    # 1. PROCESS TOAST QUEUE
-    while shared_state.get('toast_queue'):
-        msg, type_ = shared_state['toast_queue'].pop(0)
-        original_notify(msg, type=type_)
+    # Whole body wrapped in try/except RuntimeError: with multiple browser clients, each page
+    # runs its own ui.timer(1.0, update_ui), but ui_refs / shared_state are process-global. If
+    # a client disconnects, NiceGUI deletes that client's Client object, yet its (now-stale)
+    # element references can still live in ui_refs and its timer callback can still fire one
+    # more tick before NiceGUI tears it down -- any element access on a deleted client raises
+    # RuntimeError('The client this element belongs to has been deleted.'). This is a UI-
+    # refresh-only concern (this function only reads shared_state and writes label/chart
+    # widgets); it never touches trading logic, order placement, or PnL calculation, so
+    # swallowing it here is safe and mirrors the existing except-and-continue pattern already
+    # used around controller.run_loop()/run_bot_logic() below.
+    try:
+        # 1. PROCESS TOAST QUEUE
+        while shared_state.get('toast_queue'):
+            msg, type_ = shared_state['toast_queue'].pop(0)
+            original_notify(msg, type=type_)
 
-    # 2. PROCESS SOUND QUEUE (Fixes 'No Sound')
-    # NOTE: modern browsers block audio.play() unless a real user gesture happened on the
-    # page first (autoplay policy). Each play() call below is wrapped in .catch(()=>{}) so a
-    # blocked play() fails silently instead of throwing. Click the "Enable Sound" button in
-    # the banner once per session to satisfy the browser's gesture requirement.
-    while shared_state.get('sound_queue'):
-        snd = shared_state['sound_queue'].pop(0)
+        # 2. PROCESS SOUND QUEUE (Fixes 'No Sound')
+        # NOTE: modern browsers block audio.play() unless a real user gesture happened on the
+        # page first (autoplay policy). Each play() call below is wrapped in .catch(()=>{}) so a
+        # blocked play() fails silently instead of throwing. Click the "Enable Sound" button in
+        # the banner once per session to satisfy the browser's gesture requirement.
+        while shared_state.get('sound_queue'):
+            snd = shared_state['sound_queue'].pop(0)
 
-        # NEW: user-selectable alert sound + duration, from the split Upper/Lower alert cards.
-        # Distinct tuple shape, so it can't collide with the legacy string entries below.
-        # Looped (a.loop = true) for the full requested duration then stopped -- otherwise a
-        # short clip just plays once and goes silent well before the duration elapses, which
-        # looked like "the duration isn't respected".
-        if isinstance(snd, tuple) and len(snd) == 3 and snd[0] == 'alert_custom':
-            _, sound_name, duration = snd
-            url = ALERT_SOUND_URLS.get(sound_name, ALERT_SOUND_URLS['Wood Plank'])
-            try: dur_ms = int(float(duration) * 1000)
-            except (ValueError, TypeError): dur_ms = 5000
-            if dur_ms <= 0: dur_ms = 5000
-            ui.run_javascript(
-                f'const a = new Audio("{url}"); a.loop = true; a.play().catch(()=>{{}});'
-                f'setTimeout(() => {{ a.pause(); a.currentTime = 0; }}, {dur_ms});'
-            )
-            continue
+            # NEW: user-selectable alert sound + duration, from the split Upper/Lower alert cards.
+            # Distinct tuple shape, so it can't collide with the legacy string entries below.
+            # Looped (a.loop = true) for the full requested duration then stopped -- otherwise a
+            # short clip just plays once and goes silent well before the duration elapses, which
+            # looked like "the duration isn't respected".
+            if isinstance(snd, tuple) and len(snd) == 3 and snd[0] == 'alert_custom':
+                _, sound_name, duration = snd
+                url = ALERT_SOUND_URLS.get(sound_name, ALERT_SOUND_URLS['Wood Plank'])
+                try: dur_ms = int(float(duration) * 1000)
+                except (ValueError, TypeError): dur_ms = 5000
+                if dur_ms <= 0: dur_ms = 5000
+                ui.run_javascript(
+                    f'const a = new Audio("{url}"); a.loop = true; a.play().catch(()=>{{}});'
+                    f'setTimeout(() => {{ a.pause(); a.currentTime = 0; }}, {dur_ms});'
+                )
+                continue
 
-        # We use a generic notification beep for all for now, or specific if desired
-        # You can replace these URLs with any public mp3 link
-        if snd == 'success':
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg").play().catch(()=>{})')
-        elif snd == 'error':
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/clank_car_crash.ogg").play().catch(()=>{})')
-        elif snd == 'open':
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg").play().catch(()=>{})')
-        else: # alert/general
-            ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg").play().catch(()=>{})')
+            # We use a generic notification beep for all for now, or specific if desired
+            # You can replace these URLs with any public mp3 link
+            if snd == 'success':
+                ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/cartoon_boing.ogg").play().catch(()=>{})')
+            elif snd == 'error':
+                ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/clank_car_crash.ogg").play().catch(()=>{})')
+            elif snd == 'open':
+                ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg").play().catch(()=>{})')
+            else: # alert/general
+                ui.run_javascript('new Audio("https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg").play().catch(()=>{})')
 
-    # 3. Standard UI Updates
-    if controller.state != 'DONE':
-        if ui_refs['pnl_chart']:
-            ui_refs['pnl_chart'].options['xAxis']['data'] = shared_state['chart_data']['times']
-            ui_refs['pnl_chart'].options['series'][0]['data'] = shared_state['chart_data']['pnl']
-            ui_refs['pnl_chart'].options['series'][0]['markPoint']['data'] = shared_state['chart_data']['markers']
-            ui_refs['pnl_chart'].update()
+        # 3. Standard UI Updates
+        if controller.state != 'DONE':
+            if ui_refs['pnl_chart']:
+                ui_refs['pnl_chart'].options['xAxis']['data'] = shared_state['chart_data']['times']
+                ui_refs['pnl_chart'].options['series'][0]['data'] = shared_state['chart_data']['pnl']
+                ui_refs['pnl_chart'].options['series'][0]['markPoint']['data'] = shared_state['chart_data']['markers']
+                ui_refs['pnl_chart'].update()
 
-    if ui_refs['activity_log_container']:
-        ui_refs['activity_log_container'].clear()
-        with ui_refs['activity_log_container']:
-            for msg in shared_state['activity_log']: ui.label(msg).classes('text-[10px] font-mono text-green-400')
+        if ui_refs['activity_log_container']:
+            ui_refs['activity_log_container'].clear()
+            with ui_refs['activity_log_container']:
+                for msg in shared_state['activity_log']: ui.label(msg).classes('text-[10px] font-mono text-green-400')
 
-    if ui_refs['pnl_realized']:
-        p = shared_state['pnl']['realized']; c = 'text-green-500' if p>=0 else 'text-red-500'
-        ui_refs['pnl_realized'].set_text(f"₹ {p:.2f}")
-        ui_refs['pnl_realized'].classes(replace=f"text-2xl font-mono font-bold {c} leading-none")
-    
-    if ui_refs['pnl_unrealized']:
-        p = shared_state['pnl']['unrealized']; c = 'text-green-600' if p>=0 else 'text-red-600'
-        ui_refs['pnl_unrealized'].set_text(f"₹ {p:.2f}")
-        ui_refs['pnl_unrealized'].classes(replace=f"text-2xl font-bold font-mono {c} leading-none")
+        if ui_refs['pnl_realized']:
+            p = shared_state['pnl']['realized']; c = 'text-green-500' if p>=0 else 'text-red-500'
+            ui_refs['pnl_realized'].set_text(f"₹ {p:.2f}")
+            ui_refs['pnl_realized'].classes(replace=f"text-2xl font-mono font-bold {c} leading-none")
+        
+        if ui_refs['pnl_unrealized']:
+            p = shared_state['pnl']['unrealized']; c = 'text-green-600' if p>=0 else 'text-red-600'
+            ui_refs['pnl_unrealized'].set_text(f"₹ {p:.2f}")
+            ui_refs['pnl_unrealized'].classes(replace=f"text-2xl font-bold font-mono {c} leading-none")
 
-    if ui_refs['last_action']: ui_refs['last_action'].set_text(shared_state['last_action'])
-    
-    if ui_refs['monitor_status']:
-        if params['short_trigger_active'] or params['long_trigger_active'] or params.get('call_armed') or params.get('put_armed'):
-            ui_refs['monitor_status'].set_text('TRIGGERS ACTIVE')
-            ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-green-500 text-white px-2 py-1 rounded animate-pulse whitespace-nowrap')
-        else:
-            ui_refs['monitor_status'].set_text('TRIGGERS OFF')
-            ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-gray-800 text-gray-400 px-2 py-1 rounded whitespace-nowrap')
-
-    # ... [Keep rest of update_ui as is, referencing banner_card, call_status, etc.] ...
-    # (Just assume the rest of your UI update code is here unchanged)
-    
-    # [Rest of update_ui code for banner/call/put labels...]
-    # ...
-    if ui_refs['banner_card']:
-        cls = 'w-full p-3 bg-orange-200 text-orange-900 rounded-t-xl rounded-b-none border-b border-orange-300'
-        if params['live_trading'] == 'On':
-            cls = 'w-full p-3 bg-green-200 text-green-900 rounded-t-xl rounded-b-none border-b border-green-300'
-        ui_refs['banner_card'].classes(replace=cls)
-
-    idx = params['trading_index']
-    if idx in INDICES and ui_refs.get('calc_qty'): 
-        ui_refs['calc_qty'].set_text(f"(Qty: {int(params['lots']) * INDICES[idx]['lot_size']})")
-
-    # Buy Mode big button: refresh its text/color every tick to reflect the current state
-    # (also handles it being flipped back off automatically by a failed toggle attempt).
-    # Solid green when ON, solid red when OFF -- no pulse/blink (per request: "no need to be
-    # blinking").
-    if ui_refs.get('buy_mode_button'):
-        if params.get('options_buy_mode', False):
-            ui_refs['buy_mode_button'].set_text('🟢 OPTIONS BUY MODE: ON  (tap to switch to SELLING)')
-            ui_refs['buy_mode_button'].classes(replace='w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-green-600 text-white hover:bg-green-700 tracking-wide')
-        else:
-            ui_refs['buy_mode_button'].set_text('🔴 OPTIONS SELLING MODE  (tap to switch to BUY MODE)')
-            ui_refs['buy_mode_button'].classes(replace='w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-red-600 text-white hover:bg-red-700 tracking-wide')
-
-    # Buy Mode badge suffix: shows BUY on positions opened while Options Buy Mode is on,
-    # driven by the trade's own recorded direction (not the live toggle), so history stays
-    # correct even if the mode is switched back after the position closes.
-    tc = shared_state['active_trades']['Call']
-    if tc:
-        is_buy_c = tc.get('direction', 'SELL') == 'BUY'
-        status_txt = 'OPEN (BUY)' if is_buy_c else 'OPEN'
-        status_cls = 'text-[10px] font-bold text-white bg-blue-600 px-2 rounded animate-pulse' if is_buy_c else 'text-[10px] font-bold text-white bg-red-600 px-2 rounded animate-pulse'
-        ui_refs['call_status'].set_text(status_txt); ui_refs['call_status'].classes(replace=status_cls)
-        ui_refs['call_info'].set_text(f"Time: {tc['entry_time']}"); ui_refs['call_trigger'].set_text(f"Trig: {tc['trigger']}")
-        ui_refs['call_main_strike'].set_text(f"M ({tc['main']['strike']})")
-        ui_refs['call_main_open'].set_text(f"{tc['main']['entry_price']:.1f}")
-        ui_refs['call_main_curr'].set_text(f"{tc['main']['current_price']:.1f}")
-        if tc['hedge']:
-            ui_refs['call_hedge_strike'].set_text(f"H ({tc['hedge']['strike']})")
-            ui_refs['call_hedge_open'].set_text(f"{tc['hedge']['entry_price']:.1f}")
-            ui_refs['call_hedge_curr'].set_text(f"{tc['hedge']['current_price']:.1f}")
-        else:
-            ui_refs['call_hedge_strike'].set_text('-')
-            ui_refs['call_hedge_open'].set_text('--')
-            ui_refs['call_hedge_curr'].set_text('--')
-        ui_refs['call_idx_open'].set_text(f"{tc['index_entry_price']:.0f}")
-        ui_refs['call_idx_curr'].set_text(f"{tc['index_current_price']:.0f}")
-        c = 'text-green-600' if tc['pnl']>=0 else 'text-red-600'
-        ui_refs['call_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
-        ui_refs['call_pnl'].classes(replace=f"text-xl font-bold {c} font-mono")
-    else:
-        ui_refs['call_status'].set_text('INACTIVE'); ui_refs['call_status'].classes(replace='text-[10px] font-bold text-gray-400 bg-white px-2 rounded')
-        ui_refs['call_info'].set_text('T: --'); ui_refs['call_trigger'].set_text('Trig: --')
-        for k in ['call_main_strike','call_hedge_strike']: ui_refs[k].set_text('-')
-        for k in ['call_main_open','call_main_curr','call_hedge_open','call_hedge_curr']: ui_refs[k].set_text('0.0')
-        for k in ['call_idx_open','call_idx_curr']: ui_refs[k].set_text('0')
-        ui_refs['call_pnl'].set_text('₹ 0')
-    
-    tp = shared_state['active_trades']['Put']
-    if tp:
-        is_buy_p = tp.get('direction', 'SELL') == 'BUY'
-        status_txt_p = 'OPEN (BUY)' if is_buy_p else 'OPEN'
-        status_cls_p = 'text-[10px] font-bold text-white bg-blue-600 px-2 rounded animate-pulse' if is_buy_p else 'text-[10px] font-bold text-white bg-green-600 px-2 rounded animate-pulse'
-        ui_refs['put_status'].set_text(status_txt_p); ui_refs['put_status'].classes(replace=status_cls_p)
-        ui_refs['put_info'].set_text(f"Time: {tp['entry_time']}"); ui_refs['put_trigger'].set_text(f"Trig: {tp['trigger']}")
-        ui_refs['put_main_strike'].set_text(f"M ({tp['main']['strike']})")
-        ui_refs['put_main_open'].set_text(f"{tp['main']['entry_price']:.1f}")
-        ui_refs['put_main_curr'].set_text(f"{tp['main']['current_price']:.1f}")
-        if tp['hedge']:
-            ui_refs['put_hedge_strike'].set_text(f"H ({tp['hedge']['strike']})")
-            ui_refs['put_hedge_open'].set_text(f"{tp['hedge']['entry_price']:.1f}")
-            ui_refs['put_hedge_curr'].set_text(f"{tp['hedge']['current_price']:.1f}")
-        else:
-            ui_refs['put_hedge_strike'].set_text('-')
-            ui_refs['put_hedge_open'].set_text('--')
-            ui_refs['put_hedge_curr'].set_text('--')
-        ui_refs['put_idx_open'].set_text(f"{tp['index_entry_price']:.0f}")
-        ui_refs['put_idx_curr'].set_text(f"{tp['index_current_price']:.0f}")
-        c = 'text-green-600' if tp['pnl']>=0 else 'text-red-600'
-        ui_refs['put_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
-        ui_refs['put_pnl'].classes(replace=f"text-xl font-bold {c} font-mono")
-    else:
-        ui_refs['put_status'].set_text('INACTIVE'); ui_refs['put_status'].classes(replace='text-[10px] font-bold text-gray-400 bg-white px-2 rounded')
-        ui_refs['put_info'].set_text('T: --'); ui_refs['put_trigger'].set_text('Trig: --')
-        for k in ['put_main_strike','put_hedge_strike']: ui_refs[k].set_text('-')
-        for k in ['put_main_open','put_main_curr','put_hedge_open','put_hedge_curr']: ui_refs[k].set_text('0.0')
-        for k in ['put_idx_open','put_idx_curr']: ui_refs[k].set_text('0')
-        ui_refs['put_pnl'].set_text('₹ 0')
-
-    # --- OPEN POSITIONS section (kept alongside the banner cards above) ---
-    open_count = 0
-
-    if tc and ui_refs.get('call_pos_symbol'):
-        open_count += 1
-        strike = tc['main']['strike']; mark = tc['main']['current_price']; entry = tc['main']['entry_price']
-        dir_suffix_c = ' (BUY)' if tc.get('direction', 'SELL') == 'BUY' else ''
-        ui_refs['call_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} CE{dir_suffix_c}")
-        ui_refs['call_pos_mark'].set_text(f"{mark:.2f}")
-        ui_refs['call_pos_size'].set_text(f"{tc['qty']}")
-        ui_refs['call_pos_entry'].set_text(f"{entry:.2f}")
-        ui_refs['call_pos_qty'].set_text(f"{tc['qty']}")
-        c = 'text-green-600' if tc['pnl'] >= 0 else 'text-red-600'
-        ui_refs['call_pos_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
-        ui_refs['call_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
-        if ui_refs.get('call_pos_side_label'):
-            if tc.get('direction', 'SELL') == 'BUY':
-                ui_refs['call_pos_side_label'].set_text('BUY')
-                ui_refs['call_pos_side_label'].classes(replace='bg-blue-100 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded')
+        if ui_refs['last_action']: ui_refs['last_action'].set_text(shared_state['last_action'])
+        
+        if ui_refs['monitor_status']:
+            if params['short_trigger_active'] or params['long_trigger_active'] or params.get('call_armed') or params.get('put_armed'):
+                ui_refs['monitor_status'].set_text('TRIGGERS ACTIVE')
+                ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-green-500 text-white px-2 py-1 rounded animate-pulse whitespace-nowrap')
             else:
-                ui_refs['call_pos_side_label'].set_text('SHORT')
-                ui_refs['call_pos_side_label'].classes(replace='bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
+                ui_refs['monitor_status'].set_text('TRIGGERS OFF')
+                ui_refs['monitor_status'].classes(replace='text-xs font-bold bg-gray-800 text-gray-400 px-2 py-1 rounded whitespace-nowrap')
 
-    if tp and ui_refs.get('put_pos_symbol'):
-        open_count += 1
-        strike = tp['main']['strike']; mark = tp['main']['current_price']; entry = tp['main']['entry_price']
-        dir_suffix_p = ' (BUY)' if tp.get('direction', 'SELL') == 'BUY' else ''
-        ui_refs['put_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} PE{dir_suffix_p}")
-        ui_refs['put_pos_mark'].set_text(f"{mark:.2f}")
-        ui_refs['put_pos_size'].set_text(f"{tp['qty']}")
-        ui_refs['put_pos_entry'].set_text(f"{entry:.2f}")
-        ui_refs['put_pos_qty'].set_text(f"{tp['qty']}")
-        c = 'text-green-600' if tp['pnl'] >= 0 else 'text-red-600'
-        ui_refs['put_pos_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
-        ui_refs['put_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
-        if ui_refs.get('put_pos_side_label'):
-            if tp.get('direction', 'SELL') == 'BUY':
-                ui_refs['put_pos_side_label'].set_text('BUY')
-                ui_refs['put_pos_side_label'].classes(replace='bg-blue-100 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded')
+        # ... [Keep rest of update_ui as is, referencing banner_card, call_status, etc.] ...
+        # (Just assume the rest of your UI update code is here unchanged)
+        
+        # [Rest of update_ui code for banner/call/put labels...]
+        # ...
+        if ui_refs['banner_card']:
+            cls = 'w-full p-3 bg-orange-200 text-orange-900 rounded-t-xl rounded-b-none border-b border-orange-300'
+            if params['live_trading'] == 'On':
+                cls = 'w-full p-3 bg-green-200 text-green-900 rounded-t-xl rounded-b-none border-b border-green-300'
+            ui_refs['banner_card'].classes(replace=cls)
+
+        idx = params['trading_index']
+        if idx in INDICES and ui_refs.get('calc_qty'): 
+            ui_refs['calc_qty'].set_text(f"(Qty: {int(params['lots']) * INDICES[idx]['lot_size']})")
+
+        # Futures Mode symbol caption: shows the resolved near-month future symbol for the
+        # CURRENTLY ACTIVE trading_index while the mode is on, updating live as the index is
+        # switched. Blank whenever the mode is off or the future hasn't been resolved yet
+        # (e.g. before today's daily scan has run).
+        if ui_refs.get('futures_mode_symbol_label'):
+            if params.get('futures_mode', False):
+                fut_sym = shared_state.get(idx, {}).get('fut_symbol', '')
+                ui_refs['futures_mode_symbol_label'].set_text(fut_sym if fut_sym else 'resolving...')
             else:
-                ui_refs['put_pos_side_label'].set_text('LONG')
-                ui_refs['put_pos_side_label'].classes(replace='bg-green-100 text-green-700 text-[10px] font-bold px-2 py-0.5 rounded')
+                ui_refs['futures_mode_symbol_label'].set_text('spot price -> strike')
 
-    # Row classes AND visibility are ALWAYS set together via comp._set_position_row_style --
-    # never call .classes(replace=...) or .set_visibility(...) on these rows separately (that
-    # split caused the earlier bug: replacing classes silently wiped the 'hidden' class,
-    # leaving the row visible with no trade). Called unconditionally every tick, for both
-    # sides, regardless of whether tc/tp exist.
-    if ui_refs.get('call_pos_row'):
-        comp._set_position_row_style(ui_refs['call_pos_row'], 'Call', params.get('options_buy_mode', False), tc)
-    if ui_refs.get('put_pos_row'):
-        comp._set_position_row_style(ui_refs['put_pos_row'], 'Put', params.get('options_buy_mode', False), tp)
+        # Buy Mode big button: refresh its text/color every tick to reflect the current state
+        # (also handles it being flipped back off automatically by a failed toggle attempt).
+        # Solid green when ON, solid red when OFF -- no pulse/blink (per request: "no need to be
+        # blinking").
+        if ui_refs.get('buy_mode_button'):
+            if params.get('options_buy_mode', False):
+                ui_refs['buy_mode_button'].set_text('🟢 OPTIONS BUY MODE: ON  (tap to switch to SELLING)')
+                ui_refs['buy_mode_button'].classes(replace='w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-green-600 text-white hover:bg-green-700 tracking-wide')
+            else:
+                ui_refs['buy_mode_button'].set_text('🔴 OPTIONS SELLING MODE  (tap to switch to BUY MODE)')
+                ui_refs['buy_mode_button'].classes(replace='w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-red-600 text-white hover:bg-red-700 tracking-wide')
 
-    if ui_refs.get('open_positions_count'):
-        ui_refs['open_positions_count'].set_text(f"{open_count} position{'s' if open_count != 1 else ''}")
+        # Buy Mode badge suffix: shows BUY on positions opened while Options Buy Mode is on,
+        # driven by the trade's own recorded direction (not the live toggle), so history stays
+        # correct even if the mode is switched back after the position closes.
+        tc = shared_state['active_trades']['Call']
+        if tc:
+            is_buy_c = tc.get('direction', 'SELL') == 'BUY'
+            status_txt = 'OPEN (BUY)' if is_buy_c else 'OPEN'
+            status_cls = 'text-[10px] font-bold text-white bg-blue-600 px-2 rounded animate-pulse' if is_buy_c else 'text-[10px] font-bold text-white bg-red-600 px-2 rounded animate-pulse'
+            ui_refs['call_status'].set_text(status_txt); ui_refs['call_status'].classes(replace=status_cls)
+            ui_refs['call_info'].set_text(f"Time: {tc['entry_time']}"); ui_refs['call_trigger'].set_text(f"Trig: {tc['trigger']}")
+            ui_refs['call_main_strike'].set_text(f"M ({tc['main']['strike']})")
+            ui_refs['call_main_open'].set_text(f"{tc['main']['entry_price']:.1f}")
+            ui_refs['call_main_curr'].set_text(f"{tc['main']['current_price']:.1f}")
+            if tc['hedge']:
+                ui_refs['call_hedge_strike'].set_text(f"H ({tc['hedge']['strike']})")
+                ui_refs['call_hedge_open'].set_text(f"{tc['hedge']['entry_price']:.1f}")
+                ui_refs['call_hedge_curr'].set_text(f"{tc['hedge']['current_price']:.1f}")
+            else:
+                ui_refs['call_hedge_strike'].set_text('-')
+                ui_refs['call_hedge_open'].set_text('--')
+                ui_refs['call_hedge_curr'].set_text('--')
+            ui_refs['call_idx_open'].set_text(f"{tc['index_entry_price']:.0f}")
+            ui_refs['call_idx_curr'].set_text(f"{tc['index_current_price']:.0f}")
+            c = 'text-green-600' if tc['pnl']>=0 else 'text-red-600'
+            ui_refs['call_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
+            ui_refs['call_pnl'].classes(replace=f"text-xl font-bold {c} font-mono")
+        else:
+            ui_refs['call_status'].set_text('INACTIVE'); ui_refs['call_status'].classes(replace='text-[10px] font-bold text-gray-400 bg-white px-2 rounded')
+            ui_refs['call_info'].set_text('T: --'); ui_refs['call_trigger'].set_text('Trig: --')
+            for k in ['call_main_strike','call_hedge_strike']: ui_refs[k].set_text('-')
+            for k in ['call_main_open','call_main_curr','call_hedge_open','call_hedge_curr']: ui_refs[k].set_text('0.0')
+            for k in ['call_idx_open','call_idx_curr']: ui_refs[k].set_text('0')
+            ui_refs['call_pnl'].set_text('₹ 0')
+        
+        tp = shared_state['active_trades']['Put']
+        if tp:
+            is_buy_p = tp.get('direction', 'SELL') == 'BUY'
+            status_txt_p = 'OPEN (BUY)' if is_buy_p else 'OPEN'
+            status_cls_p = 'text-[10px] font-bold text-white bg-blue-600 px-2 rounded animate-pulse' if is_buy_p else 'text-[10px] font-bold text-white bg-green-600 px-2 rounded animate-pulse'
+            ui_refs['put_status'].set_text(status_txt_p); ui_refs['put_status'].classes(replace=status_cls_p)
+            ui_refs['put_info'].set_text(f"Time: {tp['entry_time']}"); ui_refs['put_trigger'].set_text(f"Trig: {tp['trigger']}")
+            ui_refs['put_main_strike'].set_text(f"M ({tp['main']['strike']})")
+            ui_refs['put_main_open'].set_text(f"{tp['main']['entry_price']:.1f}")
+            ui_refs['put_main_curr'].set_text(f"{tp['main']['current_price']:.1f}")
+            if tp['hedge']:
+                ui_refs['put_hedge_strike'].set_text(f"H ({tp['hedge']['strike']})")
+                ui_refs['put_hedge_open'].set_text(f"{tp['hedge']['entry_price']:.1f}")
+                ui_refs['put_hedge_curr'].set_text(f"{tp['hedge']['current_price']:.1f}")
+            else:
+                ui_refs['put_hedge_strike'].set_text('-')
+                ui_refs['put_hedge_open'].set_text('--')
+                ui_refs['put_hedge_curr'].set_text('--')
+            ui_refs['put_idx_open'].set_text(f"{tp['index_entry_price']:.0f}")
+            ui_refs['put_idx_curr'].set_text(f"{tp['index_current_price']:.0f}")
+            c = 'text-green-600' if tp['pnl']>=0 else 'text-red-600'
+            ui_refs['put_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
+            ui_refs['put_pnl'].classes(replace=f"text-xl font-bold {c} font-mono")
+        else:
+            ui_refs['put_status'].set_text('INACTIVE'); ui_refs['put_status'].classes(replace='text-[10px] font-bold text-gray-400 bg-white px-2 rounded')
+            ui_refs['put_info'].set_text('T: --'); ui_refs['put_trigger'].set_text('Trig: --')
+            for k in ['put_main_strike','put_hedge_strike']: ui_refs[k].set_text('-')
+            for k in ['put_main_open','put_main_curr','put_hedge_open','put_hedge_curr']: ui_refs[k].set_text('0.0')
+            for k in ['put_idx_open','put_idx_curr']: ui_refs[k].set_text('0')
+            ui_refs['put_pnl'].set_text('₹ 0')
+
+        # --- OPEN POSITIONS section (kept alongside the banner cards above) ---
+        open_count = 0
+
+        if tc and ui_refs.get('call_pos_symbol'):
+            open_count += 1
+            strike = tc['main']['strike']; mark = tc['main']['current_price']; entry = tc['main']['entry_price']
+            dir_suffix_c = ' (BUY)' if tc.get('direction', 'SELL') == 'BUY' else ''
+            ui_refs['call_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} CE{dir_suffix_c}")
+            ui_refs['call_pos_mark'].set_text(f"{mark:.2f}")
+            ui_refs['call_pos_size'].set_text(f"{tc['qty']}")
+            ui_refs['call_pos_entry'].set_text(f"{entry:.2f}")
+            ui_refs['call_pos_qty'].set_text(f"{tc['qty']}")
+            c = 'text-green-600' if tc['pnl'] >= 0 else 'text-red-600'
+            ui_refs['call_pos_pnl'].set_text(f"₹ {tc['pnl']:.0f}")
+            ui_refs['call_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
+            if ui_refs.get('call_pos_side_label'):
+                if tc.get('direction', 'SELL') == 'BUY':
+                    ui_refs['call_pos_side_label'].set_text('BUY')
+                    ui_refs['call_pos_side_label'].classes(replace='bg-blue-100 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded')
+                else:
+                    ui_refs['call_pos_side_label'].set_text('SHORT')
+                    ui_refs['call_pos_side_label'].classes(replace='bg-red-100 text-red-700 text-[10px] font-bold px-2 py-0.5 rounded')
+
+        if tp and ui_refs.get('put_pos_symbol'):
+            open_count += 1
+            strike = tp['main']['strike']; mark = tp['main']['current_price']; entry = tp['main']['entry_price']
+            dir_suffix_p = ' (BUY)' if tp.get('direction', 'SELL') == 'BUY' else ''
+            ui_refs['put_pos_symbol'].set_text(f"{params['trading_index']} {int(strike)} PE{dir_suffix_p}")
+            ui_refs['put_pos_mark'].set_text(f"{mark:.2f}")
+            ui_refs['put_pos_size'].set_text(f"{tp['qty']}")
+            ui_refs['put_pos_entry'].set_text(f"{entry:.2f}")
+            ui_refs['put_pos_qty'].set_text(f"{tp['qty']}")
+            c = 'text-green-600' if tp['pnl'] >= 0 else 'text-red-600'
+            ui_refs['put_pos_pnl'].set_text(f"₹ {tp['pnl']:.0f}")
+            ui_refs['put_pos_pnl'].classes(replace=f"font-mono font-bold text-sm {c}")
+            if ui_refs.get('put_pos_side_label'):
+                if tp.get('direction', 'SELL') == 'BUY':
+                    ui_refs['put_pos_side_label'].set_text('BUY')
+                    ui_refs['put_pos_side_label'].classes(replace='bg-blue-100 text-blue-700 text-[10px] font-bold px-2 py-0.5 rounded')
+                else:
+                    ui_refs['put_pos_side_label'].set_text('LONG')
+                    ui_refs['put_pos_side_label'].classes(replace='bg-green-100 text-green-700 text-[10px] font-bold px-2 py-0.5 rounded')
+
+        # Row classes AND visibility are ALWAYS set together via comp._set_position_row_style --
+        # never call .classes(replace=...) or .set_visibility(...) on these rows separately (that
+        # split caused the earlier bug: replacing classes silently wiped the 'hidden' class,
+        # leaving the row visible with no trade). Called unconditionally every tick, for both
+        # sides, regardless of whether tc/tp exist.
+        if ui_refs.get('call_pos_row'):
+            comp._set_position_row_style(ui_refs['call_pos_row'], 'Call', params.get('options_buy_mode', False), tc)
+        if ui_refs.get('put_pos_row'):
+            comp._set_position_row_style(ui_refs['put_pos_row'], 'Put', params.get('options_buy_mode', False), tp)
+
+        if ui_refs.get('open_positions_count'):
+            ui_refs['open_positions_count'].set_text(f"{open_count} position{'s' if open_count != 1 else ''}")
+    except RuntimeError as e:
+        # Stale-client tick from a browser tab that disconnected between the timer firing and
+        # this function running -- not a logic error, nothing to recover, just skip this tick.
+        if 'client' in str(e).lower() and 'deleted' in str(e).lower():
+            return
+        raise
 
 def custom_render_master_banner(update_lots_callback):
     with ui.column().classes('w-full gap-0 mb-4'):
@@ -1145,6 +1192,19 @@ def custom_render_master_banner(update_lots_callback):
                 # stop_via_candle_engine.py), never polled against a numeric threshold, so a
                 # direct bind carries none of the mid-edit risk that pattern exists to avoid.
                 ui.switch(value=params.get('enter_via_stop', True)).bind_value(params, 'enter_via_stop').props('dense color=teal')
+            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
+                with ui.column().classes('gap-0'):
+                    ui.label('FUTURES MODE').classes('font-bold text-indigo-900 text-[10px] leading-none')
+                    # Shows the resolved near-month future symbol for the currently active
+                    # trading_index while the mode is on (refreshed every tick in update_ui());
+                    # shows a neutral caption while off. Default text matches the OFF state
+                    # since futures_mode defaults to False.
+                    ui_refs['futures_mode_symbol_label'] = ui.label('spot price -> strike').classes('text-[8px] font-mono text-indigo-600 leading-none')
+                # Default OFF (params['futures_mode'] defaults False in config.py). Uses
+                # on_change (not a direct bind) since toggling this needs a side effect --
+                # cancelling any pending Enter via Stop jobs, since their candle-basis just
+                # changed mid-flight (see on_futures_mode_change below).
+                ui.switch(value=params.get('futures_mode', False), on_change=on_futures_mode_change).props('dense color=indigo')
 
         with ui.card().classes('w-full p-1 px-3 bg-gray-100 border-t border-gray-300 rounded-none'):
             with ui.row().classes('items-center gap-2'):
@@ -1241,6 +1301,24 @@ def run_daily_scan():
     else:
         logic.log_action('❌ Scan Failed.')
 
+    # 4. Futures Mode: resolve today's near-month future for BOTH indices (regardless of
+    # whether the mode is currently on) and subscribe to their ticks, so switching the mode
+    # on mid-session doesn't need to wait for tomorrow's scan. Failure to resolve either
+    # index is logged but non-fatal -- get_eval_price/get_eval_token simply fall back to
+    # spot for that index until it succeeds (e.g. on the next daily scan).
+    for idx_name in INDICES:
+        try:
+            fut_token, fut_symbol_or_err = inst_manager.get_near_month_future(idx_name)
+            if fut_token:
+                shared_state[idx_name]['fut_token'] = fut_token
+                shared_state[idx_name]['fut_symbol'] = fut_symbol_or_err
+                ticker.subscribe_new([fut_token])
+                logic.log_action(f"📈 Futures Mode: {idx_name} near-month future resolved", fut_symbol_or_err)
+            else:
+                logic.log_action(f"⚠️ Futures Mode: could not resolve {idx_name} future", str(fut_symbol_or_err))
+        except Exception as e:
+            logic.log_action(f"⚠️ Futures Mode: {idx_name} future resolution error", str(e))
+
 def update_lots(e): 
     if e.value in INDICES: params['lots'] = 10 if e.value == 'NIFTY' else 10; ui.notify(f"Switched to {e.value}")
 
@@ -1289,6 +1367,23 @@ def on_auto_mode_change(e):
              ui.notify("Auto Mode ON (Saved for Tomorrow)")
         else:
              ui.notify("Auto Mode ON")
+
+def on_futures_mode_change(e):
+    """Futures Mode banner switch. Any pending Enter via Stop job (either direction of this
+    flip) is cancelled outright via stop_via_candle_engine.cancel_all() -- its candle basis
+    (spot vs future) just changed mid-flight, so a job already awaiting a candle fetch under
+    the OLD basis should not hand off under the NEW one. This mirrors the existing
+    LogicEngine._check_global_limits() usage of the same cancel_all() call. No other state is
+    touched: existing open positions, already-armed live orders, and index stop/target values
+    already on the params are left exactly as they are (they'll simply be evaluated against
+    the new basis on the very next tick via get_eval_price(), same as any other params change
+    takes effect immediately)."""
+    params['futures_mode'] = e.value
+    stop_via_candle_engine.cancel_all("Futures Mode toggled")
+    if e.value:
+        ui.notify("Futures Mode ON: entries/exits/alerts now use near-month future price. Strikes stay spot-based.", type='warning')
+    else:
+        ui.notify("Futures Mode OFF: back to spot price for entries/exits/alerts.", type='info')
 
 def on_buy_mode_button_click():
     """Handles the big standalone Options Buy Mode button (toggles the opposite of current

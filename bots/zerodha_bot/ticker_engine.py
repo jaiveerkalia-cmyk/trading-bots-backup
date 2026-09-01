@@ -39,10 +39,20 @@ class TickerClient:
                     if ltp <= 0:
                         continue
 
-                    # Update index prices
+                    # Update index (spot) prices
                     for name, info in INDICES.items():
                         if info['token'] == token:
                             shared_state[name]['ltp'] = ltp
+                            break
+
+                    # Update near-month futures prices (Futures Mode). Additive: fut_token
+                    # is None until instrument_manager.get_near_month_future() resolves it
+                    # during the daily scan and auto_run subscribes to it via
+                    # subscribe_new(), so this loop is a no-op for futures until then, and
+                    # never touches the existing spot 'ltp' path above.
+                    for name in INDICES:
+                        if shared_state[name].get('fut_token') == token:
+                            shared_state[name]['fut_ltp'] = ltp
                             break
 
                     # Update option chain

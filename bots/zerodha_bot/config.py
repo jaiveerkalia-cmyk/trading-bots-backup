@@ -57,8 +57,14 @@ _saved_alert_sound, _saved_alert_duration = load_alert_profile()
 
 # --- SHARED STATE ---
 shared_state = {
-    'NIFTY': {'ltp': 0.0, 'open': 0.0, 'high': 0.0, 'low': 0.0},
-    'SENSEX': {'ltp': 0.0, 'open': 0.0, 'high': 0.0, 'low': 0.0},
+    # fut_ltp/fut_symbol/fut_token: Futures Mode (params['futures_mode']) additions.
+    # fut_token/fut_symbol are resolved once per day in auto_run.run_daily_scan() via
+    # instrument_manager.get_near_month_future(); fut_ltp is populated by a parallel
+    # tick subscription in ticker_engine.py alongside the existing spot 'ltp'. All three
+    # default to empty/zero and are simply unused (spot 'ltp' continues to drive
+    # everything) when futures_mode is off, so this is purely additive.
+    'NIFTY': {'ltp': 0.0, 'open': 0.0, 'high': 0.0, 'low': 0.0, 'fut_ltp': 0.0, 'fut_symbol': '', 'fut_token': None},
+    'SENSEX': {'ltp': 0.0, 'open': 0.0, 'high': 0.0, 'low': 0.0, 'fut_ltp': 0.0, 'fut_symbol': '', 'fut_token': None},
     'connection_status': 'Disconnected',
     'last_updated': 'Never',
 
@@ -130,6 +136,11 @@ ui_refs = {
     'put_pos_row': None, 'put_pos_symbol': None, 'put_pos_mark': None, 'put_pos_size': None,
     'put_pos_pnl': None, 'put_pos_entry': None, 'put_pos_qty': None,
     'put_pos_maxloss': None, 'put_pos_maxprofit': None, 'put_pos_side_label': None,
+
+    # Futures Mode banner switch: shows the resolved near-month future symbol for the
+    # currently active trading_index while the mode is on (mirrors the ENTER VIA STOP
+    # switch's small caption label pattern already in the banner).
+    'futures_mode_symbol_label': None,
 }
 
 # --- UI CONFIGURATION ---
@@ -168,6 +179,22 @@ params = {
     # stop_via_candle_engine.py. When off, behavior is identical to before this feature
     # existed (immediate action at candle close).
     'enter_via_stop': True,
+
+    # Futures Mode: global toggle (both NIFTY and SENSEX together), default OFF. When on,
+    # all PRICE EVALUATION -- entry triggers, index stop/target checks, index-based alerts,
+    # the index_entry_price/index_current_price fields shown in the UI/used for index-linked
+    # PnL display, and the historical-candle fetches used by pattern_engine.py, hourly
+    # trailing (AutoController.process_hourly_trailing), and stop_via_candle_engine.py --
+    # reads the near-month index FUTURE's price/candles (shared_state[index]['fut_ltp'],
+    # fut_token) instead of the spot index (shared_state[index]['ltp'], INDICES[..]['token']).
+    # STRIKE SELECTION (find_balanced_strikes, recalc_reversal_strikes, ATM/manual strike
+    # offset math, INDICES[..]['step'] rounding) is explicitly EXCLUDED and always stays
+    # spot-based, since option strikes are spot-relative, not futures-relative. Premium-based
+    # option PnL (trade['pnl']) is also unaffected -- it was already based on the option's own
+    # LTP, never the index. Default False = identical to prior spot-only behavior; see
+    # config.get_eval_price() / get_eval_token() for the single-source-of-truth switch used by
+    # every consumer of this flag.
+    'futures_mode': False,
 
     'call_target_active': False, 'call_stop_active': False,
     'put_target_active': False, 'put_stop_active': False,
@@ -241,3 +268,37 @@ params = {
     'bearish_engulfing_intervals': ['5m', '15m', '30m', '1h'],
     'bearish_engulfing_count': 1,
 }
+
+
+# --- FUTURES MODE: SINGLE-SOURCE-OF-TRUTH PRICE/TOKEN RESOLVERS ---
+# Every consumer of Futures Mode (logic_engine, auto_run.AutoController, pattern_engine,
+# stop_via_candle_engine) calls these two helpers instead of each re-implementing its own
+# "if futures_mode: use fut_ltp else ltp" branch. Falls back safely to spot whenever the
+# future's price/token hasn't been resolved yet (e.g. before today's daily scan has run),
+# so a stale/zero fut_ltp can never silently produce a bad comparison -- it just behaves as
+# if futures_mode were off for that index until the future is actually resolved.
+def get_eval_price(index_name):
+    """Returns the price to use for entry/exit/alert/index-PnL evaluation for index_name:
+    the near-month future's LTP if params['futures_mode'] is on AND a future price has
+    actually been resolved for this index yet, otherwise the spot index LTP (unchanged
+    prior behavior)."""
+    if params.get('futures_mode', False):
+        fut_ltp = shared_state.get(index_name, {}).get('fut_ltp', 0.0)
+        if fut_ltp:
+            return fut_ltp
+    return shared_state.get(index_name, {}).get('ltp', 0.0)
+
+
+def get_eval_token(index_name):
+    """Returns the instrument token to use for historical candle fetches (pattern_engine,
+    hourly trailing, stop_via_candle_engine, check_inside_candle) for index_name: the
+    near-month future's token if params['futures_mode'] is on AND it has been resolved,
+    otherwise the spot index token from INDICES (unchanged prior behavior). Strike
+    selection call sites (find_balanced_strikes, recalc_reversal_strikes, ATM/manual strike
+    math) intentionally do NOT use this helper -- they always use INDICES[index_name]['token']
+    directly, since strikes are spot-relative regardless of Futures Mode."""
+    if params.get('futures_mode', False):
+        fut_token = shared_state.get(index_name, {}).get('fut_token')
+        if fut_token:
+            return fut_token
+    return INDICES[index_name]['token']

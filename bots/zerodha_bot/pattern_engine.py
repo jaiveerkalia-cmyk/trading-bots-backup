@@ -12,9 +12,10 @@ active trading index.
 For each (index, interval) pair:
   - Detects when that interval's candle boundary has just closed.
   - Waits `params['pattern_fetch_delay_sec']` seconds.
-  - Fetches historical candles via KiteConnect (for that index's token) and
-    matches EXACT required timestamps (never uses the still-forming/
-    incomplete current candle).
+  - Fetches historical candles via KiteConnect (for that index's token, or its
+    near-month future's token when Futures Mode is on -- see
+    config.get_eval_token()) and matches EXACT required timestamps (never
+    uses the still-forming/incomplete current candle).
   - If required candles aren't available yet, retries every tick until a
     max retry window elapses, then gives up for that boundary only.
   - Supports an "engulf candle count" per pattern: N subsequent candles are
@@ -37,7 +38,7 @@ Pattern definitions (high/low/close based, candle color is NOT considered):
 from datetime import datetime, timedelta
 from nicegui import ui
 
-from config import params, shared_state, INDICES
+from config import params, shared_state, INDICES, get_eval_token
 
 
 INTERVAL_DELTA = {
@@ -211,7 +212,11 @@ class PatternEngine:
         max_count = max(counts)
 
         try:
-            token = INDICES[index]['token']
+            # Futures Mode (config.get_eval_token): returns the near-month future's token
+            # when params['futures_mode'] is on and resolved for this index, otherwise the
+            # original spot INDICES[index]['token'] -- identical behavior when the mode is
+            # off.
+            token = get_eval_token(index)
         except Exception as e:
             shared_state['pattern_debug'][pkey] = {
                 'status': f'no token: {e}',
