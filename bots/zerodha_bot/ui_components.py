@@ -1,5 +1,5 @@
 from nicegui import ui
-from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state, ALERT_SOUND_URLS, save_alert_profile
+from config import params, UI_OPTS, ui_refs, TRADEBOOK_FILE, INDICES, shared_state, ALERT_SOUND_URLS, save_alert_profile, get_eval_price
 from datetime import datetime
 import pandas as pd
 import uuid
@@ -320,7 +320,13 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     once armed), so the card automatically shows the NEW live order the moment hand-off
     happens, with no separate 'deferred order' display needed. Strike offset and Qty are NOT
     staged this way since they're only read once, at the moment an order actually fires --
-    never polled live against a threshold."""
+    never polled live against a threshold.
+
+    idx_ltp used for the instant-fire sanity check below is Futures-Mode-aware
+    (config.get_eval_price): the near-month future's LTP when params['futures_mode'] is on
+    and resolved for this index, otherwise identical to spot -- matching exactly what
+    LogicEngine._check_unified_open itself evaluates against, so this warning is never wrong
+    about whether an order will actually fire immediately."""
     order_key = f'{prefix}_order_type'; trig_key = f'{prefix}_trigger_price'
     strike_key = f'{prefix}_strike_offset'; qty_key = f'{prefix}_qty'
     fire_key = f'{prefix}_fire_on'; armed_key = f'{prefix}_armed'
@@ -377,7 +383,7 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             try: trigger_price = float(draft['trigger'])
             except (ValueError, TypeError):
                 ui.notify(f"Invalid {side} Trigger Price", type='negative'); return
-            idx_ltp = shared_state.get(params['trading_index'], {}).get('ltp', 0)
+            idx_ltp = get_eval_price(params['trading_index'])
             buy_mode = params.get('options_buy_mode', False)
 
             def _do_arm():
@@ -560,7 +566,12 @@ def index_exit_component(side, label, time_key, value_key, active_key):
     checked alongside the existing instant-fire/pct-away warnings (index price is always
     available regardless of whether a position is open, so those remain independently
     useful). Reset ALSO cancels any still-pending Enter via Stop job for the Stop card only
-    (see _cancel_engine_job_if_any) -- Target is never deferred, so nothing to cancel there."""
+    (see _cancel_engine_job_if_any) -- Target is never deferred, so nothing to cancel there.
+
+    idx_ltp used for the instant-fire/pct-away sanity checks below is Futures-Mode-aware
+    (config.get_eval_price): the near-month future's LTP when params['futures_mode'] is on
+    and resolved for this index, otherwise identical to spot -- matching exactly what
+    LogicEngine._check_exits's INDEX EXITS branch itself evaluates against."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'value': params.get(value_key, 0)}
     _sync_draft_from_params(draft, 'value', value_key)
@@ -584,7 +595,7 @@ def index_exit_component(side, label, time_key, value_key, active_key):
                 value = float(draft['value'])
             except (ValueError, TypeError):
                 ui.notify(f"Invalid {side} Index {label} Value", type='negative'); return
-            idx_ltp = shared_state.get(params['trading_index'], {}).get('ltp', 0)
+            idx_ltp = get_eval_price(params['trading_index'])
             buy_mode = params.get('options_buy_mode', False)
             is_stop = (label == 'Stop')
             warnings = []
@@ -627,7 +638,11 @@ def premium_exit_card(side):
     warns via _no_position_warning (same 'Proceed Anyway' dialog) -- previously that case
     silently set the value with no warning at all. The Stop sub-card's Reset ALSO cancels any
     still-pending Enter via Stop job (see _cancel_engine_job_if_any) -- Target is never
-    deferred, so nothing to cancel on that side."""
+    deferred, so nothing to cancel on that side.
+
+    NOTE: this card's warnings read the option's own premium (trade['main']['current_price']),
+    never the index, so they are already correct and unaffected by Futures Mode -- no change
+    needed here."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     s = side.lower()
     draft = {'stop': params.get(f'{s}_prem_stop_val', 0), 'target': params.get(f'{s}_prem_target_val', 0)}
@@ -1101,7 +1116,9 @@ def _position_row(side, on_close=None):
     No _no_position_warning check here (unlike auto_close_card/index_exit_component/
     premium_exit_card): this whole row only exists/renders while a trade IS open on this
     side (_set_position_row_style hides it entirely otherwise), so the situation that warning
-    guards against can't happen from this particular UI surface."""
+    guards against can't happen from this particular UI surface. This row also has no
+    instant-fire/pct-away index-price warnings at all (unlike index_exit_component), so no
+    Futures Mode change is needed here."""
     prefix = 'call' if side == 'Call' else 'put'
     stop_val_key = f'{prefix}_index_stop_val'; stop_active_key = f'{prefix}_index_stop_active'; stop_time_key = f'{prefix}_index_stop_time'
     tgt_val_key = f'{prefix}_index_target_val'; tgt_active_key = f'{prefix}_index_tgt_active'; tgt_time_key = f'{prefix}_index_target_time'
