@@ -80,7 +80,13 @@ shared_state = {
     'current_expiry': {'NIFTY': None, 'SENSEX': None},
     'active_trades': {'Call': None, 'Put': None},
     'option_chain': {},
-    'pnl': {'realized': 0.0, 'unrealized': 0.0, 'trades_history': []},
+    # 'peak_total': Trailing Global PnL Stop (params['global_trailing_active']) support.
+    # Tracks the highest (realized + unrealized) PnL seen so far THIS SESSION -- updated
+    # every tick in LogicEngine._check_trailing_global_limit(). Reset to 0.0 at the 15:19
+    # EOD routine in auto_run.AutoController.run_loop(), alongside daily_pnl_written/
+    # active_trades, so it starts fresh each trading day. Unused (stays at whatever value
+    # it last held, harmlessly) whenever global_trailing_active is off.
+    'pnl': {'realized': 0.0, 'unrealized': 0.0, 'trades_history': [], 'peak_total': 0.0},
     'sound_queue': [],
     'toast_queue': [],
 
@@ -219,6 +225,14 @@ params = {
     'alert_upper_duration': _saved_alert_duration, 'alert_lower_duration': _saved_alert_duration,
 
     'global_stop_value': 0, 'global_target_value': 0, 'global_stop_active': False, 'global_tgt_active': False,
+
+    # Trailing Global PnL Stop: independent from the absolute Global Stop/Target above.
+    # 'global_trailing_drawdown' is an amount (in rupees), not a price level -- fires when
+    # combined realized+unrealized PnL falls this much below its session peak
+    # (shared_state['pnl']['peak_total']), regardless of whether that peak or the current
+    # total is positive or negative. Default off/0 = no behavior change unless explicitly
+    # enabled. See LogicEngine._check_trailing_global_limit().
+    'global_trailing_value': 0, 'global_trailing_active': False,
 
     'call_index_stop_val': 0, 'call_index_stop_time': 'Current', 'call_index_stop_active': False,
     'call_index_target_val': 0, 'call_index_target_time': 'Current', 'call_index_tgt_active': False,

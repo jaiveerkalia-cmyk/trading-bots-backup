@@ -474,6 +474,7 @@ class LogicEngine:
 
         self._check_exits(now, idx_ltp, fire_1m, fire_5m)
         self._check_global_limits()
+        self._check_trailing_global_limit()
         self._check_alerts(idx_ltp, fire_1m, fire_5m)
 
         if fire_1m: self.last_trigger_time['1m'] = curr_min
@@ -865,12 +866,59 @@ class LogicEngine:
             self.trading_active = False
             self.play_sound('error')
 
+    def _check_trailing_global_limit(self):
+        """Trailing Global PnL Stop (params['global_trailing_active']/'global_trailing_value'):
+        an INDEPENDENT third limit type alongside the absolute Global Stop/Target above --
+        does not touch or interact with params['global_stop_value']/'global_target_value' in
+        any way. Where Global Stop fires at an absolute floor (total PnL <= -stop) and Global
+        Target fires at an absolute ceiling (total PnL >= target), this fires on a DRAWDOWN
+        FROM THE SESSION'S PEAK PnL: e.g. if PnL climbs to 8000 and this is set to 3000, it
+        fires the moment total PnL falls to 5000 -- regardless of whether 5000 itself would
+        ever trip the absolute Global Stop.
+
+        shared_state['pnl']['peak_total'] is updated here EVERY tick this method runs
+        (whenever combined realized+unrealized PnL makes a new session high), independent of
+        whether the trailing stop itself is even active -- so the peak is always accurate the
+        moment someone turns the toggle on mid-session, rather than only starting to track
+        from whenever the toggle was flipped on. Reset to 0.0 once daily at the 15:19 EOD
+        routine in auto_run.AutoController.run_loop(), alongside daily_pnl_written.
+
+        Guarded by `peak_total > 0`: with peak still at its reset value of 0.0 (nothing
+        profitable has happened yet today), 'total <= peak - drawdown' would trip on ANY
+        negative total_pnl for a large-enough drawdown value, which is not the intended
+        meaning of a *trailing* stop (there is no peak to trail down from yet). Once peak
+        turns positive for the first time, trailing becomes fully active from that point on.
+
+        On hit: reuses the EXACT SAME close-out sequence as _check_global_limits above
+        (close_all_positions(save_pnl=False), _clear_all_fields_and_orders,
+        trading_active=False, error sound) for full consistency with the existing Global
+        Stop/Target behavior and daily-PnL-CSV-write-once guarantee."""
+        total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
+
+        if total > shared_state['pnl']['peak_total']:
+            shared_state['pnl']['peak_total'] = total
+
+        if not params.get('global_trailing_active', False):
+            return
+
+        try: drawdown = float(params['global_trailing_value']) if str(params['global_trailing_value']).strip() != '' else 0.0
+        except ValueError: drawdown = 0.0
+
+        peak = shared_state['pnl']['peak_total']
+        if drawdown > 0 and peak > 0 and total <= (peak - drawdown):
+            self.close_all_positions("Trailing Global Stop", save_pnl=False)
+            self._clear_all_fields_and_orders("Trailing Global Stop")
+            self.trading_active = False
+            self.play_sound('error')
+            self.log_action(f"📉 Trailing Global Stop Hit: Peak {peak:.0f} -> Now {total:.0f} (Drawdown {drawdown:.0f})")
+
     def _clear_all_fields_and_orders(self, reason):
         """Wipes every per-side field on BOTH Call and Put (via clear_leg_fields_callback, if
         wired) and cancels any pending/armed Enter via Stop job (via
         stop_via_candle_engine.cancel_all(), if wired). Shared by both branches of
-        _check_global_limits() above. Both callbacks are no-ops if never wired (e.g. a future
-        caller that constructs LogicEngine standalone), so this is always safe to call."""
+        _check_global_limits() above (and by _check_trailing_global_limit()). Both callbacks
+        are no-ops if never wired (e.g. a future caller that constructs LogicEngine
+        standalone), so this is always safe to call."""
         if self.clear_leg_fields_callback:
             self.clear_leg_fields_callback('Call')
             self.clear_leg_fields_callback('Put')
