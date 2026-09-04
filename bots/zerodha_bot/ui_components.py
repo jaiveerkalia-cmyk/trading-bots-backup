@@ -521,7 +521,14 @@ def global_control_card(label, value_key, active_key):
     EXTERNAL resets without reintroducing the mid-typing bug -- see that helper's docstring.
 
     No _no_position_warning check here (unlike the per-side cards): this is global, applying
-    to combined Call+Put PnL rather than one specific side's position."""
+    to combined Call+Put PnL rather than one specific side's position.
+
+    Set/Reset explicitly log the actual numeric value into the shared Trade Event Log (via
+    _log_alert_action, the same generic activity-log writer alerts use) -- previously the
+    only trace of a Set/Reset action was the generic 'MANUAL ACTION: {label} SET' line
+    auto_run.py's global ui.notify interceptor produces, which does not include the value
+    typed in, making it impossible to later confirm exactly what threshold was armed at any
+    given time (see: diagnosing why a Global Stop fired earlier than expected)."""
     draft = {'value': params.get(value_key, 0)}
     _sync_draft_from_params(draft, 'value', value_key)
     with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 shadow-sm rounded-xl'):
@@ -537,9 +544,11 @@ def global_control_card(label, value_key, active_key):
             params[value_key] = value; params[active_key] = True
             status.set_text(f"ACTIVE: {value}")
             ui.notify(f"{label} SET", type='positive')
+            _log_alert_action(f"⚙️ {label} SET: ₹{value:.0f}")
         def reset():
             params[active_key] = False; params[value_key] = 0; draft['value'] = 0
             ui.notify(f"{label} RESET", type='info')
+            _log_alert_action(f"⚙️ {label} RESET")
         with ui.row().classes('w-full gap-2'):
             ui.button('Set', color='blue-7', on_click=activate).classes('grow h-8 text-xs rounded-lg')
             ui.button('Reset', on_click=reset).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
@@ -777,10 +786,11 @@ def premium_exit_card(side):
 def _log_alert_action(message):
     """Writes an entry into the shared Trade Event Log (shared_state['activity_log']) -- the
     exact same store LogicEngine.log_action() writes to in logic_engine.py, using the same
-    '[HH:MM:SS] message' format and 100-entry cap -- so alert add/modify/cancel show up
-    alongside trade opens/closes/fires in one unified log. Defined here rather than calling
-    into LogicEngine since these UI handlers have no LogicEngine instance available; writing
-    directly to shared_state keeps a single source of truth for the log's storage."""
+    '[HH:MM:SS] message' format and 100-entry cap -- so alert add/modify/cancel, and Global
+    Stop/Target Set/Reset (see global_control_card), show up alongside trade opens/closes/
+    fires in one unified log. Defined here rather than calling into LogicEngine since these
+    UI handlers have no LogicEngine instance available; writing directly to shared_state
+    keeps a single source of truth for the log's storage."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     shared_state['activity_log'].insert(0, f"[{timestamp}] {message}")
     shared_state['activity_log'] = shared_state['activity_log'][:100]

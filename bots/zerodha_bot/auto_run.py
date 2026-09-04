@@ -1510,11 +1510,6 @@ def _render_trailing_global_stop_card():
     Peak/Now caption underneath so the person can see exactly where the trailing floor
     currently sits (peak - drawdown) without doing the math themselves."""
     draft = {'value': params.get('global_trailing_value', 0)}
-    from config import shared_state as _ss  # already imported at module level as shared_state; kept local name for clarity here only
-    def _sync():
-        current = params.get('global_trailing_value', 0)
-        if current != draft.get('_last', object()):
-            pass
     with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 shadow-sm rounded-xl'):
         ui.label('Trailing Global Stop (Drawdown from Peak)').classes('font-bold text-sm text-gray-700')
         ui.input().bind_value(draft, 'value').props('outlined dense bg-color=white prefix="₹"').classes('w-full')
