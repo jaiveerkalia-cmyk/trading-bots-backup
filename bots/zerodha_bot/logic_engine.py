@@ -313,16 +313,36 @@ class LogicEngine:
         self.play_sound('close')
         self.add_chart_marker(f"Close {side}", shared_state['pnl']['realized'])
         shared_state['reset_queue'].append(side)
+        # Returned alongside the (success, message) tuple for callers that need this specific
+        # close's PnL (e.g. close_all_positions()'s breakdown below) without re-deriving it
+        # from shared_state['pnl']['trades_history'] (which is a running, ever-growing list
+        # covering the WHOLE session, not just this one call).
+        self._last_close_pnl = round(net_pnl, 2)
+        self._last_close_side = side
         return True, "Closed"
 
     def close_all_positions(self, reason="Global Exit", save_pnl=True):
+        """Closes every open position (Call/Put). Returns a list of {'side','symbol','pnl'}
+        dicts, one per position actually closed by THIS call -- NOT the full-session
+        shared_state['pnl']['trades_history'] (which keeps growing all day) -- so callers
+        that need to report exactly what this specific close-all event just closed (e.g.
+        LogicEngine._check_global_limits/_check_trailing_global_limit's per-trade PnL
+        breakdown logging) don't have to guess which trailing slice of that list belongs to
+        this call."""
+        closed = []
         for side in ['Call', 'Put']:
-            if shared_state['active_trades'][side]: self.close_position(side, reason)
+            trade = shared_state['active_trades'][side]
+            if trade:
+                symbol = trade['main']['symbol']
+                success, _ = self.close_position(side, reason)
+                if success:
+                    closed.append({'side': side, 'symbol': symbol, 'pnl': self._last_close_pnl})
         if save_pnl:
             self.csv_manager.save_daily_report()
             self.log_action("📊 Daily Report Saved", f"{reason}")
         else:
             self.log_action("ℹ️ All Positions Closed", f"{reason}")
+        return closed
 
     def _cancel_opposite_pending(self, side, reason=""):
         """Called after a TARGET-triggered close (PnL/Index/Premium). Cancels any pending
@@ -821,6 +841,25 @@ class LogicEngine:
                     self.close_position(side, f"Prem Target {pt_val}")
                     self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
 
+    def _log_limit_fire(self, label, threshold_value, total_at_fire, closed_trades):
+        """Shared diagnostic logging for when a Global Stop/Target/Trailing limit actually
+        fires. Logs three things, so a limit firing earlier or later than expected can be
+        confirmed after the fact purely from the Trade Event Log, without needing to inspect
+        params/shared_state directly (as previously required to diagnose a Global Stop
+        firing at a total PnL that didn't match its configured threshold):
+          1. The exact threshold value that was configured/armed at the moment this fired.
+          2. The exact combined realized+unrealized total PnL at the moment it fired.
+          3. A per-trade PnL breakdown of every position THIS event closed (from
+             close_all_positions()'s returned list), not the whole session's history."""
+        self.log_action(
+            f"🎯 {label} FIRED: threshold=₹{threshold_value:.0f} | total PnL at fire=₹{total_at_fire:.0f}"
+        )
+        if closed_trades:
+            breakdown = ', '.join(f"{t['side']} {t['symbol']}: ₹{t['pnl']:.0f}" for t in closed_trades)
+            self.log_action(f"📋 {label}: trades closed this event -> {breakdown}")
+        else:
+            self.log_action(f"📋 {label}: no open positions to close at fire time")
+
     def _check_global_limits(self):
         """Manual 'Global Stop Loss' / 'Global Target' cards (params['global_stop_value']/
         'global_target_value', combined realized+unrealized PnL across BOTH sides).
@@ -839,6 +878,10 @@ class LogicEngine:
             order' that needs cancelling as an active exit order on the side that just closed.
           - Any pending/armed Enter via Stop job (stop_via_candle_engine.py) is also cancelled
             outright via cancel_all(), rather than left to expire on its own later.
+          - The exact threshold value, the exact total PnL at fire time, and a per-trade PnL
+            breakdown of what was actually closed are logged via _log_limit_fire, so a limit
+            firing at an unexpected PnL level can be diagnosed later purely from the Trade
+            Event Log.
         """
         total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
 
@@ -856,15 +899,17 @@ class LogicEngine:
         # the limit was hit intraday) AND the EOD routine wrote again at 15:19 since it had no
         # way of knowing a report was already saved -- two rows per day for one session.
         if params['global_stop_active'] and stop > 0 and total <= -stop:
-            self.close_all_positions("Global Stop", save_pnl=False)
+            closed = self.close_all_positions("Global Stop", save_pnl=False)
             self._clear_all_fields_and_orders("Global Stop")
             self.trading_active = False
             self.play_sound('error')
+            self._log_limit_fire("Global Stop", stop, total, closed)
         if params['global_tgt_active'] and target > 0 and total >= target:
-            self.close_all_positions("Global Target", save_pnl=False)
+            closed = self.close_all_positions("Global Target", save_pnl=False)
             self._clear_all_fields_and_orders("Global Target")
             self.trading_active = False
             self.play_sound('error')
+            self._log_limit_fire("Global Target", target, total, closed)
 
     def _check_trailing_global_limit(self):
         """Trailing Global PnL Stop (params['global_trailing_active']/'global_trailing_value'):
@@ -891,8 +936,10 @@ class LogicEngine:
 
         On hit: reuses the EXACT SAME close-out sequence as _check_global_limits above
         (close_all_positions(save_pnl=False), _clear_all_fields_and_orders,
-        trading_active=False, error sound) for full consistency with the existing Global
-        Stop/Target behavior and daily-PnL-CSV-write-once guarantee."""
+        trading_active=False, error sound), plus the same _log_limit_fire diagnostic logging
+        (threshold=the configured drawdown amount, not the peak itself -- the peak and the
+        resulting floor are both included in the dedicated trailing-specific log line kept
+        below for that extra context)."""
         total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
 
         if total > shared_state['pnl']['peak_total']:
@@ -906,11 +953,12 @@ class LogicEngine:
 
         peak = shared_state['pnl']['peak_total']
         if drawdown > 0 and peak > 0 and total <= (peak - drawdown):
-            self.close_all_positions("Trailing Global Stop", save_pnl=False)
+            closed = self.close_all_positions("Trailing Global Stop", save_pnl=False)
             self._clear_all_fields_and_orders("Trailing Global Stop")
             self.trading_active = False
             self.play_sound('error')
             self.log_action(f"📉 Trailing Global Stop Hit: Peak {peak:.0f} -> Now {total:.0f} (Drawdown {drawdown:.0f})")
+            self._log_limit_fire("Trailing Global Stop", drawdown, total, closed)
 
     def _clear_all_fields_and_orders(self, reason):
         """Wipes every per-side field on BOTH Call and Put (via clear_leg_fields_callback, if

@@ -80,12 +80,14 @@ shared_state = {
     'current_expiry': {'NIFTY': None, 'SENSEX': None},
     'active_trades': {'Call': None, 'Put': None},
     'option_chain': {},
-    # 'peak_total': Trailing Global PnL Stop (params['global_trailing_active']) support.
-    # Tracks the highest (realized + unrealized) PnL seen so far THIS SESSION -- updated
-    # every tick in LogicEngine._check_trailing_global_limit(). Reset to 0.0 at the 15:19
-    # EOD routine in auto_run.AutoController.run_loop(), alongside daily_pnl_written/
-    # active_trades, so it starts fresh each trading day. Unused (stays at whatever value
-    # it last held, harmlessly) whenever global_trailing_active is off.
+    # 'peak_total': retained field, no longer used by any active logic. Originally tracked a
+    # running session-peak PnL for a "trailing drawdown" version of the Global PnL Floor
+    # (params['global_trailing_active']/'global_trailing_value') that has since been replaced
+    # with a plain absolute-floor comparison (see LogicEngine._check_global_pnl_floor()) --
+    # peak-tracking caused the floor to fire immediately whenever it was armed after PnL had
+    # already pulled back from an earlier high, which was not the intended behavior. Left in
+    # place (rather than removed) purely so nothing else in the codebase that might reference
+    # this key breaks; it is simply never read or written anymore.
     'pnl': {'realized': 0.0, 'unrealized': 0.0, 'trades_history': [], 'peak_total': 0.0},
     'sound_queue': [],
     'toast_queue': [],
@@ -117,7 +119,7 @@ shared_state = {
 # --- UI REFERENCES ---
 ui_refs = {
     'banner_card': None,
-    'pnl_realized': None, 'pnl_unrealized': None, 'last_action': None,
+    'pnl_realized': None, 'pnl_unrealized': None, 'pnl_total': None, 'last_action': None,
     'activity_log_container': None, 'pnl_chart': None,
 
     'call_status': None, 'call_pnl': None,
@@ -147,6 +149,9 @@ ui_refs = {
     # currently active trading_index while the mode is on (mirrors the ENTER VIA STOP
     # switch's small caption label pattern already in the banner).
     'futures_mode_symbol_label': None,
+
+    # Global PnL Floor card's live "Now: ₹X" caption (auto_run.py's _render_global_pnl_floor_card).
+    'trailing_stop_caption': None,
 }
 
 # --- UI CONFIGURATION ---
@@ -185,6 +190,12 @@ params = {
     # stop_via_candle_engine.py. When off, behavior is identical to before this feature
     # existed (immediate action at candle close).
     'enter_via_stop': True,
+
+    # Enter via Stop: seconds to wait AFTER a candle boundary closes before fetching that
+    # candle via the historical API (gives the broker's candle data time to finalize on
+    # their end before we ask for it). Was previously a hardcoded constant
+    # (stop_via_candle_engine.FETCH_DELAY_SEC = 3); now a configurable param, default 5.
+    'enter_via_stop_fetch_delay_sec': 5,
 
     # Futures Mode: global toggle (both NIFTY and SENSEX together), default OFF. When on,
     # all PRICE EVALUATION -- entry triggers, index stop/target checks, index-based alerts,
@@ -226,12 +237,15 @@ params = {
 
     'global_stop_value': 0, 'global_target_value': 0, 'global_stop_active': False, 'global_tgt_active': False,
 
-    # Trailing Global PnL Stop: independent from the absolute Global Stop/Target above.
-    # 'global_trailing_drawdown' is an amount (in rupees), not a price level -- fires when
-    # combined realized+unrealized PnL falls this much below its session peak
-    # (shared_state['pnl']['peak_total']), regardless of whether that peak or the current
-    # total is positive or negative. Default off/0 = no behavior change unless explicitly
-    # enabled. See LogicEngine._check_trailing_global_limit().
+    # Global PnL Floor (independent from the absolute Global Stop/Target above; internal
+    # param names kept as global_trailing_* to minimize code churn, though this is no longer
+    # a trailing/drawdown-from-peak stop -- see LogicEngine._check_global_pnl_floor()).
+    # 'global_trailing_value' is a plain ABSOLUTE PnL level (rupees, typically positive) --
+    # fires the moment combined realized+unrealized PnL drops to or below this exact value,
+    # regardless of what PnL peaked at earlier in the session. This is meant to lock in a
+    # minimum acceptable profit (the negative/loss side is already covered by Global Stop
+    # Loss above); e.g. set to 100 to close everything the instant total PnL falls to ₹100.
+    # Default off/0 = no behavior change unless explicitly enabled.
     'global_trailing_value': 0, 'global_trailing_active': False,
 
     'call_index_stop_val': 0, 'call_index_stop_time': 'Current', 'call_index_stop_active': False,
