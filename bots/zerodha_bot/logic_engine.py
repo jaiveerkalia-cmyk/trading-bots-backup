@@ -326,9 +326,8 @@ class LogicEngine:
         dicts, one per position actually closed by THIS call -- NOT the full-session
         shared_state['pnl']['trades_history'] (which keeps growing all day) -- so callers
         that need to report exactly what this specific close-all event just closed (e.g.
-        LogicEngine._check_global_limits/_check_trailing_global_limit's per-trade PnL
-        breakdown logging) don't have to guess which trailing slice of that list belongs to
-        this call."""
+        LogicEngine._check_global_limits/_check_global_pnl_floor's per-trade PnL breakdown
+        logging) don't have to guess which trailing slice of that list belongs to this call."""
         closed = []
         for side in ['Call', 'Put']:
             trade = shared_state['active_trades'][side]
@@ -494,7 +493,7 @@ class LogicEngine:
 
         self._check_exits(now, idx_ltp, fire_1m, fire_5m)
         self._check_global_limits()
-        self._check_trailing_global_limit()
+        self._check_global_pnl_floor()
         self._check_alerts(idx_ltp, fire_1m, fire_5m)
 
         if fire_1m: self.last_trigger_time['1m'] = curr_min
@@ -842,7 +841,7 @@ class LogicEngine:
                     self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
 
     def _log_limit_fire(self, label, threshold_value, total_at_fire, closed_trades):
-        """Shared diagnostic logging for when a Global Stop/Target/Trailing limit actually
+        """Shared diagnostic logging for when a Global Stop/Target/PnL Floor limit actually
         fires. Logs three things, so a limit firing earlier or later than expected can be
         confirmed after the fact purely from the Trade Event Log, without needing to inspect
         params/shared_state directly (as previously required to diagnose a Global Stop
@@ -864,15 +863,12 @@ class LogicEngine:
         """Manual 'Global Stop Loss' / 'Global Target' cards (params['global_stop_value']/
         'global_target_value', combined realized+unrealized PnL across BOTH sides).
 
-        On hit, in addition to the existing close_all_positions() + trading_active=False:
+        On hit:
           - Every per-side field on BOTH Call and Put -- PnL/Index/Premium stop-target
             values+active-flags, and any pending Unified Entry order (armed/trigger_price/
             armed_at/new_stop/new_target) -- is wiped via clear_leg_fields_callback, wired in
             from auto_run.AutoController.clear_leg_fields. This matches what Auto Pilot's own
-            internal global stop already does in AutoController.run_loop() (SECOND_LEG block)
-            -- previously this manual path only closed positions, leaving every field/pending
-            order behind (misleadingly still showing 'active'/'armed' in the UI even though
-            trading_active=False silently blocked anything from actually firing again).
+            internal global stop already does in AutoController.run_loop() (SECOND_LEG block).
           - Both sides deliberately, not just whichever side had a position open: an armed
             entry order on the OTHER side (no position yet) is just as much a 'still open
             order' that needs cancelling as an active exit order on the side that just closed.
@@ -882,6 +878,16 @@ class LogicEngine:
             breakdown of what was actually closed are logged via _log_limit_fire, so a limit
             firing at an unexpected PnL level can be diagnosed later purely from the Trade
             Event Log.
+          - ONLY this limit's OWN active flag is switched off (one-shot, so it doesn't
+            immediately refire against the same still-low/still-high PnL on the very next
+            tick). Trading is deliberately NOT globally halted (self.trading_active stays
+            True) -- new positions can be opened immediately afterward via Auto Pilot,
+            manual entry, or unified entries, same as any other moment. This also means the
+            ticker/market data connection is completely untouched here; it was never stopped
+            by this flag to begin with (self.trading_active only ever gated
+            open_position()). Each of Global Stop, Global Target, and the Global PnL Floor
+            below remain fully independent -- firing one never disables another, and each
+            can be re-armed by the person at any time to protect the next round of trades.
         """
         total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
 
@@ -895,76 +901,69 @@ class LogicEngine:
         # here. It's written exactly once per day, at the 15:19 EOD routine in
         # AutoController.run_loop() (auto_run.py), which will correctly include whatever PnL
         # this event locked in, since close_position() already appended it to
-        # shared_state['pnl']['trades_history']. Previously this wrote immediately (whenever
-        # the limit was hit intraday) AND the EOD routine wrote again at 15:19 since it had no
-        # way of knowing a report was already saved -- two rows per day for one session.
+        # shared_state['pnl']['trades_history'].
         if params['global_stop_active'] and stop > 0 and total <= -stop:
             closed = self.close_all_positions("Global Stop", save_pnl=False)
             self._clear_all_fields_and_orders("Global Stop")
-            self.trading_active = False
+            params['global_stop_active'] = False
             self.play_sound('error')
             self._log_limit_fire("Global Stop", stop, total, closed)
         if params['global_tgt_active'] and target > 0 and total >= target:
             closed = self.close_all_positions("Global Target", save_pnl=False)
             self._clear_all_fields_and_orders("Global Target")
-            self.trading_active = False
+            params['global_tgt_active'] = False
             self.play_sound('error')
             self._log_limit_fire("Global Target", target, total, closed)
 
-    def _check_trailing_global_limit(self):
-        """Trailing Global PnL Stop (params['global_trailing_active']/'global_trailing_value'):
-        an INDEPENDENT third limit type alongside the absolute Global Stop/Target above --
-        does not touch or interact with params['global_stop_value']/'global_target_value' in
-        any way. Where Global Stop fires at an absolute floor (total PnL <= -stop) and Global
-        Target fires at an absolute ceiling (total PnL >= target), this fires on a DRAWDOWN
-        FROM THE SESSION'S PEAK PnL: e.g. if PnL climbs to 8000 and this is set to 3000, it
-        fires the moment total PnL falls to 5000 -- regardless of whether 5000 itself would
-        ever trip the absolute Global Stop.
+    def _check_global_pnl_floor(self):
+        """Global PnL Floor (params['global_trailing_active']/'global_trailing_value' --
+        internal param names kept as global_trailing_* to minimize code churn, though this
+        is NOT a trailing/drawdown-from-peak stop): a THIRD, fully independent limit type
+        alongside the absolute Global Stop/Target above -- does not touch or interact with
+        params['global_stop_value']/'global_target_value'/'global_stop_active'/
+        'global_tgt_active' in any way.
 
-        shared_state['pnl']['peak_total'] is updated here EVERY tick this method runs
-        (whenever combined realized+unrealized PnL makes a new session high), independent of
-        whether the trailing stop itself is even active -- so the peak is always accurate the
-        moment someone turns the toggle on mid-session, rather than only starting to track
-        from whenever the toggle was flipped on. Reset to 0.0 once daily at the 15:19 EOD
-        routine in auto_run.AutoController.run_loop(), alongside daily_pnl_written.
+        This is a plain ABSOLUTE PnL level (typically a positive number, meant to lock in a
+        minimum acceptable profit -- the negative/loss side is already covered by Global Stop
+        Loss above): fires the moment combined realized+unrealized PnL drops to OR BELOW this
+        exact configured value, with NO peak-tracking of any kind. E.g. set to 100 -> fires
+        the instant total PnL <= 100, regardless of what PnL was earlier in the session (it
+        could have been 8000 an hour ago, or never above 100 at all -- doesn't matter, only
+        the CURRENT total relative to the configured floor matters).
 
-        Guarded by `peak_total > 0`: with peak still at its reset value of 0.0 (nothing
-        profitable has happened yet today), 'total <= peak - drawdown' would trip on ANY
-        negative total_pnl for a large-enough drawdown value, which is not the intended
-        meaning of a *trailing* stop (there is no peak to trail down from yet). Once peak
-        turns positive for the first time, trailing becomes fully active from that point on.
+        (An earlier version of this method tracked shared_state['pnl']['peak_total'] and
+        fired on a drawdown-from-peak basis instead. That caused the floor to fire
+        IMMEDIATELY whenever it was armed after PnL had already pulled back from an earlier
+        high in the session -- e.g. arming a 100 drawdown when PnL had already fallen from a
+        4254 peak to 3461 fired instantly, since 3461 was already >100 below 4254. That
+        peak-tracking behavior did not match the intended use of this control and has been
+        removed entirely; peak_total is no longer read or written by this method.)
 
         On hit: reuses the EXACT SAME close-out sequence as _check_global_limits above
-        (close_all_positions(save_pnl=False), _clear_all_fields_and_orders,
-        trading_active=False, error sound), plus the same _log_limit_fire diagnostic logging
-        (threshold=the configured drawdown amount, not the peak itself -- the peak and the
-        resulting floor are both included in the dedicated trailing-specific log line kept
-        below for that extra context)."""
-        total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
-
-        if total > shared_state['pnl']['peak_total']:
-            shared_state['pnl']['peak_total'] = total
-
+        (close_all_positions(save_pnl=False), _clear_all_fields_and_orders, error sound,
+        _log_limit_fire diagnostic logging), and -- matching _check_global_limits -- only
+        this control's OWN active flag is switched off on fire (one-shot); trading is not
+        globally halted and every other limit remains independently armed/re-armable."""
         if not params.get('global_trailing_active', False):
             return
 
-        try: drawdown = float(params['global_trailing_value']) if str(params['global_trailing_value']).strip() != '' else 0.0
-        except ValueError: drawdown = 0.0
+        total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
 
-        peak = shared_state['pnl']['peak_total']
-        if drawdown > 0 and peak > 0 and total <= (peak - drawdown):
-            closed = self.close_all_positions("Trailing Global Stop", save_pnl=False)
-            self._clear_all_fields_and_orders("Trailing Global Stop")
-            self.trading_active = False
+        try: floor_value = float(params['global_trailing_value']) if str(params['global_trailing_value']).strip() != '' else 0.0
+        except ValueError: floor_value = 0.0
+
+        if floor_value > 0 and total <= floor_value:
+            closed = self.close_all_positions("Global PnL Floor", save_pnl=False)
+            self._clear_all_fields_and_orders("Global PnL Floor")
+            params['global_trailing_active'] = False
             self.play_sound('error')
-            self.log_action(f"📉 Trailing Global Stop Hit: Peak {peak:.0f} -> Now {total:.0f} (Drawdown {drawdown:.0f})")
-            self._log_limit_fire("Trailing Global Stop", drawdown, total, closed)
+            self._log_limit_fire("Global PnL Floor", floor_value, total, closed)
 
     def _clear_all_fields_and_orders(self, reason):
         """Wipes every per-side field on BOTH Call and Put (via clear_leg_fields_callback, if
         wired) and cancels any pending/armed Enter via Stop job (via
         stop_via_candle_engine.cancel_all(), if wired). Shared by both branches of
-        _check_global_limits() above (and by _check_trailing_global_limit()). Both callbacks
+        _check_global_limits() above (and by _check_global_pnl_floor()). Both callbacks
         are no-ops if never wired (e.g. a future caller that constructs LogicEngine
         standalone), so this is always safe to call."""
         if self.clear_leg_fields_callback:

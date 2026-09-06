@@ -517,10 +517,6 @@ class AutoController:
                     shared_state['sound_queue'].append('close')
                 except: shared_state['daily_pnl_written'] = True
 
-                # Trailing Global PnL Stop: reset the session peak for tomorrow, same
-                # once-per-day gate as everything else in this block.
-                shared_state['pnl']['peak_total'] = 0.0
-
                 # Clear all pending price alerts (Active Alerts section) -- they were set
                 # against today's session; carrying them into tomorrow could fire against a
                 # completely different day's price action. Reuses the same once-per-day
@@ -950,6 +946,15 @@ def update_ui():
             ui_refs['pnl_unrealized'].set_text(f"₹ {p:.2f}")
             ui_refs['pnl_unrealized'].classes(replace=f"text-2xl font-bold font-mono {c} leading-none")
 
+        # Total PnL (Realized + Unrealized combined) -- displayed alongside the two existing
+        # figures, so the person can see the number that actually drives Global Stop/Target/
+        # PnL Floor without having to add the other two together mentally.
+        if ui_refs.get('pnl_total'):
+            p = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
+            c = 'text-green-500' if p >= 0 else 'text-red-500'
+            ui_refs['pnl_total'].set_text(f"₹ {p:.2f}")
+            ui_refs['pnl_total'].classes(replace=f"text-2xl font-mono font-bold {c} leading-none")
+
         if ui_refs['last_action']: ui_refs['last_action'].set_text(shared_state['last_action'])
         
         if ui_refs['monitor_status']:
@@ -986,11 +991,10 @@ def update_ui():
             else:
                 ui_refs['futures_mode_symbol_label'].set_text('spot price -> strike')
 
-        # Trailing Global PnL Stop: refresh the live peak/current caption every tick.
+        # Global PnL Floor: refresh the live "Now" caption every tick (no peak tracking).
         if ui_refs.get('trailing_stop_caption'):
             total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
-            peak = shared_state['pnl']['peak_total']
-            ui_refs['trailing_stop_caption'].set_text(f"Peak: ₹{peak:.0f}  |  Now: ₹{total:.0f}")
+            ui_refs['trailing_stop_caption'].set_text(f"Now: ₹{total:.0f}")
 
         # Buy Mode big button: refresh its text/color every tick to reflect the current state
         # (also handles it being flipped back off automatically by a failed toggle attempt).
@@ -1144,13 +1148,16 @@ def custom_render_master_banner(update_lots_callback):
                         'try { const a = new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg"); '
                         'a.volume = 0.4; a.play().catch(()=>{}); } catch(e) {}'
                     )).props('dense flat size=sm').classes('text-[10px] text-orange-900')
-                with ui.row().classes('absolute right-2 top-2 gap-4 text-right bg-orange-200 pl-4'):
+                with ui.row().classes('gap-6 items-center flex-nowrap justify-end'):
                     with ui.column().classes('gap-0 items-end'):
                         ui.label('Unrealized').classes('text-orange-800 text-[9px] uppercase tracking-wider')
-                        ui_refs['pnl_unrealized'] = ui.label('₹ 0.00').classes('text-xl font-mono font-bold text-gray-800 leading-none')
+                        ui_refs['pnl_unrealized'] = ui.label('₹ 0.00').classes('text-2xl font-mono font-bold text-gray-800 leading-none')
                     with ui.column().classes('gap-0 items-end'):
                         ui.label('Realized').classes('text-orange-800 text-[9px] uppercase tracking-wider')
-                        ui_refs['pnl_realized'] = ui.label('₹ 0.00').classes('text-xl font-mono font-bold text-green-700 leading-none')
+                        ui_refs['pnl_realized'] = ui.label('₹ 0.00').classes('text-2xl font-mono font-bold text-green-700 leading-none')
+                    with ui.column().classes('gap-0 items-end'):
+                        ui.label('Total').classes('text-orange-800 text-[9px] uppercase tracking-wider')
+                        ui_refs['pnl_total'] = ui.label('₹ 0.00').classes('text-2xl font-mono font-bold text-gray-800 leading-none')
 
         # --- BIG STANDALONE OPTIONS BUY MODE BUTTON ---
         # Made deliberately large, full-width, and high-contrast (not folded into the small
@@ -1501,32 +1508,36 @@ def build_left_stack():
     comp.premium_exit_card('Call')
     _index_exit_wrapper('Call')
 
-def _render_trailing_global_stop_card():
-    """Trailing Global PnL Stop card: fires close-all when combined realized+unrealized PnL
-    falls a set amount BELOW its session peak (params['global_trailing_value'],
-    shared_state['pnl']['peak_total']), independent of the absolute Global Stop/Target cards
-    above it. Same draft-and-commit input pattern as global_control_card (typing has zero
-    live effect until Set is clicked) and the same visual language, but with a live
-    Peak/Now caption underneath so the person can see exactly where the trailing floor
-    currently sits (peak - drawdown) without doing the math themselves."""
+def _render_global_pnl_floor_card():
+    """Global PnL Floor card: fires close-all the moment combined realized+unrealized PnL
+    drops to OR BELOW an absolute value (params['global_trailing_value'] -- internal name
+    kept as global_trailing_* to minimize code churn, though this is a plain absolute-floor
+    check with no peak/drawdown tracking; see LogicEngine._check_global_pnl_floor()).
+    Independent of the Global Stop/Target cards above it. Same draft-and-commit input
+    pattern as global_control_card (typing has zero live effect until Set is clicked), with
+    a live 'Now' caption underneath so the person can see the current combined PnL right next
+    to the floor they're setting."""
     draft = {'value': params.get('global_trailing_value', 0)}
     with ui.card().classes('w-full p-3 gap-2 bg-gray-50 border border-gray-200 shadow-sm rounded-xl'):
-        ui.label('Trailing Global Stop (Drawdown from Peak)').classes('font-bold text-sm text-gray-700')
+        ui.label('Global PnL Floor (Lock-in Profit)').classes('font-bold text-sm text-gray-700')
+        ui.label('Closes all positions the instant total PnL falls to this level.').classes('text-[10px] text-gray-500 -mt-1 mb-1')
         ui.input().bind_value(draft, 'value').props('outlined dense bg-color=white prefix="₹"').classes('w-full')
-        ui_refs['trailing_stop_caption'] = ui.label('Peak: ₹0  |  Now: ₹0').classes('text-[10px] text-gray-500')
+        ui_refs['trailing_stop_caption'] = ui.label('Now: ₹0').classes('text-[10px] text-gray-500')
         status = ui.label().classes('w-full text-center text-xs font-bold text-white bg-blue-600 rounded p-1 shadow-sm')
         status.bind_visibility_from(params, 'global_trailing_active')
         def activate():
             try:
                 value = float(draft['value'])
             except (ValueError, TypeError):
-                ui.notify("Invalid Trailing Stop Value", type='negative'); return
+                ui.notify("Invalid PnL Floor Value", type='negative'); return
             params['global_trailing_value'] = value; params['global_trailing_active'] = True
-            status.set_text(f"ACTIVE: Drawdown ₹{value:.0f}")
-            ui.notify("Trailing Global Stop SET", type='positive')
+            status.set_text(f"ACTIVE: Floor ₹{value:.0f}")
+            ui.notify("Global PnL Floor SET", type='positive')
+            comp._log_alert_action(f"⚙️ Global PnL Floor SET: ₹{value:.0f}")
         def reset():
             params['global_trailing_active'] = False; params['global_trailing_value'] = 0; draft['value'] = 0
-            ui.notify("Trailing Global Stop RESET", type='info')
+            ui.notify("Global PnL Floor RESET", type='info')
+            comp._log_alert_action("⚙️ Global PnL Floor RESET")
         with ui.row().classes('w-full gap-2'):
             ui.button('Set', color='blue-7', on_click=activate).classes('grow h-8 text-xs rounded-lg')
             ui.button('Reset', on_click=reset).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
@@ -1535,7 +1546,7 @@ def build_center_stack():
     ui.button('Run 9 AM Daily Scan', on_click=run_daily_scan).classes('bg-orange-200 text-orange-900 w-full shadow-md rounded-xl h-12 font-bold')
     comp.global_control_card('Global Stop Loss', 'global_stop_value', 'global_stop_active')
     comp.global_control_card('Global Target', 'global_target_value', 'global_tgt_active')
-    _render_trailing_global_stop_card()
+    _render_global_pnl_floor_card()
     comp.render_alert_sound_panel()
     comp.alerts_card_upper()
     comp.alerts_card_lower()

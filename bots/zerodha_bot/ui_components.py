@@ -397,6 +397,7 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
                 params[armed_key] = True
                 status.set_text(f"ARMED: {order_type} @ {trigger_price} ({params[fire_key]})")
                 ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} ARMED", type='positive')
+                _log_alert_action(f"⚙️ {side} Entry ARMED: {order_type} @ {trigger_price} ({params[fire_key]})")
 
             warning = _unified_instant_fire_warning(side, order_type, buy_mode, idx_ltp, trigger_price)
             if warning:
@@ -434,7 +435,9 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
 
     SET also warns (via _no_position_warning, same 'Proceed Anyway' dialog used elsewhere) if
     this side has no open position right now -- likely means the person meant the other
-    panel."""
+    panel. Both SET and RESET explicitly log the exact value into the shared Trade Event Log
+    (via _log_alert_action), so a Profit/Loss threshold that was armed can always be confirmed
+    after the fact."""
     init_color_class, _ = _side_colors(side, params.get('options_buy_mode', False), weight='50')
     draft = {'target': params.get(target_val_key, 0), 'stop': params.get(stop_val_key, 0)}
     _sync_draft_from_params(draft, 'target', target_val_key)
@@ -452,6 +455,7 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
             def _do_set_tgt(value):
                 params[target_val_key] = value; params[target_active_key] = True
                 ui.notify(f"{side} Profit Set", type='positive')
+                _log_alert_action(f"⚙️ {side} Profit SET: ₹{value:.0f}")
             def set_tgt():
                 try:
                     value = float(draft['target'])
@@ -465,6 +469,7 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
             def rst_tgt():
                 params[target_active_key] = False; params[target_val_key] = 0; draft['target'] = 0
                 ui.notify(f"{side} Profit Reset", type='info')
+                _log_alert_action(f"⚙️ {side} Profit RESET")
             ui.button('SET', on_click=set_tgt, color='green-8').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
             ui.button('RESET', on_click=rst_tgt, color='grey').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
 
@@ -476,6 +481,7 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
             def _do_set_stp(value):
                 params[stop_val_key] = value; params[stop_active_key] = True
                 ui.notify(f"{side} Loss Set", type='positive')
+                _log_alert_action(f"⚙️ {side} Loss SET: ₹{value:.0f}")
             def set_stp():
                 try:
                     value = float(draft['stop'])
@@ -489,6 +495,7 @@ def auto_close_card(side, target_val_key, target_active_key, stop_val_key, stop_
             def rst_stp():
                 params[stop_active_key] = False; params[stop_val_key] = 0; draft['stop'] = 0
                 ui.notify(f"{side} Loss Reset", type='info')
+                _log_alert_action(f"⚙️ {side} Loss RESET")
             ui.button('SET', on_click=set_stp, color='red-8').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
             ui.button('RESET', on_click=rst_stp, color='grey').props('dense flat').classes('w-auto px-2 h-6 text-[10px] rounded')
 
@@ -507,9 +514,11 @@ def open_logic_card(title, side, mode_key, amt_key, strike_key, active_key):
         def activate():
             params[active_key] = True; msg = f"ACTIVE: {params[mode_key]} < {params[amt_key]}" if side=='Call' else f"ACTIVE: {params[mode_key]} > {params[amt_key]}"
             status.set_text(msg); ui.notify(f"{title} ACTIVATED", type='positive')
+            _log_alert_action(f"⚙️ {title} ACTIVATED: {params[mode_key]} {'<' if side == 'Call' else '>'} {params[amt_key]}")
         def reset():
             params[active_key] = False; params[amt_key] = 0; params[strike_key] = 0
             ui.notify(f"{title} RESET", type='info')
+            _log_alert_action(f"⚙️ {title} RESET")
         with ui.row().classes('w-full gap-2'):
             ui.button('Activate', color=btn_color, on_click=activate).classes('grow h-8 text-xs rounded-lg shadow-sm')
             ui.button('Reset', on_click=reset).classes('grow h-8 text-xs rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300')
@@ -576,6 +585,7 @@ def index_exit_component(side, label, time_key, value_key, active_key):
     available regardless of whether a position is open, so those remain independently
     useful). Reset ALSO cancels any still-pending Enter via Stop job for the Stop card only
     (see _cancel_engine_job_if_any) -- Target is never deferred, so nothing to cancel there.
+    Both Set and Reset explicitly log the exact value into the shared Trade Event Log.
 
     idx_ltp used for the instant-fire/pct-away sanity checks below is Futures-Mode-aware
     (config.get_eval_price): the near-month future's LTP when params['futures_mode'] is on
@@ -599,6 +609,7 @@ def index_exit_component(side, label, time_key, value_key, active_key):
             params[value_key] = value; params[active_key] = True
             status.set_text(f"ON: {value}")
             ui.notify(f"{side} Index {label} SET", type='positive')
+            _log_alert_action(f"⚙️ {side} Index {label} SET: {value}")
         def activate():
             try:
                 value = float(draft['value'])
@@ -623,6 +634,7 @@ def index_exit_component(side, label, time_key, value_key, active_key):
                 _cancel_engine_job_if_any('index_stop', side)
             params[active_key] = False; params[value_key] = 0; draft['value'] = 0
             ui.notify(f"{side} Index {label} RESET", type='info')
+            _log_alert_action(f"⚙️ {side} Index {label} RESET")
         with ui.row().classes('w-full gap-1 mt-1'):
             ui.button('Set', color='black', on_click=activate).props('outline').classes('grow h-6 text-[10px] rounded')
             ui.button('Reset', on_click=reset).classes('grow h-6 text-[10px] rounded bg-gray-200 text-gray-800 hover:bg-gray-300')
@@ -647,7 +659,8 @@ def premium_exit_card(side):
     warns via _no_position_warning (same 'Proceed Anyway' dialog) -- previously that case
     silently set the value with no warning at all. The Stop sub-card's Reset ALSO cancels any
     still-pending Enter via Stop job (see _cancel_engine_job_if_any) -- Target is never
-    deferred, so nothing to cancel on that side.
+    deferred, so nothing to cancel on that side. Both Set and Reset (both sub-cards)
+    explicitly log the exact value into the shared Trade Event Log.
 
     NOTE: this card's warnings read the option's own premium (trade['main']['current_price']),
     never the index, so they are already correct and unaffected by Futures Mode -- no change
@@ -703,6 +716,7 @@ def premium_exit_card(side):
                         params[f'{sd}_prem_stop_active'] = True
                         ss.set_text(f"ON: {value}")
                         ui.notify(f"{sd} Prem Stop SET", type='positive')
+                        _log_alert_action(f"⚙️ {sd} Prem Stop SET: {value}")
                     def activate():
                         try:
                             value = float(draft['stop'])
@@ -730,6 +744,7 @@ def premium_exit_card(side):
                         params[f'{sd}_prem_stop_val'] = 0
                         draft['stop'] = 0
                         ui.notify(f"{sd} Prem Stop RESET", type='info')
+                        _log_alert_action(f"⚙️ {sd} Prem Stop RESET")
                     return activate, reset
                 act_s, rst_s = make_stop_handlers(s, stop_status)
                 with ui.row().classes('w-full gap-1 mt-1'):
@@ -751,6 +766,7 @@ def premium_exit_card(side):
                         params[f'{sd}_prem_tgt_active'] = True
                         ts.set_text(f"ON: {value}")
                         ui.notify(f"{sd} Prem Target SET", type='positive')
+                        _log_alert_action(f"⚙️ {sd} Prem Target SET: {value}")
                     def activate():
                         try:
                             value = float(draft['target'])
@@ -777,6 +793,7 @@ def premium_exit_card(side):
                         params[f'{sd}_prem_target_val'] = 0
                         draft['target'] = 0
                         ui.notify(f"{sd} Prem Target RESET", type='info')
+                        _log_alert_action(f"⚙️ {sd} Prem Target RESET")
                     return activate, reset
                 act_t, rst_t = make_tgt_handlers(s, tgt_status)
                 with ui.row().classes('w-full gap-1 mt-1'):
@@ -786,11 +803,11 @@ def premium_exit_card(side):
 def _log_alert_action(message):
     """Writes an entry into the shared Trade Event Log (shared_state['activity_log']) -- the
     exact same store LogicEngine.log_action() writes to in logic_engine.py, using the same
-    '[HH:MM:SS] message' format and 100-entry cap -- so alert add/modify/cancel, and Global
-    Stop/Target Set/Reset (see global_control_card), show up alongside trade opens/closes/
-    fires in one unified log. Defined here rather than calling into LogicEngine since these
-    UI handlers have no LogicEngine instance available; writing directly to shared_state
-    keeps a single source of truth for the log's storage."""
+    '[HH:MM:SS] message' format and 100-entry cap -- so alert add/modify/cancel, and every
+    Set/Reset/Activate action across every card in this file, show up alongside trade opens/
+    closes/fires in one unified log. Defined here rather than calling into LogicEngine since
+    these UI handlers have no LogicEngine instance available; writing directly to
+    shared_state keeps a single source of truth for the log's storage."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     shared_state['activity_log'].insert(0, f"[{timestamp}] {message}")
     shared_state['activity_log'] = shared_state['activity_log'][:100]
@@ -1122,6 +1139,9 @@ def _position_row(side, on_close=None):
     5. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
        Close -> auto_run.clear_leg_fields(), or the separate 'Exit based on Index' card
        sharing this same params key) without reintroducing the mid-typing bug.
+    6. Every value committed by a switch turning ON is explicitly logged into the shared
+       Trade Event Log (via _log_alert_action), same as every other Set/Activate action in
+       the app.
 
     No _no_position_warning check here (unlike auto_close_card/index_exit_component/
     premium_exit_card): this whole row only exists/renders while a trade IS open on this
@@ -1160,6 +1180,7 @@ def _position_row(side, on_close=None):
                 stop_switch.set_value(False)
                 return
             params[stop_val_key] = value
+            _log_alert_action(f"⚙️ {side} Idx Stop SET (quick control): {value}")
         _finalize()
 
     def _toggle_tgt(e):
@@ -1179,6 +1200,7 @@ def _position_row(side, on_close=None):
                 tgt_switch.set_value(False)
                 return
             params[tgt_val_key] = value
+            _log_alert_action(f"⚙️ {side} Idx Target SET (quick control): {value}")
         _finalize()
 
     with ui.card().classes('w-full bg-white border-l-4 border-gray-300 border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
@@ -1345,6 +1367,7 @@ def _orderbook_table_row(side, prefix):
                     # now, matching fresh-arm behavior (see unified_entry_card.fire_or_arm).
                     params[f'{prefix}_armed_at'] = datetime.now()
                     ui.notify(f"{side} Order Updated", type='positive')
+                    _log_alert_action(f"⚙️ {side} Order Updated: {draft['order_type']} @ {draft['trigger_price']} ({draft['fire_on']})")
                     exp.value = False
 
                 def discard_changes():
@@ -1445,6 +1468,7 @@ def _exit_order_row(side, order_label, value_key, active_key, time_key=None, is_
                     params[value_key] = draft['value']
                     if time_key: params[time_key] = draft['time']
                     ui.notify(f"{side} {order_label} Updated", type='positive')
+                    _log_alert_action(f"⚙️ {side} {order_label} Updated: {draft['value']}")
                     exp.value = False
 
                 with ui.row().classes('w-full gap-2'):

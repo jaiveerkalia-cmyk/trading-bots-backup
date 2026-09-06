@@ -8,15 +8,27 @@ candle-close-based, has its condition confirmed true at the moment its candle cl
 logic_engine.py hands the action off to this engine INSTEAD of executing it immediately.
 This engine then:
 
-  1. Waits a short delay after the candle boundary, then fetches that just-closed candle
-     via KiteConnect's historical API (index candle for entries/index-stops -- or its
-     near-month future's candle when Futures Mode is on, see config.get_eval_token(); the
-     option's OWN premium candle, via its instrument token, for premium-stops -- always
-     unaffected by Futures Mode, since it's already the option's own price). Exact-timestamp
-     matching, never the still-forming candle, with a 30s retry-then-give-up cap -- the
-     same reliability pattern pattern_engine.py uses, but implemented independently here so
-     nothing in that file is touched or shared (avoids any risk of interfering with pattern
-     detection's own state).
+  1. Waits params['enter_via_stop_fetch_delay_sec'] seconds (default 5; config.py) after the
+     candle boundary, then fetches that just-closed candle via KiteConnect's historical API
+     (index candle for entries/index-stops -- or its near-month future's candle when Futures
+     Mode is on, see config.get_eval_token(); the option's OWN premium candle, via its
+     instrument token, for premium-stops -- always unaffected by Futures Mode, since it's
+     already the option's own price). Exact-timestamp matching, never the still-forming
+     candle, with a 30s retry-then-give-up cap -- the same reliability pattern
+     pattern_engine.py uses, but implemented independently here so nothing in that file is
+     touched or shared (avoids any risk of interfering with pattern detection's own state).
+
+     Candle window is computed EXPLICITLY, not inferred: job['boundary_time'] is the exact
+     minute the deferring condition was confirmed true (e.g. 10:50:00 for a condition
+     confirmed at 10:50:0x), and the target candle window is
+     [boundary_time - interval, boundary_time) -- e.g. for a 5m interval at boundary 10:50:00,
+     that is exactly [10:45:00, 10:50:00), i.e. the 10:45 candle that JUST closed. This is
+     computed once at deferral time (see defer_entry/defer_index_stop/defer_premium_stop
+     below) and never recomputed from "now" during the fetch/retry loop, so a slow retry
+     can never accidentally drift onto a later candle. _try_fetch logs the exact window
+     matched (job['boundary_time'] and the resolved candle start/end) the moment a candle is
+     found, so the exact window checked is always visible in the Trade Event Log, not just
+     correct in code.
   2. Computes a real Stop-Market trigger 1 tick beyond that candle's high or low, mirroring
      the direction of the ORIGINAL condition's breakout: a downside cross -> stop below the
      candle's low; an upside cross -> stop above the candle's high. Index-level tick = 0.5;
@@ -36,11 +48,11 @@ it's first deferred (mirroring what the original code already did on successful 
 so there's no double-firing while the candle is being fetched.
 
 Jobs only exist in the brief 'awaiting_fetch' window (a few seconds, gated by
-FETCH_DELAY_SEC) between deferral and hand-off. If the user cancels/resets/modifies the
-ORIGINAL order (or the underlying position closes/opens via another route) during that
-window, cancel_pending()/the re-arm guard in _handoff() ensure the pending job never
-resurrects or clobbers it. If candle data never arrives within the retry window, the job is
-dropped with a log entry and no trade is taken.
+params['enter_via_stop_fetch_delay_sec']) between deferral and hand-off. If the user
+cancels/resets/modifies the ORIGINAL order (or the underlying position closes/opens via
+another route) during that window, cancel_pending()/the re-arm guard in _handoff() ensure
+the pending job never resurrects or clobbers it. If candle data never arrives within the
+retry window, the job is dropped with a log entry and no trade is taken.
 
 cancel_all() lets an external "kill everything" event (global stop/target, close all,
 Futures Mode being toggled mid-flight, etc) explicitly drop every pending job immediately,
@@ -66,7 +78,6 @@ INTERVAL_KITE = {
     '60m': '60minute',
 }
 
-FETCH_DELAY_SEC = 3
 MAX_RETRY_SECONDS = 30
 INDEX_TICK = 0.5
 PREMIUM_TICK = 0.05
@@ -77,6 +88,19 @@ def _to_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _fetch_delay_sec():
+    """Reads params['enter_via_stop_fetch_delay_sec'] fresh on every call (rather than
+    caching it once), so a change to the setting takes effect immediately for any job
+    that hasn't fetched yet -- consistent with every other params-driven setting in this
+    codebase. Falls back to 5 (the configured default in config.py) if the value is ever
+    missing or non-numeric."""
+    try:
+        val = float(params.get('enter_via_stop_fetch_delay_sec', 5))
+        return val if val >= 0 else 5.0
+    except (TypeError, ValueError):
+        return 5.0
 
 
 class StopViaCandleEngine:
@@ -102,8 +126,9 @@ class StopViaCandleEngine:
         }
         self._next_id += 1
         self.jobs.append(job)
+        candle_start = job['boundary_time'] - INTERVAL_DELTA[interval]
         self.logic_engine.log_action(
-            f"🕯️ ENTER VIA STOP: {side} entry deferred ({interval}) - waiting for candle close",
+            f"🕯️ ENTER VIA STOP: {side} entry deferred ({interval}) - will check {candle_start.strftime('%H:%M')}-{job['boundary_time'].strftime('%H:%M')} candle after {_fetch_delay_sec():.0f}s",
             reason
         )
 
@@ -116,8 +141,9 @@ class StopViaCandleEngine:
         }
         self._next_id += 1
         self.jobs.append(job)
+        candle_start = job['boundary_time'] - INTERVAL_DELTA[interval]
         self.logic_engine.log_action(
-            f"🕯️ ENTER VIA STOP: {side} Idx Stop deferred ({interval}) - waiting for candle close",
+            f"🕯️ ENTER VIA STOP: {side} Idx Stop deferred ({interval}) - will check {candle_start.strftime('%H:%M')}-{job['boundary_time'].strftime('%H:%M')} candle after {_fetch_delay_sec():.0f}s",
             reason
         )
 
@@ -131,8 +157,9 @@ class StopViaCandleEngine:
         }
         self._next_id += 1
         self.jobs.append(job)
+        candle_start = job['boundary_time'] - INTERVAL_DELTA[interval]
         self.logic_engine.log_action(
-            f"🕯️ ENTER VIA STOP: {side} Prem Stop deferred ({interval}) - waiting for candle close",
+            f"🕯️ ENTER VIA STOP: {side} Prem Stop deferred ({interval}) - will check {candle_start.strftime('%H:%M')}-{job['boundary_time'].strftime('%H:%M')} candle after {_fetch_delay_sec():.0f}s",
             reason
         )
 
@@ -181,13 +208,19 @@ class StopViaCandleEngine:
 
     # ------------------------------------------------------------------
     def _try_fetch(self, job, now):
-        fetch_after = job['boundary_time'] + timedelta(seconds=FETCH_DELAY_SEC)
+        fetch_after = job['boundary_time'] + timedelta(seconds=_fetch_delay_sec())
         if now < fetch_after:
             return
         if job['first_attempt_at'] is None:
             job['first_attempt_at'] = now
 
         interval = job['interval']
+        # EXPLICIT candle window, fixed at deferral time (job['boundary_time']) and NEVER
+        # recomputed from "now" -- e.g. boundary_time=10:50:00, interval=5m ->
+        # last_candle_start=10:45:00, so the window checked is exactly [10:45:00, 10:50:00),
+        # the 5m candle that had JUST closed when the condition was confirmed. A slow retry
+        # (candle not immediately available) still targets this exact same window on every
+        # subsequent attempt, never a later one.
         last_candle_start = job['boundary_time'] - INTERVAL_DELTA[interval]
 
         try:
@@ -243,6 +276,16 @@ class StopViaCandleEngine:
         if high is None or low is None:
             self._maybe_give_up(job, now, "candle missing high/low")
             return
+
+        # Explicit confirmation of exactly which candle window was matched and used --
+        # verifiable in the Trade Event Log independent of the code, e.g. for a 5m job
+        # deferred at 10:50, this logs "checked 10:45-10:50 candle" so the exact window can
+        # be confirmed after the fact matches what was intended.
+        self.logic_engine.log_action(
+            f"🕯️ ENTER VIA STOP: {job['side']} {job['kind']} matched {interval} candle "
+            f"{last_candle_start.strftime('%H:%M')}-{job['boundary_time'].strftime('%H:%M')} "
+            f"(H:{high} L:{low})"
+        )
 
         tick = PREMIUM_TICK if job['kind'] == 'premium_stop' else INDEX_TICK
         trigger_price = (low - tick) if job['is_downside'] else (high + tick)
