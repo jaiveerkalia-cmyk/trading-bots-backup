@@ -20,7 +20,7 @@ INDICES = {
 
 # --- SETTINGS ---
 FORCE_EXIT_TIME = dtime(23, 59)
-AUTO_SQUAREOFF_TIME = dtime(15, 19)
+AUTO_SQUAREOFF_TIME = dtime(15, 25)
 
 # --- ALERT SOUND LIBRARY ---
 ALERT_SOUND_URLS = {
@@ -279,7 +279,7 @@ params = {
     # --- Candlestick Pattern Indicators (pattern_engine.py) ---
     # Seconds to wait AFTER a candle boundary closes before fetching it via historical API
     # (gives the broker's candle data time to finalize). Applies to all patterns/intervals.
-    'pattern_fetch_delay_sec': 3,
+    'pattern_fetch_delay_sec': 5,
 
     # Bullish Engulfing: prev (base) candle red, current/synthetic candle green, and the
     # synthetic candle's body fully engulfs the base candle's body.

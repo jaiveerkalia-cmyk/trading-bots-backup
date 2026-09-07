@@ -33,15 +33,23 @@ This engine then:
      the direction of the ORIGINAL condition's breakout: a downside cross -> stop below the
      candle's low; an upside cross -> stop above the candle's high. Index-level tick = 0.5;
      premium-level tick = 0.05.
-  3. HANDS OFF immediately: writes that new trigger straight into the SAME params the
-     original order/stop used (Unified Entry trigger_price/order_type/fire_on, or Index/
-     Premium Stop val/time), re-arms/re-activates it there, and drops its own internal job.
-     From that moment on the order is a completely normal, live ('Live'/'Current') armed
-     order -- monitored and fired by the EXISTING logic_engine.py paths
-     (_check_unified_open / _check_exits), and visible/editable/cancelable through the
-     EXACT SAME UI (Open Short/Long card, Order Book) as any manually-armed order. This
-     engine does not live-monitor or fire anything itself once handed off -- there is
-     nothing left here to duplicate that.
+  3. HANDS OFF: checks the CURRENT live price/premium against that just-computed trigger
+     FIRST (see _handoff below). If price has ALREADY crossed the trigger by the time
+     hand-off happens (e.g. it moved further during the fetch_delay_sec wait, or while the
+     candle fetch/retry was in progress), the trigger is stale the instant it would be
+     armed -- arming it as a Stop-Market order at that point would just sit there and fire
+     on the very next tick anyway, so instead this fires the equivalent MARKET action
+     immediately: an 'entry' job opens the position at market (open_position(), same as
+     clicking 'Open Now'/Market); an 'index_stop'/'premium_stop' job closes the position at
+     market (close_position(), same as any other stop firing). Only when price has NOT yet
+     crossed the trigger does this fall through to the original behavior: writing that new
+     trigger straight into the SAME params the original order/stop used (Unified Entry
+     trigger_price/order_type/fire_on, or Index/Premium Stop val/time), re-arming/
+     re-activating it there as a normal, live ('Live'/'Current') armed order -- monitored and
+     fired by the EXISTING logic_engine.py paths (_check_unified_open / _check_exits), and
+     visible/editable/cancelable through the EXACT SAME UI (Open Short/Long card, Order
+     Book) as any manually-armed order. Either way this engine drops its own job at hand-off
+     and does not live-monitor or fire anything itself afterward.
 
 Deferring is a one-shot hand-off: the original order/stop is disarmed/disabled at the moment
 it's first deferred (mirroring what the original code already did on successful execution),
@@ -62,7 +70,7 @@ auto_run.py's Futures Mode toggle handler for the main callers.
 
 from datetime import datetime, timedelta
 
-from config import shared_state, params, INDICES, get_eval_token
+from config import shared_state, params, INDICES, get_eval_token, get_eval_price
 
 INTERVAL_DELTA = {
     '1m': timedelta(minutes=1),
@@ -302,6 +310,32 @@ class StopViaCandleEngine:
             job['status'] = 'dropped'
 
     # ------------------------------------------------------------------
+    def _current_price_for_job(self, job):
+        """Returns the CURRENT live price to compare against the just-computed trigger at
+        hand-off time: for 'entry'/'index_stop' jobs, the Futures-Mode-aware index/future
+        eval price (config.get_eval_price -- identical basis to what the ORIGINAL condition
+        was evaluated against); for 'premium_stop' jobs, the option's own current premium
+        (shared_state['option_chain'], the same source logic_engine._check_exits reads).
+        Returns 0 (never breached) if no live price is available yet, so a missing tick can
+        never accidentally trigger a market fire."""
+        if job['kind'] == 'premium_stop':
+            return shared_state['option_chain'].get(job['token'], {}).get('ltp', 0) or 0
+        return get_eval_price(job['index_name']) or 0
+
+    def _already_breached(self, job, trigger_price, current_price):
+        """True if `current_price` has ALREADY crossed `trigger_price` in the breakout
+        direction this job's condition was confirmed for -- i.e. arming this as a Stop-Market
+        order would be stale on arrival (price already moved past where the stop should have
+        sat). Mirrors the exact downside/upside sense used to compute trigger_price itself
+        (job['is_downside']): downside -> trigger sits BELOW the candle low, so already
+        breached means current_price is AT or BELOW it; upside -> trigger sits ABOVE the
+        candle high, so already breached means current_price is AT or ABOVE it. current_price
+        <= 0 (no live tick yet) is never considered breached."""
+        if current_price <= 0:
+            return False
+        return (current_price <= trigger_price) if job['is_downside'] else (current_price >= trigger_price)
+
+    # ------------------------------------------------------------------
     def _handoff(self, job, trigger_price):
         """Writes the newly-computed trigger straight into the same params the original
         order/stop used, re-arming/re-activating it there as a normal LIVE order -- from
@@ -310,13 +344,29 @@ class StopViaCandleEngine:
         order the person sees/edits/cancels in the Open Short/Long card and Order Book (no
         separate 'deferred order' UI surface needed).
 
+        BEFORE doing that, checks whether the current live price/premium has ALREADY crossed
+        trigger_price (see _already_breached) -- i.e. the trigger is stale the instant it
+        would be armed, most commonly because price kept moving during the
+        fetch_delay_sec wait or a slow candle-fetch retry. In that case, arming a Stop-Market
+        order that's already breached is pointless (it would just fire on the very next
+        polling tick anyway) and introduces an unnecessary extra tick of latency -- so this
+        fires the equivalent MARKET action immediately instead: open_position() for an
+        'entry' job (same as clicking 'Open Now'/Market, using the job's saved qty/
+        strike_offset/new_stop/new_target), or close_position() for an 'index_stop'/
+        'premium_stop' job (same as any other stop firing). Only when price has NOT yet
+        crossed the trigger does this arm it live as originally designed.
+
         Guarded against a race with the UI: if the person has ALREADY manually re-armed/
         re-activated this exact side+kind in the moments since it was disarmed at deferral
         time (e.g. re-armed the card by hand while the candle was being fetched), that manual
-        action wins -- the hand-off is skipped rather than silently overwriting it."""
+        action wins -- the hand-off (whether market-fire or arm) is skipped rather than
+        silently overwriting it."""
         side = job['side']
         kind = job['kind']
         direction_txt = 'below candle low' if job['is_downside'] else 'above candle high'
+
+        current_price = self._current_price_for_job(job)
+        breached = self._already_breached(job, trigger_price, current_price)
 
         if kind == 'entry':
             prefix = job['prefix']
@@ -325,6 +375,35 @@ class StopViaCandleEngine:
                     f"ℹ️ ENTER VIA STOP: {side} entry hand-off skipped - order was re-armed manually"
                 )
                 return
+
+            if breached:
+                self.logic_engine.log_action(
+                    f"⚡ ENTER VIA STOP: {side} price already past trigger ({current_price:.2f} vs {trigger_price:.2f}) - firing MARKET now",
+                    job['reason']
+                )
+                success, msg = self.logic_engine.open_position(
+                    side, reason=f"Enter via Stop (Market - price moved past trigger)",
+                    qty_override=job['qty'], strike_offset=job['strike_offset']
+                )
+                if success:
+                    try:
+                        new_stop = float(job['new_stop'])
+                        if new_stop > 0:
+                            params[f'{prefix}_stop_val'] = new_stop
+                            params[f'{prefix}_stop_active'] = True
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        new_target = float(job['new_target'])
+                        if new_target > 0:
+                            params[f'{prefix}_target_val'] = new_target
+                            params[f'{prefix}_target_active'] = True
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    self.logic_engine.log_action(f"⚠️ ENTER VIA STOP: {side} market fire failed: {msg}")
+                return
+
             params[f'{prefix}_order_type'] = 'Stop-Market'
             params[f'{prefix}_trigger_price'] = trigger_price
             params[f'{prefix}_fire_on'] = 'Live'
@@ -346,6 +425,15 @@ class StopViaCandleEngine:
                     f"ℹ️ ENTER VIA STOP: {side} Idx Stop hand-off skipped - stop was re-activated manually"
                 )
                 return
+
+            if breached:
+                self.logic_engine.log_action(
+                    f"⚡ ENTER VIA STOP: {side} index already past trigger ({current_price:.2f} vs {trigger_price:.2f}) - firing MARKET close now",
+                    job['reason']
+                )
+                self.logic_engine.close_position(side, "Enter via Stop (Market - price moved past trigger)")
+                return
+
             params[f'{side.lower()}_index_stop_val'] = trigger_price
             params[f'{side.lower()}_index_stop_time'] = 'Current'
             params[active_key] = True
@@ -361,6 +449,15 @@ class StopViaCandleEngine:
                     f"ℹ️ ENTER VIA STOP: {side} Prem Stop hand-off skipped - stop was re-activated manually"
                 )
                 return
+
+            if breached:
+                self.logic_engine.log_action(
+                    f"⚡ ENTER VIA STOP: {side} premium already past trigger ({current_price:.2f} vs {trigger_price:.2f}) - firing MARKET close now",
+                    job['reason']
+                )
+                self.logic_engine.close_position(side, "Enter via Stop (Market - price moved past trigger)")
+                return
+
             params[f'{side.lower()}_prem_stop_val'] = trigger_price
             params[f'{side.lower()}_prem_stop_time'] = 'Current'
             params[active_key] = True

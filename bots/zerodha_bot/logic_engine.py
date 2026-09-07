@@ -204,7 +204,16 @@ class LogicEngine:
             if main_token not in shared_state['option_chain']:
                 shared_state['option_chain'][main_token] = {'ltp': 0.0, 'symbol': main_symbol}
 
-            m_pr = shared_state['option_chain'][main_token]['ltp']
+            # Realistic fill price via live market depth (kite.quote()), quantity-weighted
+            # across the book -- used for BOTH live and paper trading, so paper-trade PnL
+            # reflects what a real market order of this size would actually get filled at,
+            # not an idealized LTP. main_is_buy: True when Options Buy Mode BUYS the main leg
+            # (opens long), False when Sell Mode SELLS it (opens short) -- a market order
+            # walks the OPPOSITE side of the book from the direction being traded (a BUY
+            # fills against the ask/depth['sell'] ladder, a SELL against the bid/
+            # depth['buy'] ladder -- see instrument_manager.get_fill_price docstring).
+            m_ltp = shared_state['option_chain'][main_token]['ltp']
+            m_pr, m_used_depth = self.inst_manager.get_fill_price(main_token, main_symbol, segment, qty, is_buy=buy_mode)
             trade_id = str(uuid.uuid4())[:8]
             trade = {
                 'id': trade_id, 'type': opt_type, 'direction': 'BUY' if buy_mode else 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
@@ -216,7 +225,8 @@ class LogicEngine:
             shared_state['active_trades'][side] = trade
             self.csv_manager.log_open(trade_id, trade)
             mode_label = "BUY (Hedgeless)" if buy_mode else "HEDGELESS"
-            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | {mode_label}"
+            depth_note = f" [depth, LTP was {m_ltp:.2f}]" if (m_used_depth and abs(m_pr - m_ltp) > 0.001) else ""
+            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}{depth_note}) | {mode_label}"
             self.log_action(f"OPENED {side} {mode_label} ({reason})", dtls)
             self.play_sound('open')
             self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
@@ -238,8 +248,14 @@ class LogicEngine:
             for t, s in [(main_token, main_symbol), (hedge_token, hedge_symbol)]:
                 if t not in shared_state['option_chain']: shared_state['option_chain'][t] = {'ltp': 0.0, 'symbol': s}
 
-            m_pr = shared_state['option_chain'][main_token]['ltp']
-            h_pr = shared_state['option_chain'][hedge_token]['ltp']
+            # Main leg is SOLD (is_buy=False -> fills against the bid/depth['buy'] ladder);
+            # hedge leg is always BOUGHT (is_buy=True -> fills against the ask/depth['sell']
+            # ladder) -- same realistic depth-based fill logic as the hedgeless branch above,
+            # for both live and paper trading.
+            m_ltp = shared_state['option_chain'][main_token]['ltp']
+            h_ltp = shared_state['option_chain'][hedge_token]['ltp']
+            m_pr, m_used_depth = self.inst_manager.get_fill_price(main_token, main_symbol, segment, qty, is_buy=False)
+            h_pr, h_used_depth = self.inst_manager.get_fill_price(hedge_token, hedge_symbol, segment, qty, is_buy=True)
 
             trade_id = str(uuid.uuid4())[:8]
             trade = {
@@ -251,7 +267,9 @@ class LogicEngine:
             }
             shared_state['active_trades'][side] = trade
             self.csv_manager.log_open(trade_id, trade)
-            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}) | H: {hedge_strike} ({h_pr:.2f})"
+            m_note = f" [depth, LTP was {m_ltp:.2f}]" if (m_used_depth and abs(m_pr - m_ltp) > 0.001) else ""
+            h_note = f" [depth, LTP was {h_ltp:.2f}]" if (h_used_depth and abs(h_pr - h_ltp) > 0.001) else ""
+            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}{m_note}) | H: {hedge_strike} ({h_pr:.2f}{h_note})"
             self.log_action(f"OPENED {side} ({reason})", dtls)
             self.play_sound('open')
             self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
@@ -279,7 +297,12 @@ class LogicEngine:
                 if not self._place_live_order(h['symbol'], kite.TRANSACTION_TYPE_SELL, trade['qty'], kite.PRODUCT_MIS, segment):
                     self.log_action("⚠️ Hedge Exit Fail"); self.play_sound('error')
 
-        m_curr = shared_state['option_chain'].get(m['token'], {}).get('ltp', 0)
+        # Realistic fill price via live market depth on CLOSE too -- both live and paper
+        # trading. Closing the main leg trades in the OPPOSITE direction from how it was
+        # opened: a BUY-mode (long) position is SOLD to close (is_buy=False -> bid ladder); a
+        # SELL-mode (short) position is BOUGHT-to-cover to close (is_buy=True -> ask ladder).
+        m_ltp = shared_state['option_chain'].get(m['token'], {}).get('ltp', 0)
+        m_curr, m_used_depth = self.inst_manager.get_fill_price(m['token'], m['symbol'], segment, trade['qty'], is_buy=(not is_buy))
         m_entry = m['entry_price'] if m['entry_price'] > 0 else m_curr
         # Index price shown/logged on close is Futures-Mode-aware (index_entry_price on this
         # trade was already recorded the same way at open, in open_position() above), never
@@ -287,13 +310,16 @@ class LogicEngine:
         idx_curr = get_eval_price(params['trading_index'])
 
         if h:
-            h_curr = shared_state['option_chain'].get(h['token'], {}).get('ltp', 0)
+            # Hedge is always CLOSED by selling it (it was bought at entry regardless of
+            # mode -- see open_position) -> is_buy=False, bid ladder.
+            h_ltp = shared_state['option_chain'].get(h['token'], {}).get('ltp', 0)
+            h_curr, h_used_depth = self.inst_manager.get_fill_price(h['token'], h['symbol'], segment, trade['qty'], is_buy=False)
             h_entry = h['entry_price'] if h['entry_price'] > 0 else h_curr
             net_pnl = ((m_entry - m_curr) * trade['qty']) + ((h_curr - h_entry) * trade['qty'])
             net_pnl -= (self.commission(trade['qty'], m_curr, m_entry) + self.commission(trade['qty'], h_curr, h_entry))
             h_exit_price = h_curr
         else:
-            h_curr = 0; h_entry = 0; h_exit_price = 0
+            h_curr = 0; h_entry = 0; h_exit_price = 0; h_ltp = 0; h_used_depth = False
             if is_buy:
                 # Bought main, now selling to close: profit as price rises.
                 net_pnl = (m_curr - m_entry) * trade['qty']
@@ -308,7 +334,9 @@ class LogicEngine:
         self.csv_manager.log_close(trade['id'], {'main_price': m_curr, 'hedge_price': h_exit_price, 'index_price': idx_curr}, round(net_pnl, 2))
         shared_state['active_trades'][side] = None
 
-        dtls = f"Idx: {idx_curr:.2f} | PnL: {net_pnl:.0f} | M_Ex: {m_curr:.2f}" + (f" | H_Ex: {h_curr:.2f}" if h else " | HEDGELESS")
+        m_note = f" [depth, LTP was {m_ltp:.2f}]" if (m_used_depth and abs(m_curr - m_ltp) > 0.001) else ""
+        h_note = f" [depth, LTP was {h_ltp:.2f}]" if (h and h_used_depth and abs(h_curr - h_ltp) > 0.001) else ""
+        dtls = f"Idx: {idx_curr:.2f} | PnL: {net_pnl:.0f} | M_Ex: {m_curr:.2f}{m_note}" + (f" | H_Ex: {h_curr:.2f}{h_note}" if h else " | HEDGELESS")
         self.log_action(f"CLOSED {side} ({reason})", dtls)
         self.play_sound('close')
         self.add_chart_marker(f"Close {side}", shared_state['pnl']['realized'])
@@ -391,7 +419,18 @@ class LogicEngine:
         Futures Mode: trade['index_current_price'] (index-linked reference/display field
         only, never part of the premium PnL math above/below) uses get_eval_price() so it
         tracks the near-month future when the mode is on, exactly like index_entry_price was
-        recorded at open in open_position()."""
+        recorded at open in open_position().
+
+        NOTE: this method deliberately stays LTP-based (shared_state['option_chain'][...]
+        ['ltp'], populated by the ticker) rather than calling
+        instrument_manager.get_fill_price() -- it runs every single tick (about once a
+        second) for every open position, and hitting kite.quote() that often would burn
+        through Kite's REST rate limit for no real benefit, since this is a continuous
+        DISPLAY estimate of unrealized PnL, not an actual fill event. Realistic
+        depth-based fill prices are used at the actual moment of a fill instead -- see
+        open_position()/close_position() above, both for live AND paper trading -- so the
+        REALIZED PnL recorded when a position actually closes reflects a real market fill,
+        even though the live ticking number in between is an LTP-based approximation."""
         unrealized = 0.0
         idx_eval = get_eval_price(params['trading_index'])
         for side in ['Call', 'Put']:

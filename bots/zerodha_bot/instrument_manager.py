@@ -195,3 +195,83 @@ class InstrumentManager:
 
         except Exception as e:
             return None, str(e)
+
+    def get_fill_price(self, token, symbol, segment, qty, is_buy):
+        """
+        Realistic fill-price estimation using LIVE MARKET DEPTH via kite.quote(), instead
+        of the last traded price (LTP) alone. Used at every actual fill EVENT (open/close,
+        both legs) -- LIVE trading and PAPER/simulated trading alike, since paper trading
+        should mirror what a real market order would actually get filled at, not an
+        idealized LTP price. NOT used for the live/unrealized PnL ticking every second in
+        LogicEngine.update_pnl() -- that stays LTP-based on purpose, both because it is a
+        continuous DISPLAY estimate rather than a fill event, and because polling
+        kite.quote() every tick for every open position would burn through Kite's REST
+        rate limit for no real benefit between actual fills.
+
+        Mechanics: a market order walks the OPPOSITE side of the book from the direction
+        you're trading -- a BUY order fills against the SELL/ask ladder (depth['sell']),
+        a SELL order fills against the BUY/bid ladder (depth['buy']). Each depth level has
+        its own 'price' and 'quantity'; this walks the ladder top-down, consuming quantity
+        level by level, until `qty` total is filled, and returns the QUANTITY-WEIGHTED
+        AVERAGE price across every level actually consumed (not just the best price) --
+        this is what materially differs from an LTP-only fill and is what makes the
+        estimate "realistic" for a real market order of this size, including any slippage
+        from walking through multiple price levels on a large order or thin book.
+
+        Falls back to LTP (quote['last_price']) whenever depth is unavailable, empty, or
+        the fetch itself fails for any reason (e.g. illiquid/no-quotes strike, API hiccup,
+        market closed) -- a fill price is ALWAYS returned, this never blocks or fails a
+        trade. Returns (fill_price, used_depth: bool) so callers can log which path was
+        used, and (0.0, False) only in the pathological case where even LTP is unavailable
+        (token has genuinely never ticked) -- callers already treat a 0 price the same way
+        the old LTP-only read did (see open_position/close_position: '0.00' fill,
+        commission math naturally comes out to 0 too since turnover is 0).
+        """
+        try:
+            quote_key = f"{segment}:{symbol}"
+            quote = self.kite.quote(quote_key)
+            data = quote.get(quote_key, {})
+            ltp = float(data.get('last_price', 0) or 0)
+
+            depth = data.get('depth', {}) or {}
+            ladder = depth.get('sell', []) if is_buy else depth.get('buy', [])
+            ladder = [lvl for lvl in ladder if lvl.get('quantity', 0) > 0 and lvl.get('price', 0) > 0]
+
+            if not ladder:
+                return ltp, False
+
+            remaining = qty
+            filled_value = 0.0
+            filled_qty = 0
+            for level in ladder:
+                if remaining <= 0:
+                    break
+                level_qty = int(level.get('quantity', 0))
+                level_price = float(level.get('price', 0))
+                take = min(remaining, level_qty)
+                filled_value += take * level_price
+                filled_qty += take
+                remaining -= take
+
+            if remaining > 0:
+                # Book depth (up to 5 levels) didn't cover the full qty -- fill whatever's
+                # left at the worst (last) level's price, same as a real market order would
+                # walk off the visible book. Still fully quantity-weighted overall.
+                worst_price = float(ladder[-1].get('price', ltp))
+                filled_value += remaining * worst_price
+                filled_qty += remaining
+
+            if filled_qty <= 0:
+                return ltp, False
+
+            avg_fill = filled_value / filled_qty
+            return avg_fill, True
+
+        except Exception:
+            # Fall back to whatever LTP we might already have in shared_state (set by the
+            # ticker) if the quote() call itself failed outright -- still never blocks a fill.
+            try:
+                cached_ltp = shared_state.get('option_chain', {}).get(token, {}).get('ltp', 0)
+                return float(cached_ltp or 0), False
+            except Exception:
+                return 0.0, False
