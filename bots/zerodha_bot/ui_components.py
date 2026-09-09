@@ -1139,9 +1139,26 @@ def _position_row(side, on_close=None):
     5. _sync_draft_from_params keeps both value inputs in sync with EXTERNAL resets (e.g.
        Close -> auto_run.clear_leg_fields(), or the separate 'Exit based on Index' card
        sharing this same params key) without reintroducing the mid-typing bug.
-    6. Every value committed by a switch turning ON is explicitly logged into the shared
-       Trade Event Log (via _log_alert_action), same as every other Set/Activate action in
-       the app.
+    6. CRITICAL (fixes a real incident): the switch's on_change handler previously committed
+       whatever was in the draft into params EVERY time it fired with e.value == True --
+       including a spurious/duplicate re-fire while the switch was ALREADY on (e.g. NiceGUI's
+       periodic re-sync of a bound switch's value nudging on_change again, or any other
+       redundant re-trigger). If, in that brief window, the Enter via Stop engine
+       (stop_via_candle_engine.py) had ITSELF just written a fresh, correct trigger value
+       into this exact same params key (its hand-off flow, by design, also sets *_index_stop_
+       active=True), this handler would silently overwrite that freshly-computed value with
+       whatever STALE value happened to be sitting in the local draft dict from before -- the
+       position would then close against the wrong, stale level instead of the engine's
+       correct one. Fixed with an edge-detection guard: a NEW value is committed into params
+       ONLY on a genuine OFF-to-ON transition (params[*_active_key] was False and is now being
+       turned True) using a locally-tracked 'was_active' flag captured at handler-build time
+       and kept in sync with every externally-observed activation (including the engine's own
+       hand-off, via the same _sync_draft_from_params-style external-change detection). If the
+       switch fires while the field is ALREADY active, the handler treats it as a no-op re-fire
+       and does nothing, leaving whatever value is currently in params (manually set, or just
+       written by the engine) completely untouched. Every value actually committed by a
+       genuine user action is still explicitly logged into the shared Trade Event Log (via
+       _log_alert_action), same as every other Set/Activate action in the app.
 
     No _no_position_warning check here (unlike auto_close_card/index_exit_component/
     premium_exit_card): this whole row only exists/renders while a trade IS open on this
@@ -1158,12 +1175,27 @@ def _position_row(side, on_close=None):
     _sync_draft_from_params(stop_draft, 'value', stop_val_key)
     _sync_draft_from_params(tgt_draft, 'value', tgt_val_key)
 
+    # Edge-detection state for the off->on guard described in point 6 above. Captures
+    # whatever the active flag's value is RIGHT NOW at build time; _toggle_stop/_toggle_tgt
+    # below update it on every call so it always reflects the most recently OBSERVED state,
+    # including changes made externally (e.g. the engine's hand-off, or a Reset from the
+    # separate 'Exit based on Index' card sharing this same params key).
+    was_active = {'stop': params.get(stop_active_key, False), 'tgt': params.get(tgt_active_key, False)}
+
     # stop_switch/tgt_switch are assigned further below, but referenced here inside these
     # handlers -- safe, since Python closures resolve free variables at CALL time (when the
     # user actually clicks), by which point both switches already exist.
     def _toggle_stop(e):
+        currently_active = params.get(stop_active_key, False)
         if not e.value:
+            was_active['stop'] = False
             return  # turning off never needs a value check
+        if was_active['stop'] or currently_active:
+            # Re-fire while already active (spurious re-sync, or the engine's own hand-off
+            # just set this) -- NOT a genuine off->on click. Do nothing; whatever value is
+            # currently in params (possibly just written by the engine) is left untouched.
+            was_active['stop'] = True
+            return
         def _finalize(retried=False):
             try:
                 value = float(stop_draft['value'])
@@ -1177,15 +1209,22 @@ def _position_row(side, on_close=None):
                     return
                 ui.notify(f"Enter a valid {side} Idx Stop value first", type='negative')
                 params[stop_active_key] = False
+                was_active['stop'] = False
                 stop_switch.set_value(False)
                 return
             params[stop_val_key] = value
+            was_active['stop'] = True
             _log_alert_action(f"⚙️ {side} Idx Stop SET (quick control): {value}")
         _finalize()
 
     def _toggle_tgt(e):
+        currently_active = params.get(tgt_active_key, False)
         if not e.value:
+            was_active['tgt'] = False
             return  # turning off never needs a value check
+        if was_active['tgt'] or currently_active:
+            was_active['tgt'] = True
+            return
         def _finalize(retried=False):
             try:
                 value = float(tgt_draft['value'])
@@ -1197,11 +1236,23 @@ def _position_row(side, on_close=None):
                     return
                 ui.notify(f"Enter a valid {side} Idx Target value first", type='negative')
                 params[tgt_active_key] = False
+                was_active['tgt'] = False
                 tgt_switch.set_value(False)
                 return
             params[tgt_val_key] = value
+            was_active['tgt'] = True
             _log_alert_action(f"⚙️ {side} Idx Target SET (quick control): {value}")
         _finalize()
+
+    # Keeps was_active in sync with EXTERNAL changes to the active flags (e.g. the engine's
+    # hand-off setting *_index_stop_active=True directly, or Reset from elsewhere clearing
+    # it) -- same polling pattern as _sync_draft_from_params, so a later genuine user click
+    # is correctly recognized as off->on rather than being mistaken for a re-fire, and an
+    # externally-driven activation is never misread as one this row is responsible for.
+    def _sync_was_active():
+        was_active['stop'] = params.get(stop_active_key, False)
+        was_active['tgt'] = params.get(tgt_active_key, False)
+    ui.timer(1.0, _sync_was_active)
 
     with ui.card().classes('w-full bg-white border-l-4 border-gray-300 border border-gray-200 rounded-lg p-3 gap-2 shadow-sm') as row:
         ui_refs[f'{prefix}_pos_row'] = row
