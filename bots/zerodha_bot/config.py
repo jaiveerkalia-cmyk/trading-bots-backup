@@ -20,7 +20,18 @@ INDICES = {
 
 # --- SETTINGS ---
 FORCE_EXIT_TIME = dtime(23, 59)
-AUTO_SQUAREOFF_TIME = dtime(15, 25)
+
+# EOD_TIME: SINGLE SOURCE OF TRUTH for the bot's end-of-day routine -- the one moment every
+# day when all open positions/orders are closed, the daily PnL CSV (final_daily_pnl.csv) is
+# written, and every other EOD task (clearing per-side fields, cancelling pending Enter via
+# Stop jobs, clearing Active Alerts, etc) runs. Previously this was split across two
+# inconsistent constants: config.AUTO_SQUAREOFF_TIME (15:25, used only by logic_engine.py's
+# dead/unreachable fallback block) and auto_run.AutoConfig.SQ_OFF_TIME (15:19, the time the
+# LIVE EOD routine in auto_run.AutoController.run_loop() actually used). EOD_TIME replaces
+# BOTH with one value (15:19, matching the live behavior everyone actually experienced) --
+# every consumer (auto_run.py, logic_engine.py) now imports this single constant, so there is
+# exactly one place to change the EOD time.
+EOD_TIME = dtime(15, 25)
 
 # --- ALERT SOUND LIBRARY ---
 ALERT_SOUND_URLS = {
@@ -103,7 +114,7 @@ shared_state = {
     # this list (one-shot, same semantics as the old single-slot alert_upper_active/
     # alert_lower_active flags). Lives in shared_state (not params) since these are
     # dynamic runtime instances, matching the existing active_trades/option_chain pattern.
-    # ALSO fully cleared (regardless of fired/pending state) at the 15:19 EOD routine in
+    # ALSO fully cleared (regardless of fired/pending state) at the EOD_TIME routine in
     # auto_run.AutoController.run_loop() -- see that method's docstring/comments -- since a
     # price alert set during today's session has no business firing against tomorrow's
     # price action.

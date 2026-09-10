@@ -1,5 +1,5 @@
-from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE, FORCE_EXIT_TIME, AUTO_SQUAREOFF_TIME, get_eval_price
-from datetime import datetime, time as dtime
+from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE, FORCE_EXIT_TIME, EOD_TIME, get_eval_price
+from datetime import datetime, time as dtime, timedelta
 from nicegui import ui
 import pandas as pd
 import os
@@ -502,18 +502,21 @@ class LogicEngine:
         fire_15m = (curr_min % 15 == 0) and self.last_trigger_time['15m'] != curr_min
         fire_60m = (curr_min == 0) and self.last_trigger_time['60m'] != curr_min
 
-        # 15:19 Auto-Squareoff. NOTE: in the current wiring this branch is effectively
+        # EOD_TIME Auto-Squareoff. NOTE: in the current wiring this branch is effectively
         # unreachable in practice, since run_bot_logic() (auto_run.py) only calls
-        # check_triggers() while now.time() < AutoConfig.SQ_OFF_TIME -- the actual EOD save
-        # happens in AutoController.run_loop()'s own priority block instead. Kept here as a
-        # defensive fallback (e.g. if that gating is ever changed) and updated to share the
+        # check_triggers() while now.time() < config.EOD_TIME -- the actual EOD save happens
+        # in AutoController.run_loop()'s own priority block instead (also gated on
+        # config.EOD_TIME, the single source of truth for this time -- see config.py). Kept
+        # here as a defensive fallback (e.g. if that gating is ever changed) and shares the
         # SAME 'daily_pnl_written' flag as every other close_all_positions(save_pnl=True)
         # call, so that even if this branch ever does run, final_daily_pnl.csv still only
-        # gets written once per day, never twice.
-        if now.time() >= AUTO_SQUAREOFF_TIME and now.time() < dtime(15, 20) and not shared_state.get('daily_pnl_written', False):
-            self.close_all_positions("15:19 Auto-SQ", save_pnl=True)
+        # gets written once per day, never twice. Upper bound is EOD_TIME + 1 minute (rather
+        # than a separately hardcoded time) so this stays a narrow one-shot guard window
+        # regardless of what EOD_TIME is set to.
+        if now.time() >= EOD_TIME and now.time() < (datetime.combine(datetime.today(), EOD_TIME) + timedelta(minutes=1)).time() and not shared_state.get('daily_pnl_written', False):
+            self.close_all_positions("EOD Auto-SQ", save_pnl=True)
             shared_state['daily_pnl_written'] = True
-            self.log_action("⚠️ 15:19 Day End Executed")
+            self.log_action("⚠️ EOD Day End Executed")
 
         if shared_state['active_trades']['Call'] is None and params['short_trigger_active']:
             self._check_single_open('Call', 'short', idx_ltp, fire_1m, fire_5m)
@@ -937,7 +940,7 @@ class LogicEngine:
 
         # save_pnl=False on both: positions are still closed immediately here (that's a real
         # trading action, not deferred), but the daily PnL CSV write is intentionally NOT done
-        # here. It's written exactly once per day, at the 15:19 EOD routine in
+        # here. It's written exactly once per day, at the EOD_TIME routine in
         # AutoController.run_loop() (auto_run.py), which will correctly include whatever PnL
         # this event locked in, since close_position() already appended it to
         # shared_state['pnl']['trades_history'].

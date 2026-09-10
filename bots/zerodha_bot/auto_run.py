@@ -45,7 +45,7 @@ def safe_ui_context():
 
 # --- IMPORT EXISTING MODULES ---
 import config
-from config import shared_state, params, ui_refs, INDICES, UI_OPTS, ALERT_SOUND_URLS, get_eval_price, get_eval_token
+from config import shared_state, params, ui_refs, INDICES, UI_OPTS, ALERT_SOUND_URLS, EOD_TIME, get_eval_price, get_eval_token
 import ui_components as comp
 from auth_manager import get_kite_session
 from ticker_engine import TickerClient
@@ -60,8 +60,11 @@ from stop_via_candle_engine import StopViaCandleEngine
 
 class AutoConfig:
     START_TIME = dtime(11, 15, 5)
-    SQ_OFF_TIME = dtime(15, 19, 0)
-    
+    # EOD time is now the single source of truth in config.EOD_TIME (see config.py) -- the
+    # one moment every day when open positions/orders are closed, the daily PnL CSV is
+    # written, and every other EOD task runs. AutoConfig.SQ_OFF_TIME has been removed;
+    # every consumer below now reads config.EOD_TIME directly instead.
+
     BUF_NIFTY = 1.0
     BUF_SENSEX = 3.5
     STRIKE_OFFSET = 2
@@ -498,19 +501,23 @@ class AutoController:
         ts = now.strftime('%H:%M:%S')
 
         # 1. PRIORITY: GLOBAL EOD ROUTINE -- ALWAYS runs regardless of options_buy_mode. This
-        # is the fix for "15:19 final PnL write never happened in Buy Mode": this block used
+        # is the fix for "EOD final PnL write never happened in Buy Mode": this block used
         # to be skipped entirely because the options_buy_mode guard (which correctly blocks
         # Auto Pilot's sell-only strategy logic below) previously sat ABOVE this block and
         # returned before it could run. save_daily_report()/close_all_positions() themselves
         # are mode-agnostic (they only read trade PnL, which is already correct for both
         # modes via LogicEngine.update_pnl), so this routine is safe to run unconditionally.
-        if AutoConfig.SQ_OFF_TIME <= now.time() < dtime(15, 40):
+        # EOD_TIME (config.py) is the single source of truth for when this window starts; the
+        # window stays open until 15:40 purely to give the one-shot daily_pnl_written guard
+        # below a wide enough margin before self.state flips to DONE and this block stops
+        # running entirely for the day.
+        if EOD_TIME <= now.time() < dtime(15, 40):
             # Wipe all fields
             self.clear_leg_fields('Call')
             self.clear_leg_fields('Put')
             
             if not shared_state.get('daily_pnl_written', False):
-                self.log("⏰ 3:19 PM Day End Routine (Auto/Manual).")
+                self.log("⏰ EOD Day End Routine (Auto/Manual).")
                 try:
                     self.logic.close_all_positions("Day End Auto-Square", save_pnl=True)
                     shared_state['daily_pnl_written'] = True
@@ -521,7 +528,7 @@ class AutoController:
                 # against today's session; carrying them into tomorrow could fire against a
                 # completely different day's price action. Reuses the same once-per-day
                 # daily_pnl_written gate as the rest of this EOD routine, so it only runs
-                # once, not every tick during the [15:19, 15:40) window.
+                # once, not every tick during the [EOD_TIME, 15:40) window.
                 if shared_state.get('alerts'):
                     cleared_count = len(shared_state['alerts'])
                     shared_state['alerts'] = []
@@ -714,7 +721,7 @@ class AutoController:
                 self.state = 'DONE'
                 self.log("🛑 Global Stop Hit. Triggers DISARMED.")
                 # Positions close immediately, but save_pnl=False: the daily PnL CSV is
-                # written exactly once, at the 15:19 EOD routine above (gated by
+                # written exactly once, at the EOD_TIME routine above (gated by
                 # daily_pnl_written), so it only ever gets one row per day regardless of
                 # whether this Auto Pilot global stop, the manual Global Stop/Target UI
                 # limits, or a manual Close All triggered the closure. Previously this wrote
@@ -1456,7 +1463,7 @@ def handle_fire_market(side):
 
 def handle_close_all():
     """Wrapper to ensure CLOSE ALL button wipes both sides of the UI. save_pnl=False: the
-    daily PnL CSV (final_daily_pnl.csv) is written exactly once per day, at the 15:19 EOD
+    daily PnL CSV (final_daily_pnl.csv) is written exactly once per day, at the EOD_TIME
     routine in AutoController.run_loop(), regardless of what closed positions intraday --
     manual Close All, Global Stop/Target, or Auto Pilot's own global stop. Positions still
     close immediately here; only the aggregate daily report write is deferred."""
@@ -1604,7 +1611,7 @@ async def run_bot_logic():
                     controller.run_loop()
                     
                     if datetime.today().weekday() not in [5, 6]:
-                        if now.time() < AutoConfig.SQ_OFF_TIME:
+                        if now.time() < EOD_TIME:
                             logic.check_triggers()
                             pattern_engine.check_patterns()
                         else:
@@ -1613,7 +1620,7 @@ async def run_bot_logic():
                                 params['long_trigger_active'] = False
 
                     # Enter via Stop: live-monitors/executes any deferred candle-stop jobs
-                    # every tick, regardless of weekday/SQ_OFF_TIME gating above -- a job
+                    # every tick, regardless of weekday/EOD_TIME gating above -- a job
                     # already armed should keep being checked so it's never silently
                     # abandoned; if its position closes via the EOD routine or any other
                     # route in the meantime, the engine drops that job harmlessly on its own.
