@@ -818,7 +818,19 @@ def _add_alert_card(direction, side_label, input_key, period_key, notify_fn):
     independent entry to shared_state['alerts'] and clears the input for the next one, so any
     number of alerts can be created in the same direction. Sound/duration are captured at
     creation time from the current shared Alert Sound Profile (render_alert_sound_panel),
-    and can be changed per-alert afterward via MODIFY in the Active Alerts section."""
+    and can be changed per-alert afterward via MODIFY in the Active Alerts section.
+
+    'index' is stamped onto the alert at creation time from params['trading_index'] --
+    whichever index (NIFTY or SENSEX) is currently selected in the banner radio when Add
+    Alert is clicked. This locks the alert to that index's LTP for its entire lifetime: it is
+    evaluated ONLY against that index's price by LogicEngine._check_alerts, regardless of
+    whether params['trading_index'] is later switched to the other index. This is what stops
+    an alert created while on NIFTY from silently firing against SENSEX's price the moment
+    the person switches the banner's Index selector (or vice versa) -- previously alerts had
+    no index of their own and were evaluated against whatever index happened to be currently
+    selected at check time, which is exactly the bug this field fixes. The index an alert
+    belongs to cannot be changed afterward (not exposed in MODIFY in _alert_row below); to
+    get a SENSEX alert, switch to SENSEX first and add it there."""
     with ui.card().classes('w-full p-3 gap-2 bg-yellow-50 shadow-md border-l-4 border-yellow-400 rounded-xl'):
         ui.label(f'Add {side_label} Price Alert').classes('font-bold text-gray-800')
 
@@ -835,8 +847,10 @@ def _add_alert_card(direction, side_label, input_key, period_key, notify_fn):
             except (ValueError, TypeError):
                 notify_fn("Invalid Alert Value", type='negative')
                 return
+            alert_index = params['trading_index']
             new_alert = {
                 'id': str(uuid.uuid4())[:8],
+                'index': alert_index,
                 'direction': direction,
                 'value': value,
                 'period': params[period_key],
@@ -846,8 +860,8 @@ def _add_alert_card(direction, side_label, input_key, period_key, notify_fn):
             }
             shared_state['alerts'].append(new_alert)
             params[input_key] = 0  # clear the form so the next alert starts fresh
-            notify_fn(f"{side_label} Alert ADDED: {value}", type='positive')
-            _log_alert_action(f"🔔 {side_label} Alert Set: {value} ({new_alert['period']})")
+            notify_fn(f"{side_label} Alert ADDED ({alert_index}): {value}", type='positive')
+            _log_alert_action(f"🔔 {side_label} Alert Set ({alert_index}): {value} ({new_alert['period']})")
 
         ui.button('Add Alert', color='orange', on_click=add_alert).classes('w-full h-8 rounded-lg')
 
@@ -905,11 +919,20 @@ def _alert_row(alert):
     (value/period/sound/duration) that only commits on CONFIRM, by looking the alert back up
     via its id (so it keeps editing the right entry even if other alerts are added/removed/
     reordered in the list while this row's expansion is open). CANCEL removes it immediately,
-    no confirm needed (matching REMOVE elsewhere in the app)."""
+    no confirm needed (matching REMOVE elsewhere in the app).
+
+    The alert's 'index' (NIFTY or SENSEX, stamped at creation time in _add_alert_card) is
+    shown as a small badge in the header, next to the Upper/Lower label, so it's always clear
+    at a glance which underlying each pending alert is watching -- especially important once
+    alerts for both indices can be pending side by side. This field is intentionally NOT
+    editable in MODIFY below: an alert is fixed to the index it was created under for its
+    whole lifetime (see _add_alert_card's docstring)."""
     alert_id = alert['id']
     direction = alert['direction']
     label = 'Upper' if direction == 'upper' else 'Lower'
     label_cls = 'w-14 text-orange-600 font-bold' if direction == 'upper' else 'w-14 text-blue-600 font-bold'
+    alert_index = alert.get('index', 'NIFTY')
+    index_badge_cls = 'bg-indigo-100 text-indigo-700 text-[10px] font-bold px-2 py-0.5 rounded w-16 text-center'
     draft = {'value': alert['value'], 'period': alert['period'], 'sound': alert['sound'], 'duration': alert['duration']}
 
     def _find():
@@ -923,6 +946,7 @@ def _alert_row(alert):
         with exp.add_slot('header'):
             with ui.row().classes('w-full items-center gap-3 text-xs pr-2'):
                 ui.label(alert['created_at']).classes('w-16 text-gray-400 font-mono')
+                ui.label(alert_index).classes(index_badge_cls)
                 ui.label(label).classes(label_cls)
                 # These four are bound directly to the SAME dict object stored in
                 # shared_state['alerts'] (not a static f-string snapshot) so that CONFIRM's
@@ -940,8 +964,8 @@ def _alert_row(alert):
 
                 def cancel_alert():
                     shared_state['alerts'] = [a for a in shared_state['alerts'] if a.get('id') != alert_id]
-                    ui.notify(f"{label} Alert Cancelled", type='info')
-                    _log_alert_action(f"🔔 {label} Alert Cancelled: {alert['value']}")
+                    ui.notify(f"{alert_index} {label} Alert Cancelled", type='info')
+                    _log_alert_action(f"🔔 {alert_index} {label} Alert Cancelled: {alert['value']}")
 
                 def open_modify():
                     live = _find()
@@ -978,8 +1002,8 @@ def _alert_row(alert):
                     return
                 live['value'] = value; live['period'] = draft['period']
                 live['sound'] = draft['sound']; live['duration'] = draft['duration']
-                ui.notify(f"{label} Alert Updated", type='positive')
-                _log_alert_action(f"🔔 {label} Alert Modified: {value} ({draft['period']})")
+                ui.notify(f"{alert_index} {label} Alert Updated", type='positive')
+                _log_alert_action(f"🔔 {alert_index} {label} Alert Modified: {value} ({draft['period']})")
                 exp.value = False
 
             with ui.row().classes('w-full gap-2'):

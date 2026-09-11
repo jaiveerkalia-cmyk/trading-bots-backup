@@ -1,61 +1,11 @@
 from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE, FORCE_EXIT_TIME, EOD_TIME, get_eval_price
+from csv_manager import CsvManager
 from datetime import datetime, time as dtime, timedelta
 from nicegui import ui
 import pandas as pd
 import os
 import uuid
 import time
-
-class CsvManager:
-    def __init__(self): self.init_files()
-    def init_files(self):
-        if not os.path.exists(TRADEBOOK_FILE):
-            cols = ['Trade_ID', 'Date', 'Index_Type', 'Expiry', 'Type', 'Direction', 'Qty', 'Main_Strike', 'Hedge_Strike', 'Open_Main_Price', 'Open_Hedge_Price', 'Open_Index_Price', 'Open_Time', 'Close_Main_Price', 'Close_Hedge_Price', 'Close_Index_Price', 'Close_Time', 'Profit', 'Status']
-            pd.DataFrame(columns=cols).to_csv(TRADEBOOK_FILE, index=False)
-        if not os.path.exists(DAILY_PNL_FILE):
-            cols = ['Date', 'Net_Profit', 'Trade_Num', 'Trades_List']
-            pd.DataFrame(columns=cols).to_csv(DAILY_PNL_FILE, index=False)
-    def log_open(self, trade_id, trade_data):
-        try: df = pd.read_csv(TRADEBOOK_FILE)
-        except: self.init_files(); df = pd.read_csv(TRADEBOOK_FILE)
-        expiry = shared_state['current_expiry'].get(params['trading_index'], 'N/A')
-        hedge_strike = trade_data['hedge']['strike'] if trade_data['hedge'] else 0
-        hedge_entry  = trade_data['hedge']['entry_price'] if trade_data['hedge'] else 0
-        new_row = pd.DataFrame([{
-            'Trade_ID': str(trade_id), 'Date': datetime.now().strftime('%Y-%m-%d'), 'Index_Type': params['trading_index'], 'Expiry': str(expiry),
-            'Type': trade_data['type'], 'Direction': trade_data.get('direction', 'SELL'), 'Qty': int(trade_data['qty']), 'Main_Strike': float(trade_data['main']['strike']), 'Hedge_Strike': float(hedge_strike),
-            'Open_Main_Price': float(trade_data['main']['entry_price']), 'Open_Hedge_Price': float(hedge_entry), 'Open_Index_Price': float(trade_data['index_entry_price']),
-            'Open_Time': datetime.now().strftime('%H:%M:%S'), 'Close_Main_Price': 0.0, 'Close_Hedge_Price': 0.0, 'Close_Index_Price': 0.0, 'Close_Time': 'Active', 'Profit': 0.0, 'Status': 'OPEN'
-        }])
-        df = pd.concat([df, new_row], ignore_index=True)
-        df.to_csv(TRADEBOOK_FILE, index=False)
-    def update_entry_log(self, trade_id, main_p, hedge_p, idx_p):
-        try:
-            df = pd.read_csv(TRADEBOOK_FILE)
-            idx = df[df['Trade_ID'].astype(str) == str(trade_id)].index
-            if not idx.empty:
-                i = idx[0]
-                df.at[i, 'Open_Main_Price'] = float(main_p); df.at[i, 'Open_Hedge_Price'] = float(hedge_p); df.at[i, 'Open_Index_Price'] = float(idx_p)
-                df.to_csv(TRADEBOOK_FILE, index=False)
-        except: pass
-    def log_close(self, trade_id, close_data, pnl):
-        try:
-            df = pd.read_csv(TRADEBOOK_FILE)
-            idx = df[df['Trade_ID'].astype(str) == str(trade_id)].index
-            if not idx.empty:
-                i = idx[0]
-                df['Close_Main_Price'] = df['Close_Main_Price'].astype(float); df['Close_Hedge_Price'] = df['Close_Hedge_Price'].astype(float); df['Profit'] = df['Profit'].astype(float)
-                df.at[i, 'Close_Main_Price'] = float(close_data['main_price']); df.at[i, 'Close_Hedge_Price'] = float(close_data['hedge_price']); df.at[i, 'Close_Index_Price'] = float(close_data['index_price'])
-                df.at[i, 'Close_Time'] = datetime.now().strftime('%H:%M:%S'); df.at[i, 'Profit'] = float(pnl); df.at[i, 'Status'] = 'CLOSED'
-                df.to_csv(TRADEBOOK_FILE, index=False)
-        except: pass
-    def save_daily_report(self):
-        trades = shared_state['pnl']['trades_history']; pnl_list = [t['pnl'] for t in trades]; net_profit = sum(pnl_list)
-        try: df = pd.read_csv(DAILY_PNL_FILE)
-        except: self.init_files(); df = pd.read_csv(DAILY_PNL_FILE)
-        new_row = pd.DataFrame([{'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'Net_Profit': round(net_profit, 2), 'Trade_Num': len(trades), 'Trades_List': str(pnl_list)}])
-        df = pd.concat([df, new_row], ignore_index=True)
-        df.to_csv(DAILY_PNL_FILE, index=False)
 
 class LogicEngine:
     def __init__(self, ticker_client, instrument_manager):
@@ -485,9 +435,9 @@ class LogicEngine:
     def check_triggers(self):
         if not self.trading_active: return
         now = datetime.now()
-        # Futures Mode: every entry/exit/alert evaluation below reads the Futures-Mode-aware
-        # price (near-month future when the mode is on and resolved, otherwise identical to
-        # spot -- see config.get_eval_price()). Strike selection (inside open_position/
+        # Futures Mode: every entry/exit evaluation below reads the Futures-Mode-aware price
+        # (near-month future when the mode is on and resolved, otherwise identical to spot --
+        # see config.get_eval_price()). Strike selection (inside open_position/
         # _check_unified_open's strike_offset math) is computed separately and always stays
         # spot-based; it is NOT affected by this variable.
         idx_ltp = get_eval_price(params['trading_index'])
@@ -536,7 +486,16 @@ class LogicEngine:
         self._check_exits(now, idx_ltp, fire_1m, fire_5m)
         self._check_global_limits()
         self._check_global_pnl_floor()
-        self._check_alerts(idx_ltp, fire_1m, fire_5m)
+        # Alerts are index-tagged (see ui_components._add_alert_card's 'index' field, added
+        # to each new alert at creation time to lock it to whichever index -- NIFTY or
+        # SENSEX -- was selected when the alert was created) and must be evaluated against
+        # THEIR OWN index's price, never whichever index happens to be currently selected in
+        # params['trading_index']. Both indices tick continuously in shared_state regardless
+        # of the active selection (ticker_engine subscribes both permanently), so both
+        # Futures-Mode-aware prices are computed here and handed to _check_alerts, which picks
+        # the right one per alert.
+        idx_prices = {name: get_eval_price(name) for name in INDICES}
+        self._check_alerts(idx_prices, fire_1m, fire_5m)
 
         if fire_1m: self.last_trigger_time['1m'] = curr_min
         if fire_5m: self.last_trigger_time['5m'] = curr_min
@@ -1015,15 +974,25 @@ class LogicEngine:
         if self.stop_via_candle_engine is not None:
             self.stop_via_candle_engine.cancel_all(reason)
 
-    def _check_alerts(self, idx_ltp, fire_1m, fire_5m):
+    def _check_alerts(self, idx_prices, fire_1m, fire_5m):
         """Multi-alert system: shared_state['alerts'] holds any number of independent price
         alerts (multiple allowed in the same direction). Each is evaluated against its own
-        'period' (Current/1m/5m) and 'direction' (upper: fires when idx_ltp >= value; lower:
-        fires when idx_ltp <= value). A fired alert is removed from the list (one-shot, same
-        semantics as the old single-slot alert_upper_active/alert_lower_active flags).
+        'period' (Current/1m/5m) and 'direction' (upper: fires when the index's LTP >= value;
+        lower: fires when it's <= value). A fired alert is removed from the list (one-shot,
+        same semantics as the old single-slot alert_upper_active/alert_lower_active flags).
 
-        idx_ltp here is already the Futures-Mode-aware evaluation price, passed down from
-        check_triggers().
+        idx_prices is a dict {index_name: eval_price}, one entry per index in config.INDICES
+        (both NIFTY and SENSEX), computed once in check_triggers() via get_eval_price() for
+        each -- Futures-Mode-aware per index. Every alert is index-tagged at creation time
+        (see ui_components._add_alert_card's 'index' field), and is evaluated ONLY against
+        idx_prices[alert['index']] -- NEVER against whichever index happens to be the
+        currently selected params['trading_index']. This is what stops an alert set while on
+        NIFTY from silently firing against SENSEX's price (or vice versa) the moment the
+        trading index is switched in the UI: each alert's price source is fixed for its
+        lifetime to the index it was created under, not to the live selection. Alerts created
+        before this field existed have no 'index' key; those default to 'NIFTY' defensively
+        (rather than crashing) via alert.get('index', 'NIFTY') -- a one-day edge case at
+        most, since alerts are cleared every EOD (see auto_run.AutoController.run_loop()).
 
         NOTE: message text intentionally avoids the word "alert" (case-insensitive). The
         global ui.notify interceptor in auto_run.py auto-queues its own generic fallback
@@ -1042,6 +1011,10 @@ class LogicEngine:
             except (ValueError, TypeError): continue
             if value <= 0: continue
 
+            alert_index = alert.get('index', 'NIFTY')
+            idx_ltp = idx_prices.get(alert_index, 0)
+            if idx_ltp <= 0: continue
+
             period = alert.get('period', 'Current')
             check_now = (period == 'Current') or (period == '1m' and fire_1m) or (period == '5m' and fire_5m)
             if not check_now: continue
@@ -1054,8 +1027,8 @@ class LogicEngine:
 
             cmp_sym = '>' if direction == 'upper' else '<'
             label = 'Upper' if direction == 'upper' else 'Lower'
-            ui.notify(f"Price Hit: {idx_ltp} {cmp_sym} {value}", type='warning', close_button=True)
-            self.log_action(f"🔔 Price Hit ({label}): {idx_ltp} vs {value}")
+            ui.notify(f"Price Hit ({alert_index}): {idx_ltp} {cmp_sym} {value}", type='warning', close_button=True)
+            self.log_action(f"🔔 Price Hit ({alert_index}, {label}): {idx_ltp} vs {value}")
             self.play_alert_sound(alert.get('sound', 'Wood Plank'), alert.get('duration', 5))
             fired_ids.append(alert.get('id'))
 
