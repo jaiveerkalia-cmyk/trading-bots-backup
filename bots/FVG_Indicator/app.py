@@ -101,7 +101,6 @@ def load_settings() -> dict:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 data.setdefault("symbol", DEFAULT_SETTINGS["symbol"])
-                # Sanitize legacy sound names
                 preset = data.get("audio_preset", "Siren")
                 if preset not in SOUND_PRESETS:
                     data["audio_preset"] = "Siren"
@@ -133,7 +132,7 @@ def save_settings():
 active_settings = load_settings()
 csv_lock = asyncio.Lock()
 
-# --- Decoupled Alert & Toast Queues (auto_run.py architecture) ---
+# --- Decoupled Alert & Toast Queues ---
 sound_queue = []
 toast_queue = []
 
@@ -343,7 +342,8 @@ class TimeframeEngine:
 
 # Global State
 engines: Dict[str, TimeframeEngine] = {tf: TimeframeEngine(tf) for tf in TIMEFRAMES}
-event_log = deque(maxlen=20)
+event_log = deque(maxlen=100)
+selected_event_tf = "ALL"
 top_50_symbols: List[str] = ["BTCUSDT"]
 clock_worker_task: Optional[asyncio.Task] = None
 
@@ -353,7 +353,7 @@ def load_recent_events_from_csv():
     try:
         with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
             reader = list(csv.DictReader(f))
-            for r in reversed(reader[-20:]):
+            for r in reversed(reader[-60:]):
                 t_ist = r.get("timestamp_ist") or r.get("timestamp") or "N/A"
                 c_ist = r.get("closed_timestamp_ist") or r.get("closed_timestamp") or ""
                 status = r.get("status", "FORMED")
@@ -465,7 +465,7 @@ async def process_new_candle(tf: str, k: list):
     ts_now = get_ist_str(bar['t'], full=True)
     cfg = eng.get_cfg()
 
-    # 1. Check Invalidations
+    # 1. Check Invalidations (Clean Event Logging)
     closed = eng.check_invalidations(bar['h'], bar['l'], bar['c'], ts_now)
     for c in closed:
         await update_fvg_close_csv(c.id, c.closed_timestamp_ist, float(c.closed_price))
@@ -484,7 +484,7 @@ async def process_new_candle(tf: str, k: list):
             sound_queue.append(('close', active_settings.get("audio_preset", "Siren"), active_settings.get("audio_duration", 5)))
         toast_queue.append((f"[{tf.upper()}] FVG Mitigated & Closed!", 'warning'))
 
-    # 2. Detect Formed FVG
+    # 2. Detect Formed FVG (Clean Event Logging)
     new_fvg = eng.detect_fvg(source="LIVE")
     if new_fvg:
         await record_fvg_csv(asdict(new_fvg))
@@ -507,7 +507,7 @@ async def process_new_candle(tf: str, k: list):
     render_event_log.refresh()
 
 async def clock_aligned_poller():
-    logger.info("Clock-aligned timestamp-verified REST poller started.")
+    """Silent background poller: avoids heavy candle-by-candle logging."""
     retries: Dict[str, int] = {tf: 0 for tf in TIMEFRAMES}
 
     while True:
@@ -535,7 +535,7 @@ async def clock_aligned_poller():
                                         break
 
                                 if matched:
-                                    logger.info(f"[{tf}] Verified completed candle matching {get_ist_str(expected_open_ms, False)}")
+                                    # Process candle silently without dumping routine candle logs
                                     await process_new_candle(tf, matched)
                                     retries[tf] = 0
                                 else:
@@ -543,13 +543,12 @@ async def clock_aligned_poller():
                                     if retries[tf] > 12 and len(data) >= 2:
                                         last_closed = data[-2]
                                         if int(last_closed[0]) > eng.last_closed_bar_time:
-                                            logger.warning(f"[{tf}] Match timeout; fallback to bar: {get_ist_str(int(last_closed[0]), False)}")
                                             await process_new_candle(tf, last_closed)
                                             retries[tf] = 0
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Poller iteration error: {e}\n{traceback.format_exc()}")
+            logger.error(f"Poller error: {e}")
 
         await asyncio.sleep(0.5)
 
@@ -697,18 +696,40 @@ def render_grid():
 
 @ui.refreshable
 def render_event_log():
+    global selected_event_tf
     with ui.card().classes('w-full bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-xl mt-2'):
-        with ui.row().classes('w-full justify-between items-center mb-3'):
+        # Header with Timeframe Filter Bar
+        with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-3'):
             with ui.row().classes('items-center gap-2'):
                 ui.icon('history', size='sm').classes('text-sky-400')
-                ui.label('Live FVG Event Stream (Last 20 Events)').classes('text-base font-bold text-white')
-            ui.label(f"Persistent CSV: {CSV_FILE}").classes('text-xs font-mono text-slate-500')
+                ui.label('Live FVG Event Stream').classes('text-base font-bold text-white')
+                ui.label(f"Persistent CSV: {CSV_FILE}").classes('text-xs font-mono text-slate-500 hidden sm:inline ml-2')
 
-        if not event_log:
-            ui.label("Waiting for bar-close detection events...").classes('text-xs text-slate-500 italic py-4 text-center w-full')
+            # Interactive Timeframe Filter Buttons
+            with ui.row().classes('items-center gap-2'):
+                ui.label('Filter:').classes('text-xs text-slate-400 font-bold uppercase tracking-wider')
+                def set_filter(e):
+                    global selected_event_tf
+                    selected_event_tf = e.value
+                    render_event_log.refresh()
+                ui.toggle(
+                    ["ALL"] + TIMEFRAMES,
+                    value=selected_event_tf,
+                    on_change=set_filter
+                ).props('dense no-caps toggle-color=sky-600').classes('text-xs font-mono bg-slate-950/80 border border-slate-800 rounded-lg')
+
+        # Filter events based on active selection
+        filtered_events = [
+            ev for ev in list(event_log)
+            if selected_event_tf == "ALL" or ev['tf'].upper() == selected_event_tf.upper()
+        ][:20]
+
+        if not filtered_events:
+            msg = f"No events recorded for {selected_event_tf}..." if selected_event_tf != "ALL" else "Waiting for bar-close detection events..."
+            ui.label(msg).classes('text-xs text-slate-500 italic py-4 text-center w-full')
         else:
             with ui.column().classes('w-full gap-2 font-mono text-xs'):
-                for ev in list(event_log):
+                for ev in filtered_events:
                     is_formed = ev['status'] == "FORMED"
                     badge_col = 'bg-emerald-900/60 text-emerald-300 border border-emerald-700' if is_formed else 'bg-rose-950/70 text-rose-300 border border-rose-800'
                     type_col = 'text-emerald-400' if ev['type'] == "BULLISH" else 'text-rose-400'
@@ -729,7 +750,7 @@ async def index():
     ui.dark_mode().enable()
     ui.add_head_html(f"<script>{AUDIO_UNLOCK_JS}</script>")
 
-    # Client-Side Decoupled Queue Processor (Never causes DOM flickering)
+    # Decoupled Queue Processor (Processes audio and popups in client context)[cite: 1]
     def process_queues():
         while toast_queue:
             msg, t_type = toast_queue.pop(0)
@@ -808,7 +829,7 @@ async def index():
                 ui.notify(f"Saved sound: {preset_select.value} ({dur_input.value}s)", type='positive')
             set_sound_btn.on('click', save_sound)
 
-            # Autoplay Unlock Button (like auto_run.py)
+            # Autoplay Unlock Button[cite: 1]
             enable_snd_btn = ui.button('🔊 Enable Sound', icon='volume_up').props('dense unelevated').classes('bg-emerald-700 hover:bg-emerald-600 text-xs px-3 py-1.5 font-bold')
             def unlock_sound():
                 ui.run_javascript('try { const a = new Audio("https://actions.google.com/sounds/v1/cartoon/pop.ogg"); a.volume = 0.4; a.play().catch(()=>{}); } catch(e) {}')

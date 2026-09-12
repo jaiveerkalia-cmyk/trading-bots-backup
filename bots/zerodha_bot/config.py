@@ -33,6 +33,21 @@ FORCE_EXIT_TIME = dtime(23, 59)
 # exactly one place to change the EOD time.
 EOD_TIME = dtime(15, 25)
 
+# --- ENTER VIA STOP: TICK BUFFERS (points/rupees added beyond the triggering candle's
+# high/low -- see stop_via_candle_engine.py's _try_fetch/_handoff, which computes:
+#     trigger_price = (low - tick) if is_downside else (high + tick)
+# ENTER_VIA_STOP_INDEX_TICK is INDEX-SPECIFIC (keyed by the same names as INDICES), since
+# NIFTY and SENSEX trade in different point scales -- applies to 'entry' and 'index_stop'
+# jobs, where the triggering candle's high/low is an index or near-month-future price.
+# ENTER_VIA_STOP_PREMIUM_TICK stays a single flat constant (both indices' options trade in
+# the same rupee-premium scale, regardless of which index they're on) -- applies to
+# 'premium_stop' jobs, where the triggering candle's high/low is the option's own premium.
+ENTER_VIA_STOP_INDEX_TICK = {
+    'NIFTY': 0.5,
+    'SENSEX': 1.0,
+}
+ENTER_VIA_STOP_PREMIUM_TICK = 0.05
+
 # --- ALERT SOUND LIBRARY ---
 ALERT_SOUND_URLS = {
     'Wood Plank': 'https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg',
@@ -107,13 +122,16 @@ shared_state = {
 
     # --- Active Alerts (multi-alert system) ---
     # List of independent, user-created price alerts. Each entry:
-    #   {'id': short-uuid str, 'direction': 'upper'|'lower', 'value': float,
-    #    'period': 'Current'|'1m'|'5m', 'sound': str (key into ALERT_SOUND_URLS),
-    #    'duration': float (seconds), 'created_at': 'HH:MM:SS'}
-    # Multiple alerts in the same direction are allowed. Fired alerts are removed from
-    # this list (one-shot, same semantics as the old single-slot alert_upper_active/
-    # alert_lower_active flags). Lives in shared_state (not params) since these are
-    # dynamic runtime instances, matching the existing active_trades/option_chain pattern.
+    #   {'id': short-uuid str, 'index': 'NIFTY'|'SENSEX', 'direction': 'upper'|'lower',
+    #    'value': float, 'period': 'Current'|'1m'|'5m', 'sound': str (key into
+    #    ALERT_SOUND_URLS), 'duration': float (seconds), 'created_at': 'HH:MM:SS'}
+    # Multiple alerts in the same direction (and across both indices) are allowed. Each is
+    # evaluated only against the LTP of its own tagged 'index' (see
+    # LogicEngine._check_alerts), never whichever index happens to be currently selected.
+    # Fired alerts are removed from this list (one-shot, same semantics as the old
+    # single-slot alert_upper_active/alert_lower_active flags). Lives in shared_state (not
+    # params) since these are dynamic runtime instances, matching the existing
+    # active_trades/option_chain pattern.
     # ALSO fully cleared (regardless of fired/pending state) at the EOD_TIME routine in
     # auto_run.AutoController.run_loop() -- see that method's docstring/comments -- since a
     # price alert set during today's session has no business firing against tomorrow's

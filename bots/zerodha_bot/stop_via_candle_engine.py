@@ -31,8 +31,11 @@ This engine then:
      correct in code.
   2. Computes a real Stop-Market trigger 1 tick beyond that candle's high or low, mirroring
      the direction of the ORIGINAL condition's breakout: a downside cross -> stop below the
-     candle's low; an upside cross -> stop above the candle's high. Index-level tick = 0.5;
-     premium-level tick = 0.05.
+     candle's low; an upside cross -> stop above the candle's high. Index-level tick is
+     INDEX-SPECIFIC (config.ENTER_VIA_STOP_INDEX_TICK, keyed by index name, since NIFTY and
+     SENSEX trade in different point scales); premium-level tick is a single flat constant
+     (config.ENTER_VIA_STOP_PREMIUM_TICK) since both indices' options trade in the same
+     rupee-premium scale regardless of underlying index.
   3. HANDS OFF: checks the CURRENT live price/premium against that just-computed trigger
      FIRST (see _handoff below). If price has ALREADY crossed the trigger by the time
      hand-off happens (e.g. it moved further during the fetch_delay_sec wait, or while the
@@ -70,7 +73,7 @@ auto_run.py's Futures Mode toggle handler for the main callers.
 
 from datetime import datetime, timedelta
 
-from config import shared_state, params, INDICES, get_eval_token, get_eval_price
+from config import shared_state, params, INDICES, get_eval_token, get_eval_price, ENTER_VIA_STOP_INDEX_TICK, ENTER_VIA_STOP_PREMIUM_TICK
 
 INTERVAL_DELTA = {
     '1m': timedelta(minutes=1),
@@ -87,8 +90,6 @@ INTERVAL_KITE = {
 }
 
 MAX_RETRY_SECONDS = 30
-INDEX_TICK = 0.5
-PREMIUM_TICK = 0.05
 
 
 def _to_float(v):
@@ -295,7 +296,16 @@ class StopViaCandleEngine:
             f"(H:{high} L:{low})"
         )
 
-        tick = PREMIUM_TICK if job['kind'] == 'premium_stop' else INDEX_TICK
+        # Tick buffer: index-specific for entry/index_stop jobs (config.ENTER_VIA_STOP_INDEX_
+        # TICK, keyed by job['index_name']), since NIFTY and SENSEX trade in different point
+        # scales; a single flat constant for premium_stop jobs (config.ENTER_VIA_STOP_PREMIUM_
+        # TICK), since both indices' options trade in the same rupee-premium scale regardless
+        # of underlying index. Falls back to 0.5 defensively if an index name is ever
+        # unrecognized (should not happen -- job['index_name'] is always one of INDICES).
+        if job['kind'] == 'premium_stop':
+            tick = ENTER_VIA_STOP_PREMIUM_TICK
+        else:
+            tick = ENTER_VIA_STOP_INDEX_TICK.get(job['index_name'], 0.5)
         trigger_price = (low - tick) if job['is_downside'] else (high + tick)
         job['trigger_price'] = trigger_price
 
