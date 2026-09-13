@@ -311,7 +311,7 @@ class PaperEngine:
                 if pos.side == 'long'
                 else (pos.entry_price - pos.current_price) * pos.qty
             )
-            pos.unrealized_pnl = round(gross - pos.entry_fee_paid - exit_fee, 6)
+            pos.unrealized_pnl = round(gross - pos.entry_fee_paid - exit_fee + pos.funding_pnl, 6)
             return pos
         
     async def close_position(self, slot_id: str) -> Optional[Position]:
@@ -367,7 +367,7 @@ class PaperEngine:
                 else (pos.entry_price - pos.current_price) * pos.qty
             )
             pos.unrealized_pnl = round(
-                gross_rem - pos.entry_fee_paid - rem_exit_fee, 6
+                gross_rem - pos.entry_fee_paid - rem_exit_fee + pos.funding_pnl, 6
             )
         return pos, realized
     
@@ -376,32 +376,46 @@ class PaperEngine:
 
     async def update_mark_prices(
         self,
-        exchange:     str,
-        symbol:       str,
-        price:        float,
-        funding_rate: float = 0.0,
+        exchange:          str,
+        symbol:            str,
+        price:             float,
+        funding_rate:      float = 0.0,
+        next_funding_time: Optional[datetime] = None,
     ) -> None:
         """
-        Called every tick. Updates current_price, applies 8-hourly funding charges
-        (Binance Futures rules: longs pay positive funding, shorts receive it),
-        and recalculates unrealized PnL.
+        Called every tick. Updates current_price, applies funding exactly when
+        `next_funding_time` (REST-polled from the exchange by
+        market_data_service._funding_poller, cached in Redis, looked up by
+        TriggerEngine._funding_info) passes, and recalculates unrealized PnL.
+
+        Binance's own formula: Funding Amount = Notional Value x Funding Rate
+        (longs pay positive funding, shorts receive it, and vice versa for
+        negative rates), applied using the mark price/rate at the settlement
+        instant. We apply it on the first tick where now >= next_funding_time,
+        using that tick's price/rate — the closest approximation available
+        without an exact-timestamp exchange snapshot.
+
+        next_funding_time replaces the old fixed 8h-UTC-grid assumption, so
+        variable funding intervals (Binance can shorten to 4h/1h in volatile
+        conditions) are honoured automatically — the poller re-fetches a fresh
+        next_funding_time after each settlement, so this keeps firing every
+        interval indefinitely, not just once.
+
+        If next_funding_time is None (funding info not polled yet for this
+        symbol), NO funding is applied this tick — we never guess a boundary.
         """
         async with self._lock:
-            now          = datetime.now(timezone.utc)
-            # Current 8-hour funding window: 00:00, 08:00, or 16:00 UTC
-            funding_hour = (now.hour // 8) * 8
-            cur_window   = now.replace(
-                hour=funding_hour, minute=0, second=0, microsecond=0
-            )
+            now = datetime.now(timezone.utc)
             for slot_id, pos in self._positions.items():
                 if pos.exchange != exchange or pos.symbol != symbol:
                     continue
                 pos.current_price = price
-                # ── Apply funding when entering a new 8-hour window ───────
+                # ── Apply funding once next_funding_time has passed ───────
                 fund_key  = f"{exchange}:{symbol}:{slot_id}"
                 last_fund = self._last_funding_dt.get(fund_key)
-                if (funding_rate != 0 and price > 0 and pos.qty > 0 and
-                        (last_fund is None or cur_window > last_fund)):
+                if (next_funding_time is not None and funding_rate != 0 and
+                        price > 0 and pos.qty > 0 and now >= next_funding_time and
+                        (last_fund is None or next_funding_time > last_fund)):
                     notional = pos.qty * price
                     fee      = notional * abs(funding_rate)
                     # Binance rule:
@@ -412,11 +426,11 @@ class PaperEngine:
                         pos.funding_pnl -= round(fee, 8)
                     else:
                         pos.funding_pnl += round(fee, 8)
-                    self._last_funding_dt[fund_key] = cur_window
+                    self._last_funding_dt[fund_key] = next_funding_time
                     logger.debug(
-                        "Funding [%s %s] side=%s rate=%.4f%% fee=%.4f",
+                        "Funding [%s %s] side=%s rate=%.4f%% fee=%.4f next=%s",
                         symbol[:8], slot_id[:6], pos.side,
-                        funding_rate * 100, fee,
+                        funding_rate * 100, fee, next_funding_time.isoformat(),
                     )
                 # ── Recalculate unrealised PnL ────────────────────────────
                 taker_fee = settings.EXCHANGE_FEES.get(

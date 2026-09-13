@@ -26,6 +26,10 @@ def mark_price_key(exchange: str, symbol: str) -> str:
     """Futures mark price — separate from last trade price."""
     return f"mark:{exchange}:{symbol}"
 
+def funding_info_key(exchange: str, symbol: str) -> str:
+    """REST-polled funding info: {rate, next_funding_time, interval_hours, fetched_at}."""
+    return f"funding:{exchange}:{symbol}"
+
 
 # ── Engine state keys ──────────────────────────────────────────────────────────
 

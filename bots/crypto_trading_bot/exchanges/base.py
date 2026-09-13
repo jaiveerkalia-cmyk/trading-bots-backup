@@ -122,6 +122,15 @@ class BaseExchangeAdapter(ABC):
         """Set 'cross' or 'isolated' margin mode."""
         return True
 
+    async def fetch_funding_info(self, symbol: str) -> Optional[dict]:
+        """
+        Fetch live funding-rate settlement info from the exchange.
+        Returns {'rate': float, 'next_funding_time': datetime, 'interval_hours': int | None}
+        or None if unsupported / unavailable.
+        Default: unsupported (spot adapters, or exchanges not yet wired up).
+        """
+        return None
+
     # ── Symbol normalisation ──────────────────────────────────────────────────
 
     @abstractmethod

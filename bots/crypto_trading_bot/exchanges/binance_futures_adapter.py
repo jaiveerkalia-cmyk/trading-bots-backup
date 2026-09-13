@@ -275,6 +275,53 @@ class BinanceFuturesAdapter(BaseExchangeAdapter):
             logger.error("BinanceFutures set_margin_mode error: %s", e)
             return False
 
+    async def fetch_funding_info(self, symbol: str) -> Optional[dict]:
+        """
+        REST funding settlement info: {'rate', 'next_funding_time', 'interval_hours'}.
+
+        Reads nextFundingTime / lastFundingRate straight off the raw Binance
+        payload (fr['info']) rather than ccxt's unified fields — same pattern
+        as the lastFundingRate parse in _ticker_loop. ccxt's unified
+        fundingTimestamp/interval keys aren't consistently populated across
+        exchanges/versions; the raw premiumIndex fields are authoritative.
+
+        interval_hours is best-effort only (via /fapi/v1/fundingInfo, which
+        Binance only populates for symbols with a NON-default interval) —
+        it's informational. Funding is applied purely off next_funding_time,
+        which Binance itself updates if a symbol's interval changes.
+        """
+        if not self._ex:
+            return None
+        try:
+            fr   = await self._ex.fetch_funding_rate(symbol)
+            info = fr.get('info', {}) or {}
+            next_ts = info.get('nextFundingTime') or fr.get('fundingTimestamp')
+            rate    = info.get('lastFundingRate')
+            if rate is None:
+                rate = fr.get('fundingRate')
+            if next_ts is None or rate is None:
+                return None
+            result = {
+                'rate': float(rate),
+                'next_funding_time': datetime.fromtimestamp(
+                    int(next_ts) / 1000, tz=timezone.utc
+                ),
+                'interval_hours': None,
+            }
+            try:
+                fi = await self._ex.fapiPublicGetFundingInfo()
+                mkt_id = self._ex.market(symbol)['id']
+                for row in fi:
+                    if row.get('symbol') == mkt_id:
+                        result['interval_hours'] = int(row.get('fundingIntervalHours'))
+                        break
+            except Exception:
+                pass   # not critical — informational only, see docstring
+            return result
+        except Exception as e:
+            logger.warning("BinanceFutures fetch_funding_info [%s]: %s", symbol, e)
+            return None
+
     def normalize_symbol(self, raw: str) -> str:  return raw
     def to_exchange_symbol(self, canonical: str) -> str: return canonical
 

@@ -73,6 +73,7 @@ async def main() -> None:
         await asyncio.gather(
             _control_loop(redis, adapters, pending_connect, publisher, keys, testnet),
             _heartbeat(redis, adapters),
+            _funding_poller(redis, adapters),
         )
     except asyncio.CancelledError:
         pass
@@ -240,6 +241,62 @@ async def _do_subscribe(
             logger.error("Subscribe error [%s %s %s]: %s", exchange, symbol, stream, e)
 
     logger.info("Subscribed: %s %s %s", exchange, symbol, streams)
+
+
+async def _funding_poller(
+    redis:    aioredis.Redis,
+    adapters: dict,
+) -> None:
+    """
+    Periodically fetches funding settlement info (rate + next_funding_time)
+    for every actively-subscribed futures symbol and caches it in Redis.
+    PaperEngine reads this instead of assuming a fixed 8h UTC grid — lets
+    real Binance funding-interval changes (e.g. shortened to 4h/1h during
+    volatility) come through automatically.
+    """
+    while True:
+        try:
+            members = await redis.smembers(ACTIVE_SUBS_KEY)
+            seen: set[tuple[str, str]] = set()
+            for raw in members:
+                try:
+                    sub = json.loads(raw)
+                except Exception:
+                    continue
+                exchange = sub.get('exchange', '')
+                symbol   = sub.get('symbol', '')
+                if not exchange or not symbol or (exchange, symbol) in seen:
+                    continue
+                seen.add((exchange, symbol))
+
+                adapter = adapters.get(exchange)
+                if not adapter:
+                    continue   # not connected (yet) — pick it up next cycle
+                try:
+                    info = await adapter.fetch_funding_info(symbol)
+                except Exception as e:
+                    logger.warning("Funding poll error [%s %s]: %s", exchange, symbol, e)
+                    continue
+                if not info:
+                    continue
+                payload = {
+                    'rate':           info['rate'],
+                    'next_ts':        info['next_funding_time'].isoformat(),
+                    'interval_hours': info.get('interval_hours'),
+                }
+                try:
+                    await redis.set(
+                        redis_keys.funding_info_key(exchange, symbol),
+                        json.dumps(payload, separators=(',', ':')),
+                        ex=settings.FUNDING_INFO_TTL,
+                    )
+                except Exception as e:
+                    logger.error("Funding cache write error [%s %s]: %s", exchange, symbol, e)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Funding poller error: %s", e)
+        await asyncio.sleep(settings.FUNDING_POLL_INTERVAL)
 
 
 async def _heartbeat(

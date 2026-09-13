@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Awaitable, TYPE_CHECKING
+from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 
 import redis.asyncio as aioredis
 
@@ -80,9 +80,9 @@ class TriggerEngine:
                 continue
             sym_key = f"{slot.exchange}:{slot.symbol}"
             if slot.position.is_paper and sym_key not in updated:
-                funding = await self._funding_rate(slot.exchange, slot.symbol)
+                rate, next_funding_ts = await self._funding_info(slot.exchange, slot.symbol)
                 await self._paper.update_mark_prices(
-                    slot.exchange, slot.symbol, mark, funding
+                    slot.exchange, slot.symbol, mark, rate, next_funding_ts
                 )
                 updated.add(sym_key)
 
@@ -302,7 +302,34 @@ class TriggerEngine:
         except Exception:
             return 0.0
 
+    async def _funding_info(
+        self, exchange: str, symbol: str
+    ) -> tuple[float, Optional[datetime]]:
+        """
+        (rate, next_funding_time) from the REST-polled funding cache
+        (market_data_service._funding_poller). This is the authoritative
+        source — next_funding_time drives WHEN funding is applied in
+        PaperEngine, replacing the old fixed-8h-UTC-grid assumption.
+
+        If the cache hasn't been populated yet (service just started, or
+        poll hasn't landed), still surface a rate for display purposes via
+        the ticker's lastFundingRate, but return next_funding_time=None so
+        PaperEngine does NOT apply a guessed/unsettled charge.
+        """
+        try:
+            raw = await self._redis.get(redis_keys.funding_info_key(exchange, symbol))
+            if raw:
+                d       = json.loads(raw)
+                rate    = float(d.get('rate', 0) or 0)
+                next_ts = d.get('next_ts')
+                next_dt = datetime.fromisoformat(next_ts) if next_ts else None
+                return rate, next_dt
+        except Exception:
+            pass
+        return await self._funding_rate(exchange, symbol), None
+
     async def _funding_rate(self, exchange: str, symbol: str) -> float:
+        """Live (unsettled) funding rate off the last tick — display fallback only."""
         try:
             raw = await self._redis.get(redis_keys.latest_tick_key(exchange, symbol))
             return float(json.loads(raw).get('fr', 0) or 0) if raw else 0.0

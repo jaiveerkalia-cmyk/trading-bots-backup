@@ -58,5 +58,8 @@ WS_MAX_RECONNECT_ATTEMPTS     = 0
 
 PAPER_FILL_CHECK_INTERVAL = 0.5
 
+FUNDING_POLL_INTERVAL = 300   # seconds between REST funding-info polls per symbol
+FUNDING_INFO_TTL      = 900   # Redis TTL for cached funding info (3x poll interval)
+
 LOG_MAX_ENTRIES              = 200
 ALERT_SOUND_DURATION_DEFAULT = 5

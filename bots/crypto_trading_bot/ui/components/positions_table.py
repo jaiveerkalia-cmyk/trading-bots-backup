@@ -54,6 +54,7 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
     qty_refs:  dict[str, ui.label] = {}
     fee_refs:  dict[str, ui.label] = {}
     fr_refs:   dict[str, ui.label] = {}
+    fp_refs:   dict[str, ui.label] = {}
     mp_refs:   dict[str, ui.label] = {}
     ml_refs:   dict[str, ui.label] = {}
 
@@ -70,7 +71,7 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
         @ui.refreshable
         def rows() -> None:
             for d in (mark_refs, pnl_refs, dv_refs, qty_refs,
-                      fee_refs, fr_refs, mp_refs, ml_refs):
+                      fee_refs, fr_refs, fp_refs, mp_refs, ml_refs):
                 d.clear()
 
             if not state.positions:
@@ -93,6 +94,7 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                 liq      = float(pos.get('liquidation_price') or 0)
                 leverage = int(pos.get('leverage', 1) or 1)
                 fr_raw   = pos.get('funding_rate')
+                fp       = float(pos.get('funding_pnl', 0) or 0)
 
                 slot     = state.get_slot(sid)
                 cur_stp  = float((slot or {}).get('stop_price')   or 0) or None
@@ -185,6 +187,12 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                                     if fr_raw is not None else '—'
                                 ).classes('font-mono text-gray-300')
                                 fr_refs[sid] = fr_l
+                            with ui.row().classes('items-center gap-1'):
+                                ui.label('Fund $').classes('text-gray-500')
+                                fp_l = ui.label(f'{fp:+.4f}').classes(
+                                    f'font-mono {"text-green-400" if fp >= 0 else "text-red-400"}'
+                                )
+                                fp_refs[sid] = fp_l
 
                         with ui.row().classes('items-center gap-1'):
                             ui.label('ExFee').classes('text-gray-500')
@@ -410,6 +418,13 @@ def build(state: 'UIState', redis: aioredis.Redis) -> dict:
                 fee_refs[sid].set_text(f'${mark * qty * taker:.4f}')
             if sid in fr_refs and fr_raw is not None:
                 fr_refs[sid].set_text(f'{float(fr_raw)*100:.4f}%')
+            fp = float(pos.get('funding_pnl', 0) or 0)
+            if sid in fp_refs:
+                fp_refs[sid].set_text(f'{fp:+.4f}')
+                fp_refs[sid].classes(
+                    remove='text-green-400 text-red-400',
+                    add=('text-green-400' if fp >= 0 else 'text-red-400'),
+                )
 
             slot    = state.get_slot(sid)
             entry   = float(pos.get('entry_price', 0) or 0)
