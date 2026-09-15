@@ -43,8 +43,8 @@ EOD_TIME = dtime(15, 25)
 # the same rupee-premium scale, regardless of which index they're on) -- applies to
 # 'premium_stop' jobs, where the triggering candle's high/low is the option's own premium.
 ENTER_VIA_STOP_INDEX_TICK = {
-    'NIFTY': 0.5,
-    'SENSEX': 1.0,
+    'NIFTY': 3.5,
+    'SENSEX': 10.0,
 }
 ENTER_VIA_STOP_PREMIUM_TICK = 0.05
 
