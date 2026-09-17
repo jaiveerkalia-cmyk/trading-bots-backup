@@ -23,6 +23,18 @@ class LogicEngine:
         # (rather than importing AutoController here) to avoid a circular import, matching the
         # same loosely-coupled pattern already used for stop_via_candle_engine.
         self.clear_leg_fields_callback = None
+        # Tick-scoped log of every position closed during the CURRENT check_triggers() call,
+        # regardless of which code path closed it (PnL/Index/Premium stop or target, manual
+        # close, close_all_positions, etc). Reset to [] at the start of every check_triggers()
+        # call and appended to by close_position() itself -- see both for details. Used by
+        # _check_global_limits/_check_global_pnl_floor so their own fired-event breakdown
+        # (_log_limit_fire) can show EVERY trade that closed this tick, not just the ones
+        # close_all_positions() itself closed as part of that specific call -- e.g. a trade
+        # that closed via an Index Stop moments earlier in the same tick, whose loss is what
+        # actually pushed the total past a Global Stop's threshold, now shows up in that
+        # Global Stop's own breakdown line instead of only as a separate CLOSED log entry
+        # above it that has to be manually cross-referenced.
+        self._closed_this_tick = []
 
     def log_action(self, message, details=""):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -297,15 +309,23 @@ class LogicEngine:
         # covering the WHOLE session, not just this one call).
         self._last_close_pnl = round(net_pnl, 2)
         self._last_close_side = side
+        # Tick-scoped record of this close, appended regardless of which code path called
+        # close_position() (PnL/Index/Premium stop or target, manual close button,
+        # close_all_positions, EOD square-off, etc) -- see _closed_this_tick's declaration in
+        # __init__ and its usage in _check_global_limits/_check_global_pnl_floor for why.
+        self._closed_this_tick.append({'side': side, 'symbol': m['symbol'], 'pnl': self._last_close_pnl})
         return True, "Closed"
 
     def close_all_positions(self, reason="Global Exit", save_pnl=True):
         """Closes every open position (Call/Put). Returns a list of {'side','symbol','pnl'}
         dicts, one per position actually closed by THIS call -- NOT the full-session
-        shared_state['pnl']['trades_history'] (which keeps growing all day) -- so callers
-        that need to report exactly what this specific close-all event just closed (e.g.
-        LogicEngine._check_global_limits/_check_global_pnl_floor's per-trade PnL breakdown
-        logging) don't have to guess which trailing slice of that list belongs to this call."""
+        shared_state['pnl']['trades_history'] (which keeps growing all day), and NOT
+        necessarily the same as self._closed_this_tick (which can also include trades closed
+        by an EARLIER call this same tick, e.g. an Index Stop firing moments before a Global
+        Stop that then calls this method) -- so callers that need to report exactly what
+        THIS specific close-all call closed still have that available here, while
+        _log_limit_fire's own breakdown (see _check_global_limits/_check_global_pnl_floor)
+        instead uses the broader self._closed_this_tick when logging a fired global limit."""
         closed = []
         for side in ['Call', 'Put']:
             trade = shared_state['active_trades'][side]
@@ -380,7 +400,17 @@ class LogicEngine:
         depth-based fill prices are used at the actual moment of a fill instead -- see
         open_position()/close_position() above, both for live AND paper trading -- so the
         REALIZED PnL recorded when a position actually closes reflects a real market fill,
-        even though the live ticking number in between is an LTP-based approximation."""
+        even though the live ticking number in between is an LTP-based approximation.
+
+        Called TWICE per tick as of this fix: once early inside check_triggers() (right
+        after _check_exits/_check_unified_open, before _check_global_limits/
+        _check_global_pnl_floor read any PnL total -- see check_triggers() below) so those
+        checks never read a stale/mixed total, and again later in auto_run.py's
+        run_bot_logic() loop body for the general UI-display refresh. The second call is a
+        cheap, harmless re-confirmation once nothing changed between the two -- it exists
+        for the same reason it always did (keeping the live display current every tick) and
+        is left in place rather than removed, to avoid disturbing other timing assumptions
+        downstream of it."""
         unrealized = 0.0
         idx_eval = get_eval_price(params['trading_index'])
         for side in ['Call', 'Put']:
@@ -432,9 +462,49 @@ class LogicEngine:
         shared_state['pnl']['unrealized'] = unrealized
         self.update_chart_data()
 
+    def _live_total_pnl(self):
+        """Computes total PnL fresh from currently-open trades, never from the cached
+        shared_state['pnl']['unrealized'] snapshot -- that snapshot is only refreshed once
+        per tick by update_pnl(), so if a trade opened AND/OR closed earlier in this same
+        tick (e.g. inside _check_exits/_check_unified_open, both of which run before this
+        is called from check_triggers()), the cache could still be holding a just-closed
+        trade's last-known unrealized PnL, while shared_state['pnl']['realized'] has
+        ALREADY been updated (synchronously, inside close_position()) with that same
+        trade's realized close -- double-counting that one trade's loss/profit for the
+        single tick between its close and the next update_pnl() refresh. This was
+        confirmed as the cause of a Global Stop firing at a total (₹-10438) that did not
+        match the sum of any actually-closed trades: a Put closed and a Call opened in the
+        same tick, and _check_global_limits() read realized (already updated by the Put's
+        close) plus a still-stale unrealized (still holding the Put's own last-known
+        live PnL, not yet zeroed out because update_pnl() hadn't run again yet) --
+        effectively counting the Put's loss twice.
+
+        Summing trade['pnl'] directly from shared_state['active_trades'] AS IT STANDS
+        RIGHT NOW sidesteps this entirely: a just-closed trade is no longer in
+        active_trades by the time this runs (close_position() sets it to None
+        synchronously), so it cannot contribute a second time via a stale cached figure.
+        A freshly-opened trade's pnl is correctly ~0 at this point (it hasn't had a tick
+        to move yet), which is the accurate state of the world, not a bug -- see also the
+        update_pnl() call added earlier in check_triggers(), which additionally keeps the
+        CACHED unrealized figure (used for the UI display and by AutoController.run_loop's
+        own SECOND_LEG global-stop check) consistent for the rest of this same tick, not
+        just for this method.
+
+        Used by every Global Stop/Target/PnL Floor check so each always compares against
+        what's actually true at the instant it checks, never a snapshot that can lag by
+        exactly the trades that just happened."""
+        unrealized = sum(t['pnl'] for t in shared_state['active_trades'].values() if t is not None)
+        return shared_state['pnl']['realized'] + unrealized
+
     def check_triggers(self):
         if not self.trading_active: return
         now = datetime.now()
+        # Reset the tick-scoped closed-trades log at the very start of this tick's
+        # processing -- see _closed_this_tick's declaration in __init__ and close_position()
+        # for how it's populated, and _check_global_limits/_check_global_pnl_floor for how
+        # it's consumed. Every entry appended below (by any close_position() call anywhere
+        # in this tick, from any code path) reflects ONLY this tick's closes.
+        self._closed_this_tick = []
         # Futures Mode: every entry/exit evaluation below reads the Futures-Mode-aware price
         # (near-month future when the mode is on and resolved, otherwise identical to spot --
         # see config.get_eval_price()). Strike selection (inside open_position/
@@ -484,6 +554,20 @@ class LogicEngine:
             shared_state['unified_debug']['Put'] = None
 
         self._check_exits(now, idx_ltp, fire_1m, fire_5m)
+
+        # Refresh unrealized PnL (and each open trade's own pnl field) NOW, before any
+        # global check below reads a PnL total -- entries/exits above this line can have
+        # opened and/or closed a position THIS SAME TICK, and without this call the global
+        # checks below would read shared_state['pnl']['unrealized'] as it stood BEFORE
+        # those opens/closes, which can double-count a trade that just closed (its loss/
+        # profit already landed in 'realized' synchronously, but its last-known live pnl
+        # could still be sitting in the stale 'unrealized' cache for one more tick). See
+        # _live_total_pnl()'s docstring for the full incident this fixes. This call also
+        # keeps the CACHED unrealized figure fresh for anything else that reads it later
+        # this same tick (the UI display, and AutoController.run_loop's own SECOND_LEG
+        # global-stop check in auto_run.py), not just the two methods immediately below.
+        self.update_pnl()
+
         self._check_global_limits()
         self._check_global_pnl_floor()
         # Alerts are index-tagged (see ui_components._add_alert_card's 'index' field, added
@@ -849,8 +933,14 @@ class LogicEngine:
         firing at a total PnL that didn't match its configured threshold):
           1. The exact threshold value that was configured/armed at the moment this fired.
           2. The exact combined realized+unrealized total PnL at the moment it fired.
-          3. A per-trade PnL breakdown of every position THIS event closed (from
-             close_all_positions()'s returned list), not the whole session's history."""
+          3. A per-trade PnL breakdown of every position closed THIS TICK (from
+             self._closed_this_tick, passed in by the caller) -- NOT just what
+             close_all_positions() itself closed as part of THIS specific call. If a
+             different exit (e.g. an Index Stop) already closed a position earlier in the
+             same tick, before this limit's own check ran, that trade's PnL is what
+             actually contributed to total_at_fire -- so it now appears in this same
+             breakdown line instead of only as a separate CLOSED log entry above that has
+             to be manually cross-referenced to explain the total."""
         self.log_action(
             f"🎯 {label} FIRED: threshold=₹{threshold_value:.0f} | total PnL at fire=₹{total_at_fire:.0f}"
         )
@@ -864,6 +954,18 @@ class LogicEngine:
         """Manual 'Global Stop Loss' / 'Global Target' cards (params['global_stop_value']/
         'global_target_value', combined realized+unrealized PnL across BOTH sides).
 
+        total is computed via _live_total_pnl() -- summed fresh from currently-open trades,
+        NOT from the cached shared_state['pnl']['unrealized'] snapshot -- so this always
+        reflects reality at the instant it's checked, even if a trade opened and/or closed
+        earlier in this same tick (see _live_total_pnl()'s docstring for the incident this
+        fixes: a stale cached unrealized figure double-counting a trade that had already
+        closed and landed in 'realized'). check_triggers() ALSO now calls update_pnl()
+        immediately before this method runs, so the cached 'unrealized' figure itself
+        (read by the UI and by AutoController.run_loop's own SECOND_LEG check) is fresh
+        too by this point -- _live_total_pnl() and the cache should therefore always agree
+        with each other now; _live_total_pnl() is used here regardless as the more
+        directly-verifiable source of truth for this specific decision.
+
         On hit:
           - Every per-side field on BOTH Call and Put -- PnL/Index/Premium stop-target
             values+active-flags, and any pending Unified Entry order (armed/trigger_price/
@@ -876,9 +978,12 @@ class LogicEngine:
           - Any pending/armed Enter via Stop job (stop_via_candle_engine.py) is also cancelled
             outright via cancel_all(), rather than left to expire on its own later.
           - The exact threshold value, the exact total PnL at fire time, and a per-trade PnL
-            breakdown of what was actually closed are logged via _log_limit_fire, so a limit
-            firing at an unexpected PnL level can be diagnosed later purely from the Trade
-            Event Log.
+            breakdown of EVERY position closed this tick (self._closed_this_tick, not just
+            what close_all_positions() itself closed here) are logged via _log_limit_fire, so
+            a limit firing at an unexpected PnL level can be diagnosed later purely from the
+            Trade Event Log -- even when another exit closed a position moments earlier in
+            the same tick and that closure's PnL is what actually drove the total past the
+            threshold.
           - ONLY this limit's OWN active flag is switched off (one-shot, so it doesn't
             immediately refire against the same still-low/still-high PnL on the very next
             tick). Trading is deliberately NOT globally halted (self.trading_active stays
@@ -890,7 +995,7 @@ class LogicEngine:
             below remain fully independent -- firing one never disables another, and each
             can be re-armed by the person at any time to protect the next round of trades.
         """
-        total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
+        total = self._live_total_pnl()
 
         try: stop = float(params['global_stop_value']) if str(params['global_stop_value']).strip() != '' else 0.0
         except ValueError: stop = 0.0
@@ -904,17 +1009,17 @@ class LogicEngine:
         # this event locked in, since close_position() already appended it to
         # shared_state['pnl']['trades_history'].
         if params['global_stop_active'] and stop > 0 and total <= -stop:
-            closed = self.close_all_positions("Global Stop", save_pnl=False)
+            self.close_all_positions("Global Stop", save_pnl=False)
             self._clear_all_fields_and_orders("Global Stop")
             params['global_stop_active'] = False
             self.play_sound('error')
-            self._log_limit_fire("Global Stop", stop, total, closed)
+            self._log_limit_fire("Global Stop", stop, total, self._closed_this_tick)
         if params['global_tgt_active'] and target > 0 and total >= target:
-            closed = self.close_all_positions("Global Target", save_pnl=False)
+            self.close_all_positions("Global Target", save_pnl=False)
             self._clear_all_fields_and_orders("Global Target")
             params['global_tgt_active'] = False
             self.play_sound('error')
-            self._log_limit_fire("Global Target", target, total, closed)
+            self._log_limit_fire("Global Target", target, total, self._closed_this_tick)
 
     def _check_global_pnl_floor(self):
         """Global PnL Floor (params['global_trailing_active']/'global_trailing_value' --
@@ -923,6 +1028,10 @@ class LogicEngine:
         alongside the absolute Global Stop/Target above -- does not touch or interact with
         params['global_stop_value']/'global_target_value'/'global_stop_active'/
         'global_tgt_active' in any way.
+
+        total is computed via _live_total_pnl() -- see _check_global_limits() above and
+        _live_total_pnl()'s own docstring for why this reads fresh state rather than the
+        cached shared_state['pnl']['unrealized'] snapshot.
 
         This is a plain ABSOLUTE PnL level (typically a positive number, meant to lock in a
         minimum acceptable profit -- the negative/loss side is already covered by Global Stop
@@ -942,23 +1051,26 @@ class LogicEngine:
 
         On hit: reuses the EXACT SAME close-out sequence as _check_global_limits above
         (close_all_positions(save_pnl=False), _clear_all_fields_and_orders, error sound,
-        _log_limit_fire diagnostic logging), and -- matching _check_global_limits -- only
-        this control's OWN active flag is switched off on fire (one-shot); trading is not
-        globally halted and every other limit remains independently armed/re-armable."""
+        _log_limit_fire diagnostic logging with self._closed_this_tick -- see
+        _check_global_limits's docstring for why this whole-tick list is used instead of
+        just what close_all_positions() itself closed here), and -- matching
+        _check_global_limits -- only this control's OWN active flag is switched off on fire
+        (one-shot); trading is not globally halted and every other limit remains
+        independently armed/re-armable."""
         if not params.get('global_trailing_active', False):
             return
 
-        total = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
+        total = self._live_total_pnl()
 
         try: floor_value = float(params['global_trailing_value']) if str(params['global_trailing_value']).strip() != '' else 0.0
         except ValueError: floor_value = 0.0
 
         if floor_value > 0 and total <= floor_value:
-            closed = self.close_all_positions("Global PnL Floor", save_pnl=False)
+            self.close_all_positions("Global PnL Floor", save_pnl=False)
             self._clear_all_fields_and_orders("Global PnL Floor")
             params['global_trailing_active'] = False
             self.play_sound('error')
-            self._log_limit_fire("Global PnL Floor", floor_value, total, closed)
+            self._log_limit_fire("Global PnL Floor", floor_value, total, self._closed_this_tick)
 
     def _clear_all_fields_and_orders(self, reason):
         """Wipes every per-side field on BOTH Call and Put (via clear_leg_fields_callback, if

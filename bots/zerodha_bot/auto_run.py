@@ -644,7 +644,17 @@ class AutoController:
 
         if self.state == 'SECOND_LEG':
             lots = int(params['lots'])
-            total_pnl = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
+            # Computed LIVE from currently-open trades, NOT from the cached
+            # shared_state['pnl']['unrealized'] snapshot -- run_loop() (this method) runs
+            # BEFORE logic.check_triggers() each tick (see run_bot_logic() below), so at
+            # this point 'unrealized' can still be stale by exactly whatever opened/closed
+            # earlier this same tick, for the identical reason LogicEngine._live_total_pnl()
+            # was introduced (see logic_engine.py) -- a just-closed trade's loss/profit is
+            # already reflected in 'realized' but its last-known live pnl could still be
+            # sitting in the cache for one more tick, double-counting it here too.
+            total_pnl = shared_state['pnl']['realized'] + sum(
+                t['pnl'] for t in shared_state['active_trades'].values() if t is not None
+            )
 
             if total_pnl <= -(AutoConfig.GLB_STOP_PER_LOT * lots):
                 self.clear_leg_fields('Call')

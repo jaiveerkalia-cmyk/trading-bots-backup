@@ -153,7 +153,7 @@ DAY_CONFIGURATION = {
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
         },
-    3: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 25,
+    3: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 19,
         'lots': 3, 'live_mode': 1,
         'pos1_stop'                   : 20000,  # Thu per-leg SL for 1st position
         'pos2_close_target'           : 50000,  # Thu total PnL target to close 2nd position
