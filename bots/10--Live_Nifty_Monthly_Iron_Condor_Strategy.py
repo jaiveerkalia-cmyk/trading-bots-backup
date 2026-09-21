@@ -115,7 +115,7 @@ def calc_single_execution_charges(quantity, price, side, exchange='NSE'):
     return round(total, 2)
 
 # ============================================================================
-# 3. BLACK-SCHOLES IV & GREEKS ENGINE (Memory-Optimized)
+# 3. BLACK-SCHOLES IV & GREEKS ENGINE
 # ============================================================================
 _erf_vec = np.vectorize(math.erf)
 
@@ -187,7 +187,7 @@ def compute_single_iv_delta(price, S, K, T, r, option_type):
         return 0.0, 0.0
 
 # ============================================================================
-# 4. REDIS & KITE DATA STREAMING HELPERS
+# 4. DATA STREAMING & INSTRUMENT HELPERS
 # ============================================================================
 def subscribe_tokens(tick_client, tokens):
     valid_tokens = [int(t) for t in tokens if t and int(t) > 0]
@@ -221,7 +221,7 @@ def load_filtered_instruments():
     gc.collect()
     return df
 
-def get_target_monthly_expiry(instruments_df, current_date):
+def get_target_monthly_expiry(instruments_df, current_date, traded_expiries):
     unique_expiries = sorted(instruments_df['expiry'].unique())
     grouped = {}
     for exp in unique_expiries:
@@ -233,6 +233,8 @@ def get_target_monthly_expiry(instruments_df, current_date):
     best_diff = 999
 
     for exp in monthly_expiries:
+        if exp in traded_expiries:
+            continue
         exp_dt = datetime.strptime(exp, '%Y-%m-%d').date()
         dte = (exp_dt - current_date).days
         if min_entry_dte <= dte <= max_entry_dte:
@@ -244,23 +246,36 @@ def get_target_monthly_expiry(instruments_df, current_date):
     return candidate_exp
 
 # ============================================================================
-# 5. HIGH-SPEED DIRECT-APPEND LEDGERS & ATOMIC PERSISTENCE
+# 5. ATOMIC PERSISTENCE & DIRECT-APPEND CSV LEDGERS
 # ============================================================================
 def load_trade_state():
     if not os.path.exists(state_file):
-        return {'status': 'IDLE', 'trade_id': None}
+        return {'status': 'IDLE', 'trade_id': None, 'traded_expiries': []}
     try:
         with open(state_file, 'r') as f:
-            return json.load(f)
+            state = json.load(f)
+            if 'traded_expiries' not in state:
+                state['traded_expiries'] = []
+            return state
     except Exception as e:
         print(f"Error loading state: {e}. Reverting to IDLE.")
-        return {'status': 'IDLE', 'trade_id': None}
+        return {'status': 'IDLE', 'trade_id': None, 'traded_expiries': []}
 
 def save_trade_state(state):
     tmp_path = state_file + '.tmp'
     with open(tmp_path, 'w') as f:
         json.dump(state, f, indent=2)
     os.replace(tmp_path, state_file)
+
+def get_historical_traded_expiries():
+    expiries = set()
+    if os.path.exists(final_pnl_file):
+        try:
+            df = pd.read_csv(final_pnl_file, usecols=['Expiry'])
+            expiries = set(df['Expiry'].dropna().unique())
+        except Exception:
+            pass
+    return expiries
 
 def append_to_tradebook(row_dict):
     headers = ['Trade_ID', 'Timestamp', 'Symbol', 'Expiry', 'Strike', 'Option_Type', 
@@ -286,7 +301,7 @@ def append_to_final_pnl(row_dict):
 
 def append_to_daily_mtm(row_dict):
     headers = ['Trade_ID', 'Date', 'Expiry', 'DTE', 'Spot', 'Unrealized_Gross', 
-               'Realized_Net', 'Est_Closing_Charges', 'Total_Net_PnL', 'Net_Delta']
+               'Realized_Gross', 'Est_Closing_Charges', 'Total_Net_PnL', 'Net_Delta']
     file_exists = os.path.exists(daily_mtm_file)
     with open(daily_mtm_file, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -295,7 +310,7 @@ def append_to_daily_mtm(row_dict):
         writer.writerow(row_dict)
 
 # ============================================================================
-# 6. ORDER ROUTING & PRICE CHASING (NRML PRODUCT SPECIFICATION)
+# 6. ORDER ROUTING & REALISTIC EXECUTION (NRML)
 # ============================================================================
 def place_order(kite, sym, qty, side, live_execution_flag):
     ltp_sym = f"NFO:{sym}"
@@ -331,7 +346,7 @@ def place_order(kite, sym, qty, side, live_execution_flag):
     limit_price = get_limit_price(current_ltp)
 
     # -------------------------------------------------------------
-    # PAPER TRADING: REALISTIC ORDERBOOK DEPTH FILL & SLIPPAGE
+    # PAPER TRADING: ORDERBOOK DEPTH FILL & SLIPPAGE
     # -------------------------------------------------------------
     if live_execution_flag == 0:
         paper_fill_price = current_ltp
@@ -447,9 +462,12 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
     if exp_df.empty:
         return None
 
+    # Dynamic wide search bandwidth (±15% of spot)
+    min_k = spot * 0.85
+    max_k = spot * 1.15
     candidate_strikes = exp_df[(exp_df['strike'] % strike_step == 0) & 
-                               (exp_df['strike'] >= spot - 1500) & 
-                               (exp_df['strike'] <= spot + 1500)]['strike'].unique()
+                               (exp_df['strike'] >= min_k) & 
+                               (exp_df['strike'] <= max_k)]['strike'].unique()
     candidate_strikes = sorted(candidate_strikes)
 
     symbols_map = {}
@@ -457,15 +475,15 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
     quote_symbols = []
 
     for k in candidate_strikes:
-        ce_row = exp_df[(exp_df['strike'] == k) & (exp_df['instrument_type'] == 'CE')]
-        pe_row = exp_df[(exp_df['strike'] == k) & (exp_df['instrument_type'] == 'PE')]
-        if not ce_row.empty and not pe_row.empty:
-            ce_sym = ce_row.iloc[0]['tradingsymbol']
-            pe_sym = pe_row.iloc[0]['tradingsymbol']
+        ce_match = exp_df[(exp_df['strike'] == k) & (exp_df['instrument_type'] == 'CE')]
+        pe_match = exp_df[(exp_df['strike'] == k) & (exp_df['instrument_type'] == 'PE')]
+        if not ce_match.empty and not pe_match.empty:
+            ce_sym = ce_match.iloc[0]['tradingsymbol']
+            pe_sym = pe_match.iloc[0]['tradingsymbol']
             symbols_map[(k, 'CE')] = ce_sym
             symbols_map[(k, 'PE')] = pe_sym
-            tokens_map[(k, 'CE')] = int(ce_row.iloc[0]['instrument_token'])
-            tokens_map[(k, 'PE')] = int(pe_row.iloc[0]['instrument_token'])
+            tokens_map[(k, 'CE')] = int(ce_match.iloc[0]['instrument_token'])
+            tokens_map[(k, 'PE')] = int(pe_match.iloc[0]['instrument_token'])
             quote_symbols.extend([f"NFO:{ce_sym}", f"NFO:{pe_sym}"])
 
     if not quote_symbols:
@@ -491,15 +509,15 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
             q_ce = quotes[ce_sym]
             q_pe = quotes[pe_sym]
 
-            ce_buy = q_ce['depth']['buy'][0]['price'] if q_ce.get('depth', {}).get('buy') else q_ce.get('last_price', 0.0)
-            ce_sell = q_ce['depth']['sell'][0]['price'] if q_ce.get('depth', {}).get('sell') else q_ce.get('last_price', 0.0)
-            pe_buy = q_pe['depth']['buy'][0]['price'] if q_pe.get('depth', {}).get('buy') else q_pe.get('last_price', 0.0)
-            pe_sell = q_pe['depth']['sell'][0]['price'] if q_pe.get('depth', {}).get('sell') else q_pe.get('last_price', 0.0)
+            ce_bid = float(q_ce['depth']['buy'][0]['price']) if q_ce.get('depth', {}).get('buy') else 0.0
+            ce_ask = float(q_ce['depth']['sell'][0]['price']) if q_ce.get('depth', {}).get('sell') else 0.0
+            pe_bid = float(q_pe['depth']['buy'][0]['price']) if q_pe.get('depth', {}).get('buy') else 0.0
+            pe_ask = float(q_pe['depth']['sell'][0]['price']) if q_pe.get('depth', {}).get('sell') else 0.0
 
             chain_data.append({
                 'strike': k,
-                'ce_buy': ce_buy, 'ce_sell': ce_sell, 'ce_ltp': q_ce['last_price'],
-                'pe_buy': pe_buy, 'pe_sell': pe_sell, 'pe_ltp': q_pe['last_price']
+                'ce_bid': ce_bid, 'ce_ask': ce_ask, 'ce_ltp': q_ce.get('last_price', 0.0),
+                'pe_bid': pe_bid, 'pe_ask': pe_ask, 'pe_ltp': q_pe.get('last_price', 0.0)
             })
 
     cdf = pd.DataFrame(chain_data)
@@ -510,17 +528,17 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
         sub = cdf.copy()
         if opt_type == 'call':
             sub = sub[sub['strike'] >= spot]
-            buy_c, sell_c = 'ce_buy', 'ce_sell'
+            bid_c, ask_c = 'ce_bid', 'ce_ask'
         else:
             sub = sub[sub['strike'] <= spot]
-            buy_c, sell_c = 'pe_buy', 'pe_sell'
+            bid_c, ask_c = 'pe_bid', 'pe_ask'
 
-        sub = sub[(sub[buy_c] > 0) & (sub[sell_c] > 0)]
+        sub = sub[(sub[bid_c] > 0) & (sub[ask_c] > 0)]
         if sub.empty:
             return None, 0.0, 0.0
 
-        sub['mid'] = (sub[buy_c] + sub[sell_c]) / 2.0
-        sub['spread'] = (sub[buy_c] - sub[sell_c]).abs() / sub['mid']
+        sub['mid'] = (sub[bid_c] + sub[ask_c]) / 2.0
+        sub['spread'] = (sub[ask_c] - sub[bid_c]).abs() / sub['mid']
         sub = sub[sub['spread'] <= max_entry_spread_pct]
         if sub.empty:
             return None, 0.0, 0.0
@@ -534,7 +552,8 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
         best_idx = int(np.abs(deltas - target_delta).argmin())
         chosen_k = float(strikes[best_idx])
         row = sub[sub['strike'] == chosen_k].iloc[0]
-        exec_price = float(row[sell_c if is_short else buy_c])
+        # Short sells at Bid; Long buys at Ask
+        exec_price = float(row[bid_c if is_short else ask_c])
         return chosen_k, exec_price, float(deltas[best_idx])
 
     sc_k, sc_p, sc_d = pick_strike('call', target_short_delta, True)
@@ -568,12 +587,13 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
                 r_lc = cdf[cdf['strike'] == test_lc_k]
                 r_lp = cdf[cdf['strike'] == test_lp_k]
                 if not r_lc.empty and not r_lp.empty:
-                    test_lc_p = float(r_lc.iloc[0]['ce_buy'])
-                    test_lp_p = float(r_lp.iloc[0]['pe_buy'])
+                    test_lc_p = float(r_lc.iloc[0]['ce_ask'])  # Buying call wing at Ask
+                    test_lp_p = float(r_lp.iloc[0]['pe_ask'])  # Buying put wing at Ask
                     test_credit = (sc_p + sp_p) - (test_lc_p + test_lp_p)
                     test_w = max(test_lc_k - sc_k, sp_k - test_lp_k)
                     test_loss = test_w - test_credit
                     test_rr = test_loss / test_credit if test_credit > 0 else 999.0
+                    
                     if test_rr <= max_risk_reward_ratio and test_lc_p < sc_p and test_lp_p < sp_p:
                         lc_k, lc_p = test_lc_k, test_lc_p
                         lp_k, lp_p = test_lp_k, test_lp_p
@@ -583,6 +603,13 @@ def select_best_iron_condor_setup(kite, spot, exp_str, instruments_df, current_d
                         max_w = test_w
                         max_loss = test_loss
                         rr = test_rr
+                        
+                        # Recalculate deltas after inward wing shift
+                        lc_mid = (float(r_lc.iloc[0]['ce_bid']) + test_lc_p) / 2.0
+                        lp_mid = (float(r_lp.iloc[0]['pe_bid']) + test_lp_p) / 2.0
+                        _, new_lc_d = compute_single_iv_delta(lc_mid, spot, lc_k, T_entry, risk_free_rate, 'call')
+                        _, new_lp_d = compute_single_iv_delta(lp_mid, spot, lp_k, T_entry, risk_free_rate, 'put')
+                        lc_d, lp_d = abs(new_lc_d), abs(new_lp_d)
                         nudged = True
                         break
 
@@ -640,17 +667,21 @@ def run_trading_worker():
     kws.start()
     time.sleep(1.0)
 
-    # Resolve Initial Spot Underlying Price
+    # Initial Spot Quote Retrieval
+    spot_price = 0.0
     try:
         q_scrip = kite.ltp(f"NSE:{scrip}")
         spot_price = float(q_scrip[f"NSE:{scrip}"]['last_price'])
     except Exception as e:
-        print(f"Initial spot fetch warning: {e}. Defaulting to 0.0")
-        spot_price = 0.0
+        print(f"Initial spot fetch warning: {e}")
 
     state = load_trade_state()
+    historical_expiries = get_historical_traded_expiries()
+    traded_expiries = set(state.get('traded_expiries', [])).union(historical_expiries)
+    state['traded_expiries'] = sorted(list(traded_expiries))
+    save_trade_state(state)
+
     active_tokens = []
-    
     if state.get('status') == 'ACTIVE':
         legs = state['legs']
         active_tokens = [legs['sc']['token'], legs['lc']['token'], legs['sp']['token'], legs['lp']['token']]
@@ -664,11 +695,12 @@ def run_trading_worker():
         print(f"  Subscribed Tokens   : {active_tokens}", flush=True)
     else:
         print(f"  Active Trade State  : IDLE (Hunting for ~{target_entry_dte} DTE Monthly Setup)", flush=True)
+    print(f"  Locked Expiries     : {state['traded_expiries']}", flush=True)
     print("=" * 88 + "\n", flush=True)
 
     daily_trade_exited = False
 
-    # Synchronize to Next Minute
+    # Synchronize to next minute
     now = datetime.now(KOLKATA_TZ)
     time.sleep(max(0, 60 - now.second))
 
@@ -692,21 +724,33 @@ def run_trading_worker():
             if state.get('status') == 'ACTIVE':
                 legs = state['legs']
                 q_val = state['frozen_config']['quantity']
-                sc_p = get_live_price(legs['sc']['token'], legs['sc']['entry_price'])
-                lc_p = get_live_price(legs['lc']['token'], legs['lc']['entry_price'])
-                sp_p = get_live_price(legs['sp']['token'], legs['sp']['entry_price'])
-                lp_p = get_live_price(legs['lp']['token'], legs['lp']['entry_price'])
+                
+                # Snapshot closing prices using depth quotes
+                try:
+                    q_snap = kite.quote([f"NFO:{legs['sc']['sym']}", f"NFO:{legs['lc']['sym']}", 
+                                         f"NFO:{legs['sp']['sym']}", f"NFO:{legs['lp']['sym']}"])
+                    sc_ask = float(q_snap[f"NFO:{legs['sc']['sym']}"]['depth']['sell'][0]['price'])
+                    lc_bid = float(q_snap[f"NFO:{legs['lc']['sym']}"]['depth']['buy'][0]['price'])
+                    sp_ask = float(q_snap[f"NFO:{legs['sp']['sym']}"]['depth']['sell'][0]['price'])
+                    lp_bid = float(q_snap[f"NFO:{legs['lp']['sym']}"]['depth']['buy'][0]['price'])
+                except Exception:
+                    sc_ask = get_live_price(legs['sc']['token'], legs['sc']['entry_price'])
+                    lc_bid = get_live_price(legs['lc']['token'], legs['lc']['entry_price'])
+                    sp_ask = get_live_price(legs['sp']['token'], legs['sp']['entry_price'])
+                    lp_bid = get_live_price(legs['lp']['token'], legs['lp']['entry_price'])
 
-                unrealized = ((legs['sc']['entry_price'] - sc_p) + (lc_p - legs['lc']['entry_price']) +
-                              (legs['sp']['entry_price'] - sp_p) + (lp_p - legs['lp']['entry_price'])) * q_val
+                unrealized_gross = ((legs['sc']['entry_price'] - sc_ask) + (lc_bid - legs['lc']['entry_price']) +
+                                    (legs['sp']['entry_price'] - sp_ask) + (lp_bid - legs['lp']['entry_price'])) * q_val
 
                 est_close_charges = (
-                    commission_single_leg(q_val, sc_p, legs['sc']['entry_price'], exchange) +
-                    commission_single_leg(q_val, legs['lc']['entry_price'], lc_p, exchange) +
-                    commission_single_leg(q_val, sp_p, legs['sp']['entry_price'], exchange) +
-                    commission_single_leg(q_val, legs['lp']['entry_price'], lp_p, exchange)
+                    commission_single_leg(q_val, sc_ask, legs['sc']['entry_price'], exchange) +
+                    commission_single_leg(q_val, legs['lc']['entry_price'], lc_bid, exchange) +
+                    commission_single_leg(q_val, sp_ask, legs['sp']['entry_price'], exchange) +
+                    commission_single_leg(q_val, legs['lp']['entry_price'], lp_bid, exchange)
                 )
-                net_pnl = unrealized + state.get('realized_net_pnl', 0.0) - est_close_charges
+
+                total_comm = state.get('total_commission_paid', 0.0) + est_close_charges
+                total_net = (unrealized_gross + state.get('realized_gross_pnl', 0.0)) - total_comm
                 exp_d = datetime.strptime(state['expiry'], '%Y-%m-%d').date()
                 cur_dte = (exp_d - now.date()).days
 
@@ -716,20 +760,28 @@ def run_trading_worker():
                     'Expiry': state['expiry'],
                     'DTE': cur_dte,
                     'Spot': spot_price,
-                    'Unrealized_Gross': round(unrealized, 2),
-                    'Realized_Net': round(state.get('realized_net_pnl', 0.0), 2),
+                    'Unrealized_Gross': round(unrealized_gross, 2),
+                    'Realized_Gross': round(state.get('realized_gross_pnl', 0.0), 2),
                     'Est_Closing_Charges': round(est_close_charges, 2),
-                    'Total_Net_PnL': round(net_pnl, 2),
+                    'Total_Net_PnL': round(total_net, 2),
                     'Net_Delta': 0.0
                 })
             break
 
-        # Periodic Underlying Spot Refresh
+        # Periodic Underlying Spot Refresh with Stale Guard
         try:
             q_scrip = kite.ltp(f"NSE:{scrip}")
-            spot_price = float(q_scrip[f"NSE:{scrip}"]['last_price'])
-        except Exception:
-            pass
+            fresh_spot = float(q_scrip[f"NSE:{scrip}"]['last_price'])
+            if fresh_spot > 0:
+                spot_price = fresh_spot
+        except Exception as e:
+            print(f"Warning: Failed to fetch spot price: {e}")
+
+        # Missing/Zero Spot Guard: Halt evaluation loop if spot is missing/corrupt
+        if spot_price <= 0.0:
+            print(f"[{now.strftime('%H:%M:%S')}] CRITICAL: Corrupted/Stale spot price ({spot_price:.2f}). Skipping cycle...", flush=True)
+            time.sleep(check_interval_seconds)
+            continue
 
         # -------------------------------------------------------------
         # STATE: IDLE - ENTRY SCANNING ENGINE
@@ -741,7 +793,7 @@ def run_trading_worker():
             )
 
             if within_scan_window:
-                cand_exp = get_target_monthly_expiry(instruments_df, now.date())
+                cand_exp = get_target_monthly_expiry(instruments_df, now.date(), state['traded_expiries'])
                 if cand_exp:
                     setup = select_best_iron_condor_setup(kite, spot_price, cand_exp, instruments_df, now.date())
                     if setup:
@@ -755,7 +807,7 @@ def run_trading_worker():
                         print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] ENTRY CRITERIA SATISFIED -> {trade_id}", flush=True)
                         print(f"Expiry: {cand_exp} ({setup['dte']} DTE) | Spot: {spot_price:.2f} | Risk-Reward: 1:{setup['rr_ratio']:.2f}", flush=True)
 
-                        state = {'status': 'ENTRY_PENDING', 'trade_id': trade_id}
+                        state = {'status': 'ENTRY_PENDING', 'trade_id': trade_id, 'traded_expiries': state['traded_expiries']}
                         save_trade_state(state)
 
                         # Phased Entry Execution: Long Wings First (Hedge Protection)
@@ -769,7 +821,7 @@ def run_trading_worker():
                                 place_order(kite, setup['lc']['sym'], total_qty, 'SELL', live_mode)
                             if fill_lp['status'] == 'COMPLETE':
                                 place_order(kite, setup['lp']['sym'], total_qty, 'SELL', live_mode)
-                            state = {'status': 'IDLE', 'trade_id': None}
+                            state = {'status': 'IDLE', 'trade_id': None, 'traded_expiries': state['traded_expiries']}
                             save_trade_state(state)
                             time.sleep(check_interval_seconds)
                             continue
@@ -786,7 +838,7 @@ def run_trading_worker():
                                 place_order(kite, setup['sp']['sym'], total_qty, 'BUY', live_mode)
                             place_order(kite, setup['lc']['sym'], total_qty, 'SELL', live_mode)
                             place_order(kite, setup['lp']['sym'], total_qty, 'SELL', live_mode)
-                            state = {'status': 'IDLE', 'trade_id': None}
+                            state = {'status': 'IDLE', 'trade_id': None, 'traded_expiries': state['traded_expiries']}
                             save_trade_state(state)
                             time.sleep(check_interval_seconds)
                             continue
@@ -800,11 +852,13 @@ def run_trading_worker():
                         }
 
                         ts_str = now.strftime('%Y-%m-%d %H:%M:%S')
+                        entry_comm = 0.0
                         for k_leg, side_str, act_tag in [('lc', 'BUY', 'ENTRY_HEDGE'), ('lp', 'BUY', 'ENTRY_HEDGE'),
                                                          ('sc', 'SELL', 'ENTRY_SHORT'), ('sp', 'SELL', 'ENTRY_SHORT')]:
                             f_p = legs_conf[k_leg]['entry_price']
                             o_id = fill_lc['order_id'] if k_leg == 'lc' else (fill_lp['order_id'] if k_leg == 'lp' else (fill_sc['order_id'] if k_leg == 'sc' else fill_sp['order_id']))
                             chg = calc_single_execution_charges(total_qty, f_p, side_str, exchange)
+                            entry_comm += chg
                             append_to_tradebook({
                                 'Trade_ID': trade_id, 'Timestamp': ts_str, 'Symbol': symbol,
                                 'Expiry': cand_exp, 'Strike': legs_conf[k_leg]['strike'],
@@ -825,13 +879,14 @@ def run_trading_worker():
                             'legs': legs_conf,
                             'call_wing_width': setup['call_wing_w'],
                             'put_wing_width': setup['put_wing_w'],
-                            'realized_net_pnl': 0.0,
-                            'total_commission_paid': 0.0,
+                            'realized_gross_pnl': 0.0,
+                            'total_commission_paid': entry_comm,
                             'down_rolls_done': 0,
                             'up_rolls_done': 0,
                             'spot_at_roll_1': None,
                             'last_adj_date': str(now.date()),
                             'max_drawdown_seen': 0.0,
+                            'traded_expiries': state['traded_expiries'],
                             'frozen_config': {
                                 'quantity': total_qty,
                                 'setup_cost': total_cap,
@@ -855,22 +910,36 @@ def run_trading_worker():
             q_val = state['frozen_config']['quantity']
             cfg = state['frozen_config']
 
-            sc_p = get_live_price(legs['sc']['token'], legs['sc']['entry_price'])
-            lc_p = get_live_price(legs['lc']['token'], legs['lc']['entry_price'])
-            sp_p = get_live_price(legs['sp']['token'], legs['sp']['entry_price'])
-            lp_p = get_live_price(legs['lp']['token'], legs['lp']['entry_price'])
+            # Real Bid/Ask quotes for accurate Mark-to-Market
+            try:
+                active_symbols = [f"NFO:{legs['sc']['sym']}", f"NFO:{legs['lc']['sym']}", 
+                                  f"NFO:{legs['sp']['sym']}", f"NFO:{legs['lp']['sym']}"]
+                live_quotes = kite.quote(active_symbols)
+                sc_ask = float(live_quotes[f"NFO:{legs['sc']['sym']}"]['depth']['sell'][0]['price']) if live_quotes[f"NFO:{legs['sc']['sym']}"]['depth']['sell'] else float(live_quotes[f"NFO:{legs['sc']['sym']}"]['last_price'])
+                lc_bid = float(live_quotes[f"NFO:{legs['lc']['sym']}"]['depth']['buy'][0]['price']) if live_quotes[f"NFO:{legs['lc']['sym']}"]['depth']['buy'] else float(live_quotes[f"NFO:{legs['lc']['sym']}"]['last_price'])
+                sp_ask = float(live_quotes[f"NFO:{legs['sp']['sym']}"]['depth']['sell'][0]['price']) if live_quotes[f"NFO:{legs['sp']['sym']}"]['depth']['sell'] else float(live_quotes[f"NFO:{legs['sp']['sym']}"]['last_price'])
+                lp_bid = float(live_quotes[f"NFO:{legs['lp']['sym']}"]['depth']['buy'][0]['price']) if live_quotes[f"NFO:{legs['lp']['sym']}"]['depth']['buy'] else float(live_quotes[f"NFO:{legs['lp']['sym']}"]['last_price'])
+            except Exception:
+                # Resilient Fallback to Redis LTP
+                sc_ask = get_live_price(legs['sc']['token'], legs['sc']['entry_price'])
+                lc_bid = get_live_price(legs['lc']['token'], legs['lc']['entry_price'])
+                sp_ask = get_live_price(legs['sp']['token'], legs['sp']['entry_price'])
+                lp_bid = get_live_price(legs['lp']['token'], legs['lp']['entry_price'])
 
-            unrealized_gross = ((legs['sc']['entry_price'] - sc_p) + (lc_p - legs['lc']['entry_price']) +
-                                (legs['sp']['entry_price'] - sp_p) + (lp_p - legs['lp']['entry_price'])) * q_val
+            unrealized_gross = ((legs['sc']['entry_price'] - sc_ask) + (lc_bid - legs['lc']['entry_price']) +
+                                (legs['sp']['entry_price'] - sp_ask) + (lp_bid - legs['lp']['entry_price'])) * q_val
 
+            # Closing charges if squared off now
             comm_open_legs = (
-                commission_single_leg(q_val, sc_p, legs['sc']['entry_price'], exchange) +
-                commission_single_leg(q_val, legs['lc']['entry_price'], lc_p, exchange) +
-                commission_single_leg(q_val, sp_p, legs['sp']['entry_price'], exchange) +
-                commission_single_leg(q_val, legs['lp']['entry_price'], lp_p, exchange)
+                commission_single_leg(q_val, sc_ask, legs['sc']['entry_price'], exchange) +
+                commission_single_leg(q_val, legs['lc']['entry_price'], lc_bid, exchange) +
+                commission_single_leg(q_val, sp_ask, legs['sp']['entry_price'], exchange) +
+                commission_single_leg(q_val, legs['lp']['entry_price'], lp_bid, exchange)
             )
 
-            total_net_pnl = unrealized_gross + state['realized_net_pnl'] - comm_open_legs
+            # Total Net Realized & Unrealized PnL (No Double Commission Deduction)
+            total_net_pnl = unrealized_gross + state.get('realized_gross_pnl', 0.0) - (state.get('total_commission_paid', 0.0) + comm_open_legs)
+            
             if total_net_pnl < state['max_drawdown_seen']:
                 state['max_drawdown_seen'] = round(total_net_pnl, 2)
                 save_trade_state(state)
@@ -879,21 +948,21 @@ def run_trading_worker():
             cur_dte = (exp_date_obj - now.date()).days
             T_curr = max(cur_dte / 365.0, 1e-5)
 
-            _, sc_d = compute_single_iv_delta(sc_p, spot_price, legs['sc']['strike'], T_curr, risk_free_rate, 'call')
-            _, sp_d = compute_single_iv_delta(sp_p, spot_price, legs['sp']['strike'], T_curr, risk_free_rate, 'put')
+            _, sc_d = compute_single_iv_delta(sc_ask, spot_price, legs['sc']['strike'], T_curr, risk_free_rate, 'call')
+            _, sp_d = compute_single_iv_delta(sp_ask, spot_price, legs['sp']['strike'], T_curr, risk_free_rate, 'put')
             net_delta = ((-sc_d) + (-sp_d)) * q_val
 
             # Every-Minute Real-Time MTM Progress Display
             print(f"[{now.strftime('%H:%M:%S')}] MTM | DTE: {cur_dte:02d} | Spot: {spot_price:.1f} | "
-                  f"SC({legs['sc']['strike']:.0f}): {sc_p:.2f} | LC({legs['lc']['strike']:.0f}): {lc_p:.2f} | "
-                  f"SP({legs['sp']['strike']:.0f}): {sp_p:.2f} | LP({legs['lp']['strike']:.0f}): {lp_p:.2f} | "
+                  f"SC({legs['sc']['strike']:.0f}): {sc_ask:.2f} | LC({legs['lc']['strike']:.0f}): {lc_bid:.2f} | "
+                  f"SP({legs['sp']['strike']:.0f}): {sp_ask:.2f} | LP({legs['lp']['strike']:.0f}): {lp_bid:.2f} | "
                   f"Gross: Rs. {unrealized_gross:+,.2f} | Net: Rs. {total_net_pnl:+,.2f} | "
                   f"Target: Rs. {cfg['target_pnl']:,.2f} | Stop: Rs. {cfg['stop_pnl']:,.2f} | Delta: {net_delta:+.1f}", flush=True)
 
-            # Exit Conditions Evaluation
+            # Exit Conditions Evaluation (Sunset strictly triggers immediately if cur_dte < 15)
             target_hit = total_net_pnl >= cfg['target_pnl']
             stop_hit = total_net_pnl <= cfg['stop_pnl']
-            dte_cutoff_hit = (cur_dte <= cfg['exit_dte'] and curr_time >= rollover_time)
+            dte_cutoff_hit = (cur_dte < cfg['exit_dte']) or (cur_dte == cfg['exit_dte'] and curr_time >= rollover_time)
             friction_guard_hit = False
 
             if (state['down_rolls_done'] > 0 or state['up_rolls_done'] > 0) and total_net_pnl > 0:
@@ -919,9 +988,11 @@ def run_trading_worker():
                 f_lp_x = place_order(kite, legs['lp']['sym'], q_val, 'SELL', live_mode)
 
                 exit_ts = now.strftime('%Y-%m-%d %H:%M:%S')
+                exit_comm = 0.0
                 for k_leg, s_side, f_res in [('sc', 'BUY', f_sc_x), ('sp', 'BUY', f_sp_x),
                                              ('lc', 'SELL', f_lc_x), ('lp', 'SELL', f_lp_x)]:
                     chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
+                    exit_comm += chg
                     append_to_tradebook({
                         'Trade_ID': state['trade_id'], 'Timestamp': exit_ts, 'Symbol': symbol,
                         'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
@@ -931,8 +1002,9 @@ def run_trading_worker():
                         'Charges_STT_Brok': chg, 'Action_Tag': 'EXIT_' + reason.split()[0].upper()
                     })
 
-                total_comm = state['total_commission_paid'] + comm_open_legs
-                final_net = total_net_pnl
+                total_comm = state['total_commission_paid'] + exit_comm
+                final_gross_pnl = unrealized_gross + state.get('realized_gross_pnl', 0.0)
+                final_net = final_gross_pnl - total_comm
                 roc = (final_net / cfg['setup_cost']) * 100.0
                 days_held = (now.date() - datetime.strptime(state['entry_time'], '%Y-%m-%d %H:%M:%S').date()).days
 
@@ -941,14 +1013,18 @@ def run_trading_worker():
                     'Entry_Time': state['entry_time'], 'Exit_Time': exit_ts,
                     'Days_Held': days_held, 'Entry_Spot': state['entry_spot'],
                     'Exit_Spot': spot_price, 'Initial_Credit_Pts': state['initial_credit_pts'],
-                    'Gross_PnL': round(unrealized_gross + state['realized_net_pnl'], 2),
+                    'Gross_PnL': round(final_gross_pnl, 2),
                     'Total_Charges': round(total_comm, 2),
                     'Net_Realized_PnL': round(final_net, 2),
                     'Setup_Capital': cfg['setup_cost'], 'RoC_Pct': round(roc, 2),
                     'Exit_Reason': reason, 'Max_Drawdown_Seen': state['max_drawdown_seen']
                 })
 
-                state = {'status': 'IDLE', 'trade_id': None}
+                # Permanently lock this monthly expiry from being re-entered
+                if state['expiry'] not in state['traded_expiries']:
+                    state['traded_expiries'].append(state['expiry'])
+
+                state = {'status': 'IDLE', 'trade_id': None, 'traded_expiries': state['traded_expiries']}
                 save_trade_state(state)
                 daily_trade_exited = True
                 print(f"Cycle Settled. Final Realized Net PnL: Rs. {final_net:,.2f} | RoC: {roc:+.2f}%\n", flush=True)
@@ -956,7 +1032,7 @@ def run_trading_worker():
                 continue
 
             # ---------------------------------------------------------
-            # DEFENSIVE ADJUSTMENT ENGINE (Video 3 Asymmetric Rolls)
+            # DEFENSIVE ADJUSTMENT ENGINE (Video 3 Dynamic Rolls)
             # ---------------------------------------------------------
             timing_ok = (curr_time >= rollover_time) if adjustment_timing == 'eod' else True
             cooldown_ok = str(now.date()) > state['last_adj_date']
@@ -967,48 +1043,91 @@ def run_trading_worker():
                 put_wing_w = state['put_wing_width']
                 exp_scope = instruments_df[instruments_df['expiry'] == state['expiry']]
 
+                # Helper to pre-verify replacement strikes & quotes
+                def verify_roll_spread(opt_type, new_short_k, new_long_k):
+                    sc_match = exp_scope[(exp_scope['strike'] == new_short_k) & (exp_scope['instrument_type'] == opt_type)]
+                    lc_match = exp_scope[(exp_scope['strike'] == new_long_k) & (exp_scope['instrument_type'] == opt_type)]
+                    if sc_match.empty or lc_match.empty:
+                        return False, None, None, 0.0, 0.0
+
+                    row_s = sc_match.iloc[0]
+                    row_l = lc_match.iloc[0]
+
+                    try:
+                        q_roll = kite.quote([f"NFO:{row_s['tradingsymbol']}", f"NFO:{row_l['tradingsymbol']}"])
+                        # Selling new short at Bid; Buying new long at Ask
+                        new_s_p = float(q_roll[f"NFO:{row_s['tradingsymbol']}"]['depth']['buy'][0]['price']) if q_roll[f"NFO:{row_s['tradingsymbol']}"]['depth']['buy'] else float(q_roll[f"NFO:{row_s['tradingsymbol']}"]['last_price'])
+                        new_l_p = float(q_roll[f"NFO:{row_l['tradingsymbol']}"]['depth']['sell'][0]['price']) if q_roll[f"NFO:{row_l['tradingsymbol']}"]['depth']['sell'] else float(q_roll[f"NFO:{row_l['tradingsymbol']}"]['last_price'])
+                        
+                        if new_l_p < new_s_p:  # Strict net credit requirement
+                            return True, row_s, row_l, new_s_p, new_l_p
+                    except Exception as e:
+                        print(f"Error fetching roll spread quotes: {e}")
+                    return False, None, None, 0.0, 0.0
+
                 # SCENARIO A1: Downside Stage 1 (Spot Breaches Short Put)
                 if state['down_rolls_done'] == 0 and spot_price <= legs['sp']['strike']:
                     print(f"\n[ADJUSTMENT] Downside Breach 1: Spot {spot_price:.2f} <= Short Put {legs['sp']['strike']}", flush=True)
-                    comm_close_call = (
-                        commission_single_leg(q_val, sc_p, legs['sc']['entry_price'], exchange) +
-                        commission_single_leg(q_val, legs['lc']['entry_price'], lc_p, exchange)
-                    )
-                    call_gross = (legs['sc']['entry_price'] - sc_p + lc_p - legs['lc']['entry_price']) * q_val
-                    call_net = call_gross - comm_close_call
 
-                    # Buy back Short Call, Sell out Long Call
-                    f_sc_c = place_order(kite, legs['sc']['sym'], q_val, 'BUY', live_mode)
-                    f_lc_c = place_order(kite, legs['lc']['sym'], q_val, 'SELL', live_mode)
-
-                    adj_ts = now.strftime('%Y-%m-%d %H:%M:%S')
-                    for k_leg, s_side, f_res in [('sc', 'BUY', f_sc_c), ('lc', 'SELL', f_lc_c)]:
-                        chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
-                        append_to_tradebook({
-                            'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
-                            'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
-                            'Option_Type': 'CE', 'Order_Side': s_side, 'Quantity': q_val,
-                            'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
-                            'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_CLOSE_CALL'
-                        })
-
-                    # Select New ~45 Delta Call Spread
-                    new_sc_k = None
+                    # 1. Pre-calculate candidate ~45 Delta Call Spread
                     cand_k = sorted([k for k in exp_scope['strike'].unique() if k >= spot_price and k % strike_step == 0])
+                    quote_syms = [f"NFO:{exp_scope[(exp_scope['strike'] == k) & (exp_scope['instrument_type'] == 'CE')].iloc[0]['tradingsymbol']}" for k in cand_k if not exp_scope[(exp_scope['strike'] == k) & (exp_scope['instrument_type'] == 'CE')].empty]
+                    
+                    try:
+                        batch_q = kite.quote(quote_syms)
+                    except Exception:
+                        batch_q = {}
+
+                    new_sc_k = None
+                    best_delta_diff = 999
                     for k in cand_k:
-                        iv, d = compute_single_iv_delta(sc_p, spot_price, k, T_snap, risk_free_rate, 'call')
-                        if abs(d - roll_call_delta) < 0.08:
-                            new_sc_k = k
-                            break
+                        sym_match = exp_scope[(exp_scope['strike'] == k) & (exp_scope['instrument_type'] == 'CE')]
+                        if sym_match.empty:
+                            continue
+                        tsym = f"NFO:{sym_match.iloc[0]['tradingsymbol']}"
+                        if tsym in batch_q:
+                            mid_p = (float(batch_q[tsym]['depth']['buy'][0]['price']) + float(batch_q[tsym]['depth']['sell'][0]['price'])) / 2.0 if batch_q[tsym]['depth']['buy'] and batch_q[tsym]['depth']['sell'] else float(batch_q[tsym]['last_price'])
+                            _, d = compute_single_iv_delta(mid_p, spot_price, k, T_snap, risk_free_rate, 'call')
+                            diff = abs(d - roll_call_delta)
+                            if diff < best_delta_diff:
+                                best_delta_diff = diff
+                                new_sc_k = k
 
                     new_lc_k = new_sc_k + call_wing_w if new_sc_k else None
-                    if new_sc_k and new_lc_k:
-                        row_sc = exp_scope[(exp_scope['strike'] == new_sc_k) & (exp_scope['instrument_type'] == 'CE')].iloc[0]
-                        row_lc = exp_scope[(exp_scope['strike'] == new_lc_k) & (exp_scope['instrument_type'] == 'CE')].iloc[0]
 
-                        # Margin-Safe: Buy New Long Hedge First, Then Sell New Short Leg
+                    # 2. Pre-verify strikes and credit before routing any orders
+                    valid_roll, row_sc, row_lc, new_sc_p, new_lc_p = verify_roll_spread('CE', new_sc_k, new_lc_k) if new_sc_k and new_lc_k else (False, None, None, 0, 0)
+
+                    if valid_roll:
+                        # 3. Safe Execution: Close Old Call Spread
+                        f_sc_c = place_order(kite, legs['sc']['sym'], q_val, 'BUY', live_mode)
+                        f_lc_c = place_order(kite, legs['lc']['sym'], q_val, 'SELL', live_mode)
+
+                        comm_close_call = (
+                            calc_single_execution_charges(q_val, f_sc_c['fill_price'], 'BUY', exchange) +
+                            calc_single_execution_charges(q_val, f_lc_c['fill_price'], 'SELL', exchange)
+                        )
+                        call_gross = (legs['sc']['entry_price'] - f_sc_c['fill_price'] + f_lc_c['fill_price'] - legs['lc']['entry_price']) * q_val
+
+                        adj_ts = now.strftime('%Y-%m-%d %H:%M:%S')
+                        for k_leg, s_side, f_res in [('sc', 'BUY', f_sc_c), ('lc', 'SELL', f_lc_c)]:
+                            chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
+                            append_to_tradebook({
+                                'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
+                                'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
+                                'Option_Type': 'CE', 'Order_Side': s_side, 'Quantity': q_val,
+                                'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
+                                'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_CLOSE_CALL'
+                            })
+
+                        # 4. Open New Call Spread (Hedge Long First)
                         f_new_lc = place_order(kite, row_lc['tradingsymbol'], q_val, 'BUY', live_mode)
                         f_new_sc = place_order(kite, row_sc['tradingsymbol'], q_val, 'SELL', live_mode)
+
+                        comm_open_new = (
+                            calc_single_execution_charges(q_val, f_new_lc['fill_price'], 'BUY', exchange) +
+                            calc_single_execution_charges(q_val, f_new_sc['fill_price'], 'SELL', exchange)
+                        )
 
                         for k_k, s_side, f_res in [(new_lc_k, 'BUY', f_new_lc), (new_sc_k, 'SELL', f_new_sc)]:
                             chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
@@ -1020,8 +1139,8 @@ def run_trading_worker():
                                 'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_OPEN_CALL'
                             })
 
-                        state['realized_net_pnl'] += call_net
-                        state['total_commission_paid'] += comm_close_call
+                        state['realized_gross_pnl'] = state.get('realized_gross_pnl', 0.0) + call_gross
+                        state['total_commission_paid'] += (comm_close_call + comm_open_new)
                         state['down_rolls_done'] = 1
                         state['last_adj_date'] = str(now.date())
                         state['spot_at_roll_1'] = spot_price
@@ -1031,109 +1150,161 @@ def run_trading_worker():
                         subscribe_tokens(kws, [int(row_sc['instrument_token']), int(row_lc['instrument_token'])])
                         print(f"Call Spread Rolled to ~45D Cushion -> New Strikes: [{new_sc_k}/{new_lc_k}]\n", flush=True)
 
-                # SCENARIO A2: Downside Stage 2 (Market Breaches Long Put Wing)
+                # SCENARIO A2: Downside Stage 2 (Market Breaches Long Put Wing -> Iron Fly)
                 elif state['down_rolls_done'] == 1 and spot_price <= legs['lp']['strike'] and spot_price < state['spot_at_roll_1']:
                     print(f"\n[ADJUSTMENT] Downside Breach 2: Spot {spot_price:.2f} <= Long Put {legs['lp']['strike']} (Converting to Iron Fly)", flush=True)
-                    comm_close_call = (
-                        commission_single_leg(q_val, sc_p, legs['sc']['entry_price'], exchange) +
-                        commission_single_leg(q_val, legs['lc']['entry_price'], lc_p, exchange)
-                    )
-                    call_gross = (legs['sc']['entry_price'] - sc_p + lc_p - legs['lc']['entry_price']) * q_val
-                    call_net = call_gross - comm_close_call
-
-                    f_sc_c = place_order(kite, legs['sc']['sym'], q_val, 'BUY', live_mode)
-                    f_lc_c = place_order(kite, legs['lc']['sym'], q_val, 'SELL', live_mode)
-
-                    adj_ts = now.strftime('%Y-%m-%d %H:%M:%S')
-                    for k_leg, s_side, f_res in [('sc', 'BUY', f_sc_c), ('lc', 'SELL', f_lc_c)]:
-                        chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
-                        append_to_tradebook({
-                            'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
-                            'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
-                            'Option_Type': 'CE', 'Order_Side': s_side, 'Quantity': q_val,
-                            'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
-                            'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_CLOSE_CALL'
-                        })
-
                     new_sc_k = legs['sp']['strike']
                     new_lc_k = new_sc_k + call_wing_w
-                    row_sc = exp_scope[(exp_scope['strike'] == new_sc_k) & (exp_scope['instrument_type'] == 'CE')].iloc[0]
-                    row_lc = exp_scope[(exp_scope['strike'] == new_lc_k) & (exp_scope['instrument_type'] == 'CE')].iloc[0]
 
-                    f_new_lc = place_order(kite, row_lc['tradingsymbol'], q_val, 'BUY', live_mode)
-                    f_new_sc = place_order(kite, row_sc['tradingsymbol'], q_val, 'SELL', live_mode)
+                    valid_roll, row_sc, row_lc, new_sc_p, new_lc_p = verify_roll_spread('CE', new_sc_k, new_lc_k)
 
-                    for k_k, s_side, f_res in [(new_lc_k, 'BUY', f_new_lc), (new_sc_k, 'SELL', f_new_sc)]:
-                        chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
-                        append_to_tradebook({
-                            'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
-                            'Expiry': state['expiry'], 'Strike': k_k,
-                            'Option_Type': 'CE', 'Order_Side': s_side, 'Quantity': q_val,
-                            'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
-                            'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_OPEN_CALL'
-                        })
+                    if valid_roll:
+                        f_sc_c = place_order(kite, legs['sc']['sym'], q_val, 'BUY', live_mode)
+                        f_lc_c = place_order(kite, legs['lc']['sym'], q_val, 'SELL', live_mode)
 
-                    state['realized_net_pnl'] += call_net
-                    state['total_commission_paid'] += comm_close_call
-                    state['down_rolls_done'] = 2
-                    state['last_adj_date'] = str(now.date())
-                    state['legs']['sc'] = {'strike': new_sc_k, 'sym': row_sc['tradingsymbol'], 'token': int(row_sc['instrument_token']), 'entry_price': f_new_sc['fill_price']}
-                    state['legs']['lc'] = {'strike': new_lc_k, 'sym': row_lc['tradingsymbol'], 'token': int(row_lc['instrument_token']), 'entry_price': f_new_lc['fill_price']}
-                    save_trade_state(state)
-                    subscribe_tokens(kws, [int(row_sc['instrument_token']), int(row_lc['instrument_token'])])
-                    print(f"Position Converted to Centered Iron Fly on {new_sc_k} Strike\n", flush=True)
+                        comm_close_call = (
+                            calc_single_execution_charges(q_val, f_sc_c['fill_price'], 'BUY', exchange) +
+                            calc_single_execution_charges(q_val, f_lc_c['fill_price'], 'SELL', exchange)
+                        )
+                        call_gross = (legs['sc']['entry_price'] - f_sc_c['fill_price'] + f_lc_c['fill_price'] - legs['lc']['entry_price']) * q_val
 
-                # SCENARIO B: Upside Breach (Spot Breaches Short Call)
+                        adj_ts = now.strftime('%Y-%m-%d %H:%M:%S')
+                        for k_leg, s_side, f_res in [('sc', 'BUY', f_sc_c), ('lc', 'SELL', f_lc_c)]:
+                            chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
+                            append_to_tradebook({
+                                'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
+                                'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
+                                'Option_Type': 'CE', 'Order_Side': s_side, 'Quantity': q_val,
+                                'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
+                                'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_CLOSE_CALL'
+                            })
+
+                        f_new_lc = place_order(kite, row_lc['tradingsymbol'], q_val, 'BUY', live_mode)
+                        f_new_sc = place_order(kite, row_sc['tradingsymbol'], q_val, 'SELL', live_mode)
+
+                        comm_open_new = (
+                            calc_single_execution_charges(q_val, f_new_lc['fill_price'], 'BUY', exchange) +
+                            calc_single_execution_charges(q_val, f_new_sc['fill_price'], 'SELL', exchange)
+                        )
+
+                        for k_k, s_side, f_res in [(new_lc_k, 'BUY', f_new_lc), (new_sc_k, 'SELL', f_new_sc)]:
+                            chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
+                            append_to_tradebook({
+                                'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
+                                'Expiry': state['expiry'], 'Strike': k_k,
+                                'Option_Type': 'CE', 'Order_Side': s_side, 'Quantity': q_val,
+                                'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
+                                'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_OPEN_CALL'
+                            })
+
+                        state['realized_gross_pnl'] = state.get('realized_gross_pnl', 0.0) + call_gross
+                        state['total_commission_paid'] += (comm_close_call + comm_open_new)
+                        state['down_rolls_done'] = 2
+                        state['last_adj_date'] = str(now.date())
+                        state['legs']['sc'] = {'strike': new_sc_k, 'sym': row_sc['tradingsymbol'], 'token': int(row_sc['instrument_token']), 'entry_price': f_new_sc['fill_price']}
+                        state['legs']['lc'] = {'strike': new_lc_k, 'sym': row_lc['tradingsymbol'], 'token': int(row_lc['instrument_token']), 'entry_price': f_new_lc['fill_price']}
+                        save_trade_state(state)
+                        subscribe_tokens(kws, [int(row_sc['instrument_token']), int(row_lc['instrument_token'])])
+                        print(f"Position Converted to Centered Iron Fly on {new_sc_k} Strike", flush=True)
+
+                        # Terminal Cutoff Check on Converted Iron Fly
+                        comm_terminal_exit = (
+                            commission_single_leg(q_val, new_sc_p, f_new_sc['fill_price'], exchange) +
+                            commission_single_leg(q_val, f_new_lc['fill_price'], new_lc_p, exchange) +
+                            commission_single_leg(q_val, sp_ask, legs['sp']['entry_price'], exchange) +
+                            commission_single_leg(q_val, legs['lp']['entry_price'], lp_bid, exchange)
+                        )
+                        final_net_terminal_pnl = (unrealized_gross + state['realized_gross_pnl']) - (state['total_commission_paid'] + comm_terminal_exit)
+
+                        if (cfg['target_pnl'] - final_net_terminal_pnl) <= (comm_terminal_exit * 1.5):
+                            print(f"\n[TERMINAL CUTOFF] Position exhausted post-Iron Fly conversion. Liquidating immediately...", flush=True)
+                            f_sc_t = place_order(kite, row_sc['tradingsymbol'], q_val, 'BUY', live_mode)
+                            f_sp_t = place_order(kite, legs['sp']['sym'], q_val, 'BUY', live_mode)
+                            f_lc_t = place_order(kite, row_lc['tradingsymbol'], q_val, 'SELL', live_mode)
+                            f_lp_t = place_order(kite, legs['lp']['sym'], q_val, 'SELL', live_mode)
+
+                            tot_terminal_comm = state['total_commission_paid'] + comm_terminal_exit
+                            final_net_exit = (unrealized_gross + state['realized_gross_pnl']) - tot_terminal_comm
+                            roc = (final_net_exit / cfg['setup_cost']) * 100.0
+                            days_held = (now.date() - datetime.strptime(state['entry_time'], '%Y-%m-%d %H:%M:%S').date()).days
+
+                            append_to_final_pnl({
+                                'Trade_ID': state['trade_id'], 'Expiry': state['expiry'],
+                                'Entry_Time': state['entry_time'], 'Exit_Time': now.strftime('%Y-%m-%d %H:%M:%S'),
+                                'Days_Held': days_held, 'Entry_Spot': state['entry_spot'],
+                                'Exit_Spot': spot_price, 'Initial_Credit_Pts': state['initial_credit_pts'],
+                                'Gross_PnL': round(unrealized_gross + state['realized_gross_pnl'], 2),
+                                'Total_Charges': round(tot_terminal_comm, 2),
+                                'Net_Realized_PnL': round(final_net_exit, 2),
+                                'Setup_Capital': cfg['setup_cost'], 'RoC_Pct': round(roc, 2),
+                                'Exit_Reason': "Terminal Iron Fly Exit (Loss Controlled)", 'Max_Drawdown_Seen': state['max_drawdown_seen']
+                            })
+
+                            if state['expiry'] not in state['traded_expiries']:
+                                state['traded_expiries'].append(state['expiry'])
+
+                            state = {'status': 'IDLE', 'trade_id': None, 'traded_expiries': state['traded_expiries']}
+                            save_trade_state(state)
+                            daily_trade_exited = True
+                            time.sleep(check_interval_seconds)
+                            continue
+
+                # SCENARIO B: Upside Breach (Spot Breaches Short Call -> Iron Fly)
                 elif state['up_rolls_done'] == 0 and spot_price >= legs['sc']['strike']:
                     print(f"\n[ADJUSTMENT] Upside Breach: Spot {spot_price:.2f} >= Short Call {legs['sc']['strike']} (Converting to Iron Fly)", flush=True)
-                    comm_close_put = (
-                        commission_single_leg(q_val, sp_p, legs['sp']['entry_price'], exchange) +
-                        commission_single_leg(q_val, legs['lp']['entry_price'], lp_p, exchange)
-                    )
-                    put_gross = (legs['sp']['entry_price'] - sp_p + lp_p - legs['lp']['entry_price']) * q_val
-                    put_net = put_gross - comm_close_put
-
-                    f_sp_c = place_order(kite, legs['sp']['sym'], q_val, 'BUY', live_mode)
-                    f_lp_c = place_order(kite, legs['lp']['sym'], q_val, 'SELL', live_mode)
-
-                    adj_ts = now.strftime('%Y-%m-%d %H:%M:%S')
-                    for k_leg, s_side, f_res in [('sp', 'BUY', f_sp_c), ('lp', 'SELL', f_lp_c)]:
-                        chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
-                        append_to_tradebook({
-                            'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
-                            'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
-                            'Option_Type': 'PE', 'Order_Side': s_side, 'Quantity': q_val,
-                            'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
-                            'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_CLOSE_PUT'
-                        })
-
                     new_sp_k = legs['sc']['strike']
                     new_lp_k = new_sp_k - put_wing_w
-                    row_sp = exp_scope[(exp_scope['strike'] == new_sp_k) & (exp_scope['instrument_type'] == 'PE')].iloc[0]
-                    row_lp = exp_scope[(exp_scope['strike'] == new_lp_k) & (exp_scope['instrument_type'] == 'PE')].iloc[0]
 
-                    f_new_lp = place_order(kite, row_lp['tradingsymbol'], q_val, 'BUY', live_mode)
-                    f_new_sp = place_order(kite, row_sp['tradingsymbol'], q_val, 'SELL', live_mode)
+                    valid_roll, row_sp, row_lp, new_sp_p, new_lp_p = verify_roll_spread('PE', new_sp_k, new_lp_k)
 
-                    for k_k, s_side, f_res in [(new_lp_k, 'BUY', f_new_lp), (new_sp_k, 'SELL', f_new_sp)]:
-                        chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
-                        append_to_tradebook({
-                            'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
-                            'Expiry': state['expiry'], 'Strike': k_k,
-                            'Option_Type': 'PE', 'Order_Side': s_side, 'Quantity': q_val,
-                            'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
-                            'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_OPEN_PUT'
-                        })
+                    if valid_roll:
+                        f_sp_c = place_order(kite, legs['sp']['sym'], q_val, 'BUY', live_mode)
+                        f_lp_c = place_order(kite, legs['lp']['sym'], q_val, 'SELL', live_mode)
 
-                    state['realized_net_pnl'] += put_net
-                    state['total_commission_paid'] += comm_close_put
-                    state['up_rolls_done'] = 1
-                    state['last_adj_date'] = str(now.date())
-                    state['legs']['sp'] = {'strike': new_sp_k, 'sym': row_sp['tradingsymbol'], 'token': int(row_sp['instrument_token']), 'entry_price': f_new_sp['fill_price']}
-                    state['legs']['lp'] = {'strike': new_lp_k, 'sym': row_lp['tradingsymbol'], 'token': int(row_lp['instrument_token']), 'entry_price': f_new_lp['fill_price']}
-                    save_trade_state(state)
-                    subscribe_tokens(kws, [int(row_sp['instrument_token']), int(row_lp['instrument_token'])])
-                    print(f"Put Spread Converted to Center on Short Call {new_sp_k} (Iron Fly)\n", flush=True)
+                        comm_close_put = (
+                            calc_single_execution_charges(q_val, f_sp_c['fill_price'], 'BUY', exchange) +
+                            calc_single_execution_charges(q_val, f_lp_c['fill_price'], 'SELL', exchange)
+                        )
+                        put_gross = (legs['sp']['entry_price'] - f_sp_c['fill_price'] + f_lp_c['fill_price'] - legs['lp']['entry_price']) * q_val
+
+                        adj_ts = now.strftime('%Y-%m-%d %H:%M:%S')
+                        for k_leg, s_side, f_res in [('sp', 'BUY', f_sp_c), ('lp', 'SELL', f_lp_c)]:
+                            chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
+                            append_to_tradebook({
+                                'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
+                                'Expiry': state['expiry'], 'Strike': legs[k_leg]['strike'],
+                                'Option_Type': 'PE', 'Order_Side': s_side, 'Quantity': q_val,
+                                'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
+                                'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_CLOSE_PUT'
+                            })
+
+                        f_new_lp = place_order(kite, row_lp['tradingsymbol'], q_val, 'BUY', live_mode)
+                        f_new_sp = place_order(kite, row_sp['tradingsymbol'], q_val, 'SELL', live_mode)
+
+                        comm_open_new = (
+                            calc_single_execution_charges(q_val, f_new_lp['fill_price'], 'BUY', exchange) +
+                            calc_single_execution_charges(q_val, f_new_sp['fill_price'], 'SELL', exchange)
+                        )
+
+                        for k_k, s_side, f_res in [(new_lp_k, 'BUY', f_new_lp), (new_sp_k, 'SELL', f_new_sp)]:
+                            chg = calc_single_execution_charges(q_val, f_res['fill_price'], s_side, exchange)
+                            append_to_tradebook({
+                                'Trade_ID': state['trade_id'], 'Timestamp': adj_ts, 'Symbol': symbol,
+                                'Expiry': state['expiry'], 'Strike': k_k,
+                                'Option_Type': 'PE', 'Order_Side': s_side, 'Quantity': q_val,
+                                'Order_Type': 'LIMIT', 'Fill_Price': f_res['fill_price'],
+                                'Order_ID': f_res['order_id'], 'Charges_STT_Brok': chg, 'Action_Tag': 'ROLL_OPEN_PUT'
+                            })
+
+                        state['realized_gross_pnl'] = state.get('realized_gross_pnl', 0.0) + put_gross
+                        state['total_commission_paid'] += (comm_close_put + comm_open_new)
+                        state['up_rolls_done'] = 1
+                        state['last_adj_date'] = str(now.date())
+                        state['legs']['sp'] = {'strike': new_sp_k, 'sym': row_sp['tradingsymbol'], 'token': int(row_sp['instrument_token']), 'entry_price': f_new_sp['fill_price']}
+                        state['legs']['lp'] = {'strike': new_lp_k, 'sym': row_lp['tradingsymbol'], 'token': int(row_lp['instrument_token']), 'entry_price': f_new_lp['fill_price']}
+                        save_trade_state(state)
+                        subscribe_tokens(kws, [int(row_sp['instrument_token']), int(row_lp['instrument_token'])])
+                        print(f"Put Spread Converted to Center on Short Call {new_sp_k} (Iron Fly)\n", flush=True)
 
         time.sleep(check_interval_seconds)
 
@@ -1147,42 +1318,45 @@ if __name__ == '__main__':
         run_trading_worker()
     else:
         worker_process = None
-        print(f"Supervisor Active. Waiting for daily market dispatch at {token_swap_time} IST...", flush=True)
+        last_completed_date = None
+        print(f"Supervisor Active. Monitoring window {token_swap_time} to {pnl_check_end_time} IST...", flush=True)
 
         try:
             while True:
                 now_kolkata = datetime.now(KOLKATA_TZ)
-                if now_kolkata.strftime("%H:%M") == token_swap_time:
-                    if now_kolkata.weekday() in [5, 6]:
-                        print("Weekend detected. Supervisor sleeping.", flush=True)
-                        time.sleep(70)
-                        continue
+                curr_hm = now_kolkata.strftime("%H:%M")
+                today_d = now_kolkata.date()
 
-                    print(f"\n{'*' * 60}", flush=True)
-                    print(f"DISPATCHING DAILY TRADING WORKER: {now_kolkata.date()}", flush=True)
-                    print(f"{'*' * 60}\n", flush=True)
+                # Launch worker during active market window (resilient to reboots)
+                if token_swap_time <= curr_hm < pnl_check_end_time:
+                    if today_d.weekday() not in [5, 6] and last_completed_date != today_d:
+                        if worker_process is None or worker_process.poll() is not None:
+                            print(f"\n{'*' * 60}", flush=True)
+                            print(f"DISPATCHING DAILY TRADING WORKER: {today_d} at {curr_hm} IST", flush=True)
+                            print(f"{'*' * 60}\n", flush=True)
 
-                    try:
-                        worker_process = subprocess.Popen(
-                            [sys.executable, __file__, "--worker"],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            bufsize=1
-                        )
+                            try:
+                                worker_process = subprocess.Popen(
+                                    [sys.executable, __file__, "--worker"],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    text=True,
+                                    bufsize=1
+                                )
 
-                        for line in worker_process.stdout:
-                            print(line, end='', flush=True)
+                                for line in worker_process.stdout:
+                                    print(line, end='', flush=True)
 
-                        worker_process.wait()
-                    except Exception as e:
-                        print(f"Worker Interruption Exception: {e}", flush=True)
+                                worker_process.wait()
+                                if curr_hm >= "15:29":
+                                    last_completed_date = today_d
+                            except Exception as e:
+                                print(f"Worker Interruption Exception: {e}", flush=True)
 
-                    print("\nWorker Process Terminated. OS Memory Cleaned. Supervisor idling until tomorrow.", flush=True)
-                    worker_process = None
-                    time.sleep(70)
+                            print("\nWorker Terminated. Memory Cleaned.", flush=True)
+                            worker_process = None
 
-                time.sleep(30)
+                time.sleep(15)
 
         except KeyboardInterrupt:
             print("\nSupervisor terminating by User Request (Ctrl+C).", flush=True)
