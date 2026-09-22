@@ -1767,20 +1767,87 @@ def render_master_banner(update_lots_callback):
                     ui_refs['put_pnl'] = ui.label('₹ 0').classes('text-xl font-bold text-gray-400 font-mono')
 
 def render_chart_row():
+    """Real-Time PnL Curve. Purely a visual/readability redesign of the original single
+    total-PnL line -- data source, update cadence (LogicEngine.update_chart_data(), still
+    1-min resolution), and ui_refs['pnl_chart'] wiring in auto_run.update_ui() are all
+    UNCHANGED. Only this ECharts option object differs:
+      - Line color and area fill are now PnL-direction-aware (green above zero, red below)
+        via a piecewise visualMap pinned at 0, instead of one fixed orange line.
+      - The area fill is a soft top-to-bottom gradient (fading to transparent) per polarity,
+        instead of one flat translucent orange block.
+      - A dashed zero-reference line (markLine) makes the profit/loss boundary visible at a
+        glance instead of requiring the person to read the y-axis.
+      - Axis/grid chrome is lighter and less busy: thinner axis lines, fewer x-axis label
+        ticks (interval='auto' with hideOverlap) so every single minute doesn't crowd the
+        axis, y-axis values formatted with a ₹ prefix.
+      - Tooltip is dark-themed and ₹-formatted, matching the rest of the dashboard's dark
+        Trade Event Log panel rather than ECharts' plain default tooltip.
+      - Open/Close markPoints are restyled (smaller pins, white border, subtle shadow) so
+        they read clearly against the new gradient fill instead of clashing with it.
+    """
     with ui.card().classes('w-full h-64 p-2 border-x border-gray-300 rounded-none shadow-sm'):
         ui.label('Real-Time PnL Curve').classes('text-xs font-bold text-gray-500 mb-2')
         ui_refs['pnl_chart'] = ui.echart({
-            'tooltip': {'trigger': 'axis'},
-            'grid': {'top': 30, 'bottom': 20, 'left': 50, 'right': 20},
-            'xAxis': {'type': 'category', 'data': [], 'axisLine': {'lineStyle': {'color': '#9ca3af'}}},
-            'yAxis': {'type': 'value', 'scale': True, 'splitLine': {'lineStyle': {'color': '#e5e7eb'}}},
+            'tooltip': {
+                'trigger': 'axis',
+                'backgroundColor': 'rgba(17, 24, 39, 0.92)',  # gray-900, matches Trade Event Log panel
+                'borderColor': '#374151',
+                'borderWidth': 1,
+                'textStyle': {'color': '#f3f4f6', 'fontSize': 11, 'fontFamily': 'monospace'},
+                'padding': [6, 10],
+                'axisPointer': {'type': 'line', 'lineStyle': {'color': '#9ca3af', 'type': 'dashed'}},
+                'valueFormatter': 'function(v) { return "₹ " + Number(v).toFixed(2); }',
+            },
+            'grid': {'top': 26, 'bottom': 26, 'left': 56, 'right': 20},
+            'xAxis': {
+                'type': 'category', 'data': [],
+                'boundaryGap': False,
+                'axisLine': {'lineStyle': {'color': '#d1d5db', 'width': 1}},
+                'axisTick': {'show': False},
+                'axisLabel': {'color': '#9ca3af', 'fontSize': 9, 'interval': 'auto', 'hideOverlap': True},
+                'splitLine': {'show': False},
+            },
+            'yAxis': {
+                'type': 'value', 'scale': True,
+                'axisLine': {'show': False},
+                'axisTick': {'show': False},
+                'axisLabel': {'color': '#9ca3af', 'fontSize': 9, 'formatter': '₹{value}'},
+                'splitLine': {'lineStyle': {'color': '#eef0f3', 'type': 'dashed'}},
+            },
             'backgroundColor': '#f9fafb',
-            'dataZoom': [{'type': 'inside', 'start': 0, 'end': 100}, {'type': 'slider'}],
+            'dataZoom': [{'type': 'inside', 'start': 0, 'end': 100}, {'type': 'slider', 'height': 14, 'bottom': 2}],
+            # dimension=0: shared_state['chart_data']['pnl'] (update_chart_data() in
+            # logic_engine.py) is a plain 1-D array of numbers, one PnL value per category
+            # (time) tick -- NOT [x, y] pairs. For 1-D series data, ECharts' own value
+            # dimension is dimension 0 (there is no dimension 1 to reference); pointing
+            # visualMap at a non-existent dimension 1 caused it to silently fail to color
+            # (and, in this ECharts build, fail to RENDER AT ALL) the line/area -- only the
+            # markPoint (which needs no visualMap) was still showing. This was the cause of
+            # the PnL curve appearing completely blank despite live chart_data being pushed.
+            'visualMap': {
+                'type': 'piecewise', 'show': False, 'dimension': 0, 'seriesIndex': 0,
+                'pieces': [
+                    {'min': 0, 'color': '#16a34a'},   # green-600: profit
+                    {'max': 0, 'color': '#dc2626'},   # red-600: loss
+                ],
+            },
             'series': [{
-                'name': 'Total PnL', 'type': 'line', 'data': [], 'smooth': True, 'showSymbol': False,
-                'lineStyle': {'color': '#f97316', 'width': 2}, 'areaStyle': {'color': '#ffedd5', 'opacity': 0.5},
-                'markPoint': {'data': [], 'symbolSize': 25, 'label': {'fontSize': 8, 'color': 'white'}}
-            }]
+                'name': 'Total PnL', 'type': 'line', 'data': [], 'smooth': 0.3, 'showSymbol': False,
+                'lineStyle': {'width': 2.5, 'shadowColor': 'rgba(0,0,0,0.12)', 'shadowBlur': 6, 'shadowOffsetY': 3},
+                'areaStyle': {'opacity': 0.18},
+                'markLine': {
+                    'silent': True, 'symbol': 'none', 'animation': False,
+                    'lineStyle': {'color': '#9ca3af', 'type': 'dashed', 'width': 1},
+                    'label': {'show': False},
+                    'data': [{'yAxis': 0}],
+                },
+                'markPoint': {
+                    'symbolSize': 18,
+                    'itemStyle': {'borderColor': '#fff', 'borderWidth': 1.5, 'shadowColor': 'rgba(0,0,0,0.25)', 'shadowBlur': 3},
+                    'label': {'fontSize': 8, 'fontWeight': 'bold', 'color': 'white'},
+                    'data': [],
+                },
+            }],
         })
 
 def render_log_row():
