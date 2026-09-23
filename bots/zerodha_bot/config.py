@@ -36,16 +36,16 @@ EOD_TIME = dtime(15, 25)
 # --- ENTER VIA STOP: TICK BUFFERS (points/rupees added beyond the triggering candle's
 # high/low -- see stop_via_candle_engine.py's _try_fetch/_handoff, which computes:
 #     trigger_price = (low - tick) if is_downside else (high + tick)
-# ENTER_VIA_STOP_INDEX_TICK is INDEX-SPECIFIC (keyed by the same names as INDICES), since
-# NIFTY and SENSEX trade in different point scales -- applies to 'entry' and 'index_stop'
-# jobs, where the triggering candle's high/low is an index or near-month-future price.
+# Index-level tick (applies to 'entry' and 'index_stop' jobs, where the triggering candle's
+# high/low is an index or near-month-future price) is now USER-CONFIGURABLE PER INDEX from
+# the UI (see params['enter_via_stop_tick_nifty']/['enter_via_stop_tick_sensex'] below, and
+# the ENTER VIA STOP row in auto_run.py's banner) -- NIFTY and SENSEX trade in different
+# point scales, so each gets its own field. get_enter_via_stop_tick() is the single-source-of-
+# truth reader every consumer (stop_via_candle_engine.py) calls, replacing the old fixed
+# ENTER_VIA_STOP_INDEX_TICK dict constant.
 # ENTER_VIA_STOP_PREMIUM_TICK stays a single flat constant (both indices' options trade in
 # the same rupee-premium scale, regardless of which index they're on) -- applies to
 # 'premium_stop' jobs, where the triggering candle's high/low is the option's own premium.
-ENTER_VIA_STOP_INDEX_TICK = {
-    'NIFTY': 3.5,
-    'SENSEX': 10.0,
-}
 ENTER_VIA_STOP_PREMIUM_TICK = 0.05
 
 # --- ALERT SOUND LIBRARY ---
@@ -226,6 +226,15 @@ params = {
     # (stop_via_candle_engine.FETCH_DELAY_SEC = 3); now a configurable param, default 5.
     'enter_via_stop_fetch_delay_sec': 5,
 
+    # Enter via Stop: index-specific tick buffers (points added beyond the triggering
+    # candle's high/low -- see stop_via_candle_engine.py's _try_fetch/_handoff and
+    # get_enter_via_stop_tick() below). Previously the fixed constant
+    # config.ENTER_VIA_STOP_INDEX_TICK = {'NIFTY': 1, 'SENSEX': 2.0}; now user-editable from
+    # the ENTER VIA STOP row in auto_run.py's banner. Defaults match the old constants
+    # exactly, so this is a pure UI addition with no behavior change until edited.
+    'enter_via_stop_tick_nifty': 1,
+    'enter_via_stop_tick_sensex': 2.0,
+
     # Futures Mode: global toggle (both NIFTY and SENSEX together), default OFF. When on,
     # all PRICE EVALUATION -- entry triggers, index stop/target checks, index-based alerts,
     # the index_entry_price/index_current_price fields shown in the UI/used for index-linked
@@ -359,3 +368,19 @@ def get_eval_token(index_name):
         if fut_token:
             return fut_token
     return INDICES[index_name]['token']
+
+
+# --- ENTER VIA STOP: INDEX TICK RESOLVER ---
+def get_enter_via_stop_tick(index_name):
+    """Single-source-of-truth reader for the Enter via Stop index tick buffer, replacing the
+    old fixed ENTER_VIA_STOP_INDEX_TICK dict constant. Reads params['enter_via_stop_tick_
+    nifty']/['enter_via_stop_tick_sensex'] fresh on every call (so a UI edit takes effect
+    immediately for any job that hasn't handed off yet, consistent with every other
+    params-driven setting in this codebase), falling back to 0.5 defensively if index_name
+    is ever unrecognized or the value is non-numeric (should not happen -- index_name is
+    always one of INDICES)."""
+    key = f"enter_via_stop_tick_{index_name.lower()}"
+    try:
+        return float(params.get(key, 0.5))
+    except (TypeError, ValueError):
+        return 0.5
