@@ -1767,23 +1767,33 @@ def render_master_banner(update_lots_callback):
                     ui_refs['put_pnl'] = ui.label('₹ 0').classes('text-xl font-bold text-gray-400 font-mono')
 
 def render_chart_row():
-    """Real-Time PnL Curve. Purely a visual/readability redesign of the original single
-    total-PnL line -- data source, update cadence (LogicEngine.update_chart_data(), still
-    1-min resolution), and ui_refs['pnl_chart'] wiring in auto_run.update_ui() are all
-    UNCHANGED. Only this ECharts option object differs:
-      - Line color and area fill are now PnL-direction-aware (green above zero, red below)
-        via a piecewise visualMap pinned at 0, instead of one fixed orange line.
-      - The area fill is a soft top-to-bottom gradient (fading to transparent) per polarity,
-        instead of one flat translucent orange block.
-      - A dashed zero-reference line (markLine) makes the profit/loss boundary visible at a
-        glance instead of requiring the person to read the y-axis.
-      - Axis/grid chrome is lighter and less busy: thinner axis lines, fewer x-axis label
-        ticks (interval='auto' with hideOverlap) so every single minute doesn't crowd the
-        axis, y-axis values formatted with a ₹ prefix.
-      - Tooltip is dark-themed and ₹-formatted, matching the rest of the dashboard's dark
-        Trade Event Log panel rather than ECharts' plain default tooltip.
-      - Open/Close markPoints are restyled (smaller pins, white border, subtle shadow) so
-        they read clearly against the new gradient fill instead of clashing with it.
+    """Real-Time PnL Curve. Visual redesign of the original single total-PnL line -- data
+    source, update cadence (LogicEngine.update_chart_data(), still 1-min resolution), and
+    ui_refs['pnl_chart'] wiring in auto_run.update_ui() are all UNCHANGED. Only this ECharts
+    option object differs from the plain baseline:
+      - A soft top-to-bottom gradient area fill under the line, instead of one flat
+        translucent orange block.
+      - A dashed zero-reference line (markLine) so the profit/loss boundary is visible at a
+        glance.
+      - Lighter, less busy axis/grid chrome: thinner axis lines, fewer x-axis label ticks
+        (interval='auto' with hideOverlap) so every single minute doesn't crowd the axis,
+        y-axis values formatted with a ₹ prefix.
+      - A dark-themed, ₹-formatted tooltip matching the dashboard's dark Trade Event Log
+        panel, instead of ECharts' plain default tooltip.
+      - Restyled markPoints (smaller pins, white border, subtle shadow).
+
+    IMPORTANT: earlier revisions of this chart tried to color the line green/red by PnL sign
+    using ECharts' `visualMap` (a 'piecewise' map pinned at value 0). That construct never
+    rendered ANY line at all here -- not even the wrong color, the entire line/area silently
+    failed to draw, leaving only the markPoint pins visible -- regardless of which `dimension`
+    index (0 or 1) was passed to it. Rather than keep guessing at visualMap's dimension
+    semantics against shared_state['chart_data']['pnl'] (a plain 1-D array of numbers, NOT
+    [x, y] pairs -- see LogicEngine.update_chart_data() in logic_engine.py), visualMap has
+    been REMOVED entirely from this chart. The line is a single fixed color (orange, matching
+    the original design) -- this is the tradeoff for reliable rendering. If PnL-direction
+    color-coding is wanted again later, it should be implemented as two separate series (a
+    'profit' line and a 'loss' line, each with its own data array pre-split by sign in
+    Python/JS) rather than via visualMap, to avoid this exact class of silent-render failure.
     """
     with ui.card().classes('w-full h-64 p-2 border-x border-gray-300 rounded-none shadow-sm'):
         ui.label('Real-Time PnL Curve').classes('text-xs font-bold text-gray-500 mb-2')
@@ -1816,25 +1826,18 @@ def render_chart_row():
             },
             'backgroundColor': '#f9fafb',
             'dataZoom': [{'type': 'inside', 'start': 0, 'end': 100}, {'type': 'slider', 'height': 14, 'bottom': 2}],
-            # dimension=0: shared_state['chart_data']['pnl'] (update_chart_data() in
-            # logic_engine.py) is a plain 1-D array of numbers, one PnL value per category
-            # (time) tick -- NOT [x, y] pairs. For 1-D series data, ECharts' own value
-            # dimension is dimension 0 (there is no dimension 1 to reference); pointing
-            # visualMap at a non-existent dimension 1 caused it to silently fail to color
-            # (and, in this ECharts build, fail to RENDER AT ALL) the line/area -- only the
-            # markPoint (which needs no visualMap) was still showing. This was the cause of
-            # the PnL curve appearing completely blank despite live chart_data being pushed.
-            'visualMap': {
-                'type': 'piecewise', 'show': False, 'dimension': 0, 'seriesIndex': 0,
-                'pieces': [
-                    {'min': 0, 'color': '#16a34a'},   # green-600: profit
-                    {'max': 0, 'color': '#dc2626'},   # red-600: loss
-                ],
-            },
             'series': [{
-                'name': 'Total PnL', 'type': 'line', 'data': [], 'smooth': 0.3, 'showSymbol': False,
-                'lineStyle': {'width': 2.5, 'shadowColor': 'rgba(0,0,0,0.12)', 'shadowBlur': 6, 'shadowOffsetY': 3},
-                'areaStyle': {'opacity': 0.18},
+                'name': 'Total PnL', 'type': 'line', 'data': [], 'smooth': True, 'showSymbol': False,
+                'lineStyle': {'color': '#f97316', 'width': 2.5, 'shadowColor': 'rgba(0,0,0,0.12)', 'shadowBlur': 6, 'shadowOffsetY': 3},
+                'areaStyle': {
+                    'color': {
+                        'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
+                        'colorStops': [
+                            {'offset': 0, 'color': 'rgba(249, 115, 22, 0.35)'},
+                            {'offset': 1, 'color': 'rgba(249, 115, 22, 0.02)'},
+                        ],
+                    },
+                },
                 'markLine': {
                     'silent': True, 'symbol': 'none', 'animation': False,
                     'lineStyle': {'color': '#9ca3af', 'type': 'dashed', 'width': 1},
@@ -1842,7 +1845,7 @@ def render_chart_row():
                     'data': [{'yAxis': 0}],
                 },
                 'markPoint': {
-                    'symbolSize': 18,
+                    'symbolSize': 20,
                     'itemStyle': {'borderColor': '#fff', 'borderWidth': 1.5, 'shadowColor': 'rgba(0,0,0,0.25)', 'shadowBlur': 3},
                     'label': {'fontSize': 8, 'fontWeight': 'bold', 'color': 'white'},
                     'data': [],

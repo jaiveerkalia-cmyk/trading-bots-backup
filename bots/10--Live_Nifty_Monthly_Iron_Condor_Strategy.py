@@ -38,7 +38,7 @@ token_swap_time = "09:00"
 
 # Target Expiry & Delta Specifications
 target_entry_dte = 45
-min_entry_dte = 35
+min_entry_dte = 30
 max_entry_dte = 50
 exit_dte = 15
 

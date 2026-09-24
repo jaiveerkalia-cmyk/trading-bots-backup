@@ -1157,6 +1157,24 @@ def custom_render_master_banner(update_lots_callback):
                 # stop_via_candle_engine.py), never polled against a numeric threshold, so a
                 # direct bind carries none of the mid-edit risk that pattern exists to avoid.
                 ui.switch(value=params.get('enter_via_stop', True)).bind_value(params, 'enter_via_stop').props('dense color=teal')
+                # Index tick buffers (points beyond the triggering candle's high/low -- see
+                # config.get_enter_via_stop_tick() and stop_via_candle_engine.py's _try_fetch).
+                # Previously the fixed constant config.ENTER_VIA_STOP_INDEX_TICK = {'NIFTY':
+                # 1, 'SENSEX': 2.0}; now editable here, one small numeric input per index,
+                # live-bound directly to params (same live-bind reasoning as the switch just
+                # above: get_enter_via_stop_tick() reads params fresh at the moment a job
+                # hands off, never polled every tick against a threshold, so there's no
+                # mid-edit risk the draft-and-commit pattern elsewhere in this app exists to
+                # avoid). Defaults match the old constants exactly (NIFTY=1, SENSEX=2.0).
+                with ui.column().classes('gap-0'):
+                    ui.label('Tick N/S').classes('text-[8px] text-gray-400 leading-none')
+                    with ui.row().classes('gap-1 items-center'):
+                        ui.input(value=str(params.get('enter_via_stop_tick_nifty', 1))) \
+                            .bind_value(params, 'enter_via_stop_tick_nifty') \
+                            .props('outlined dense bg-color=white').classes('w-12 text-[10px]')
+                        ui.input(value=str(params.get('enter_via_stop_tick_sensex', 2.0))) \
+                            .bind_value(params, 'enter_via_stop_tick_sensex') \
+                            .props('outlined dense bg-color=white').classes('w-12 text-[10px]')
             with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
                 with ui.column().classes('gap-0'):
                     ui.label('FUTURES MODE').classes('font-bold text-indigo-900 text-[10px] leading-none')
