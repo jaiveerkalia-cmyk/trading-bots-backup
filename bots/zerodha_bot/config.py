@@ -143,6 +143,13 @@ shared_state = {
     'pattern_debug': {},
     # Per-pattern last fired signal (for UI display): {'bullish_engulfing'|'bearish_engulfing': {...}}
     'pattern_last_signal': {},
+
+    # --- Indicator Alerts (indicator_engine.py) ---
+    # Per-(index, interval) diagnostic info, same shape/purpose as pattern_debug above.
+    'indicator_debug': {},
+    # Last fired indicator signal (for UI display): {'index','interval','indicator',
+    # 'condition','candle_start','time','close','value'} or {} if none yet.
+    'indicator_last_signal': {},
 }
 
 # --- UI REFERENCES ---
@@ -196,11 +203,12 @@ UI_OPTS = {
     'fire_on_opts': ['Live', '1m', '5m', '15m', '60m'],
     'alert_sounds': list(ALERT_SOUND_URLS.keys()),
     'pattern_intervals': ['1m', '5m', '15m', '30m', '1h'],
+    'indicator_modes': ['Cross', 'Every close'],
 }
 
 # --- USER PARAMETERS ---
 params = {
-    'trading_index': 'NIFTY', 'lots': 4, 'live_trading': 'Off', 'mute_sound': False,
+    'trading_index': 'SENSEX', 'lots': 4, 'live_trading': 'Off', 'mute_sound': False,
     'hedgeless_mode': True,
 
     # Options Buy Mode: global toggle. True = whole bot buys (Call=buy CE, Put=buy PE),
@@ -333,6 +341,22 @@ params = {
     'bearish_engulfing_enabled': True,
     'bearish_engulfing_intervals': ['5m', '15m', '30m', '1h'],
     'bearish_engulfing_count': 1,
+
+    # --- Indicator Alerts (indicator_engine.py) ---
+    # Extensible moving-average alert framework. indicator_type selects the active indicator
+    # (registry key in indicator_engine.INDICATOR_REGISTRY -- 'ema' today, more addable there
+    # without touching this file). indicator_intervals: candle timeframes to evaluate on
+    # (subset of UI_OPTS['pattern_intervals']). indicator_length: lookback period for the
+    # active indicator. indicator_alert_above/below: per-condition on/off switches (default
+    # OFF -- purely additive, no alerts fire until enabled from the UI).
+    # indicator_alert_mode: 'Cross' fires once when the close crosses the line; 'Every close'
+    # fires on every closed candle beyond it.
+    'indicator_type': 'ema',
+    'indicator_intervals': ['5m'],
+    'indicator_length': 20,
+    'indicator_alert_above': False,
+    'indicator_alert_below': False,
+    'indicator_alert_mode': 'Cross',
 }
 
 
