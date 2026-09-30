@@ -52,6 +52,7 @@ from ticker_engine import TickerClient
 from instrument_manager import InstrumentManager
 from logic_engine import LogicEngine
 from pattern_engine import PatternEngine
+from indicator_engine import IndicatorEngine, render_indicator_section as render_indicator_alerts_section
 from stop_via_candle_engine import StopViaCandleEngine
 from daily_logger import DailyLogger
 
@@ -801,6 +802,7 @@ ticker = TickerClient(api_key, access_token)
 inst_manager = InstrumentManager(kite)
 logic = LogicEngine(ticker, inst_manager)
 pattern_engine = PatternEngine(inst_manager)
+indicator_engine = IndicatorEngine(inst_manager)
 stop_via_candle_engine = StopViaCandleEngine(inst_manager, logic)
 logic.stop_via_candle_engine = stop_via_candle_engine
 comp._stop_via_candle_engine = stop_via_candle_engine   # <-- ADD THIS LINE
@@ -1098,30 +1100,11 @@ def custom_render_master_banner(update_lots_callback):
                     )).props('dense flat size=sm').classes('text-[10px] text-orange-900')
                 with ui.row().classes('gap-6 items-center flex-nowrap justify-end'):
                     with ui.column().classes('gap-0 items-end'):
-                        ui.label('Unrealized').classes('text-orange-800 text-[9px] uppercase tracking-wider')
+                        ui.label('Unrealized PnL').classes('text-orange-800 text-[10px] uppercase tracking-wider whitespace-nowrap')
                         ui_refs['pnl_unrealized'] = ui.label('₹ 0.00').classes('text-2xl font-mono font-bold text-gray-800 leading-none')
                     with ui.column().classes('gap-0 items-end'):
-                        ui.label('Realized').classes('text-orange-800 text-[9px] uppercase tracking-wider')
+                        ui.label('Realized PnL').classes('text-orange-800 text-[10px] uppercase tracking-wider whitespace-nowrap')
                         ui_refs['pnl_realized'] = ui.label('₹ 0.00').classes('text-2xl font-mono font-bold text-green-700 leading-none')
-                    with ui.column().classes('gap-0 items-end'):
-                        ui.label('Total').classes('text-orange-800 text-[9px] uppercase tracking-wider')
-                        ui_refs['pnl_total'] = ui.label('₹ 0.00').classes('text-2xl font-mono font-bold text-gray-800 leading-none')
-
-        # --- BIG STANDALONE OPTIONS BUY MODE BUTTON ---
-        # Made deliberately large, full-width, and high-contrast (not folded into the small
-        # toggle row below) since a mode-switch this consequential (changes entry/exit
-        # direction on both legs) needs to be unmissable rather than another row toggle among
-        # several. Solid green = Buy Mode ON, solid red = Selling Mode (no pulse/blink). Text
-        # and color are refreshed every tick in update_ui() so it always reflects the true
-        # current state, including if a toggle attempt is auto-reverted (e.g. blocked because
-        # a position is open). Initial colors here match the update_ui() default (OFF/red)
-        # since options_buy_mode defaults to False.
-        with ui.card().classes('w-full p-0 bg-transparent shadow-none rounded-none border-none'):
-            buy_mode_btn = ui.button(
-                '🔴 OPTIONS SELLING MODE  (tap to switch to BUY MODE)',
-                on_click=lambda: on_buy_mode_button_click()
-            ).classes('w-full h-14 text-base font-extrabold rounded-xl shadow-lg bg-red-600 text-white hover:bg-red-700 tracking-wide')
-            ui_refs['buy_mode_button'] = buy_mode_btn
 
         with ui.card().classes('w-full p-2 bg-orange-50 flex-row items-center gap-6 rounded-none border-x border-orange-200'):
             with ui.row().classes('items-center gap-2'):
@@ -1130,64 +1113,6 @@ def custom_render_master_banner(update_lots_callback):
             with ui.row().classes('items-center gap-2'):
                 ui.label('Live Trading:').classes('font-bold text-orange-900 text-xs ml-4')
                 ui.radio(UI_OPTS['on_off'], value=params['live_trading']).bind_value(params, 'live_trading').props('inline dense')
-            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
-                with ui.column().classes('gap-0'):
-                    ui.label('AUTO PILOT').classes('font-bold text-blue-900 text-[10px] leading-none')
-                    status_lbl = ui.label().bind_text_from(controller, 'log_msg')
-                    status_lbl.classes('text-[8px] font-mono text-blue-600 leading-none')
-                ui.radio(['ON', 'OFF'], value=controller.mode, on_change=on_auto_mode_change).bind_value(controller, 'mode').props('inline dense color=blue')
-            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
-                with ui.column().classes('gap-0'):
-                    ui.label('HEDGELESS').classes('font-bold text-purple-900 text-[10px] leading-none')
-                    ui.label('No hedge buy').classes('text-[8px] font-mono text-purple-600 leading-none')
-                # Disabled (greyed) whenever Options Buy Mode is on, since Buy Mode is always
-                # hedgeless -- keeps the banner from looking contradictory. bind_enabled_from
-                # reads a boolean, so it's inverted via a tiny backward transform.
-                hedgeless_toggle = ui.toggle(['On', 'Off'], value='On' if params['hedgeless_mode'] else 'Off',
-                    on_change=lambda e: params.update({'hedgeless_mode': e.value == 'On'})
-                ).props('dense').classes('text-xs')
-                hedgeless_toggle.bind_enabled_from(params, 'options_buy_mode', backward=lambda v: not v)
-            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
-                with ui.column().classes('gap-0'):
-                    ui.label('ENTER VIA STOP').classes('font-bold text-teal-900 text-[10px] leading-none')
-                    ui.label('1m/5m/15m/60m -> real stop').classes('text-[8px] font-mono text-teal-600 leading-none')
-                # Default ON (params['enter_via_stop'] defaults True in config.py). Live-bound
-                # directly to params -- unlike the numeric draft-and-commit fields elsewhere in
-                # this app, this is a plain boolean read at decision points (logic_engine.py /
-                # stop_via_candle_engine.py), never polled against a numeric threshold, so a
-                # direct bind carries none of the mid-edit risk that pattern exists to avoid.
-                ui.switch(value=params.get('enter_via_stop', True)).bind_value(params, 'enter_via_stop').props('dense color=teal')
-                # Index tick buffers (points beyond the triggering candle's high/low -- see
-                # config.get_enter_via_stop_tick() and stop_via_candle_engine.py's _try_fetch).
-                # Previously the fixed constant config.ENTER_VIA_STOP_INDEX_TICK = {'NIFTY':
-                # 1, 'SENSEX': 2.0}; now editable here, one small numeric input per index,
-                # live-bound directly to params (same live-bind reasoning as the switch just
-                # above: get_enter_via_stop_tick() reads params fresh at the moment a job
-                # hands off, never polled every tick against a threshold, so there's no
-                # mid-edit risk the draft-and-commit pattern elsewhere in this app exists to
-                # avoid). Defaults match the old constants exactly (NIFTY=1, SENSEX=2.0).
-                with ui.column().classes('gap-0'):
-                    ui.label('Tick N/S').classes('text-[8px] text-gray-400 leading-none')
-                    with ui.row().classes('gap-1 items-center'):
-                        ui.input(value=str(params.get('enter_via_stop_tick_nifty', 1))) \
-                            .bind_value(params, 'enter_via_stop_tick_nifty') \
-                            .props('outlined dense bg-color=white').classes('w-12 text-[10px]')
-                        ui.input(value=str(params.get('enter_via_stop_tick_sensex', 2.0))) \
-                            .bind_value(params, 'enter_via_stop_tick_sensex') \
-                            .props('outlined dense bg-color=white').classes('w-12 text-[10px]')
-            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
-                with ui.column().classes('gap-0'):
-                    ui.label('FUTURES MODE').classes('font-bold text-indigo-900 text-[10px] leading-none')
-                    # Shows the resolved near-month future symbol for the currently active
-                    # trading_index while the mode is on (refreshed every tick in update_ui());
-                    # shows a neutral caption while off. Default text matches the OFF state
-                    # since futures_mode defaults to False.
-                    ui_refs['futures_mode_symbol_label'] = ui.label('spot price -> strike').classes('text-[8px] font-mono text-indigo-600 leading-none')
-                # Default OFF (params['futures_mode'] defaults False in config.py). Uses
-                # on_change (not a direct bind) since toggling this needs a side effect --
-                # cancelling any pending Enter via Stop jobs, since their candle-basis just
-                # changed mid-flight (see on_futures_mode_change below).
-                ui.switch(value=params.get('futures_mode', False), on_change=on_futures_mode_change).props('dense color=indigo')
 
         with ui.card().classes('w-full p-1 px-3 bg-gray-100 border-t border-gray-300 rounded-none'):
             with ui.row().classes('items-center gap-2'):
@@ -1573,6 +1498,7 @@ async def run_bot_logic():
                         if now.time() < EOD_TIME:
                             logic.check_triggers()
                             pattern_engine.check_patterns()
+                            indicator_engine.check()
                         else:
                             if params['short_trigger_active'] or params['long_trigger_active']:
                                 params['short_trigger_active'] = False
@@ -1639,9 +1565,11 @@ def index():
     comp.render_open_positions(on_close_call=lambda: handle_close('Call'), on_close_put=lambda: handle_close('Put'))
 
     # Order Book (pending Limit/Stop-Market triggers, table-styled), Candlestick Pattern
-    # Indicators (below Open Orders), and Order History (full tradebook)
+    # Indicators (below Open Orders), Indicator Alerts (EMA/SMA, below Pattern Indicators),
+    # and Order History (full tradebook)
     comp.render_orderbook()
     comp.render_pattern_indicators()
+    render_indicator_alerts_section()
     comp.render_order_history()
 
     # 2. LOCAL TIMER
