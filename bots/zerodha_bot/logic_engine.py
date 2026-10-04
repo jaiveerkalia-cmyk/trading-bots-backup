@@ -1140,7 +1140,7 @@ class LogicEngine:
             cmp_sym = '>' if direction == 'upper' else '<'
             label = 'Upper' if direction == 'upper' else 'Lower'
             ui.notify(f"Price Hit ({alert_index}): {idx_ltp} {cmp_sym} {value}", type='warning', close_button=True)
-            self.log_action(f"🔔 Price Hit ({alert_index}, {label}): {idx_ltp} vs {value}")
+            self.log_action(f"🔔 Price Hit ({alert_index}, {label}, {period}): {idx_ltp} vs {value}")
             self.play_alert_sound(alert.get('sound', 'Wood Plank'), alert.get('duration', 5))
             fired_ids.append(alert.get('id'))
 

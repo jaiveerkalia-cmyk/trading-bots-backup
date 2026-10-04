@@ -359,14 +359,19 @@ class IndicatorEngine:
 # Dashboard card
 # ----------------------------------------------------------------------
 def render_indicator_section():
-    """'INDICATOR ALERTS' card, placed below the Candlestick Pattern Indicators card. Every
-    control is read by the engine only at candle-boundary fetch time (never polled against a
-    live threshold), so direct live binds to params are safe here -- no mid-edit risk."""
+    """'INDICATOR ALERTS' card, placed below the Candlestick Pattern Indicators card. Type/
+    Intervals/Conditions/Mode are read by the engine only at candle-boundary fetch time
+    (never polled against a live threshold), so direct live binds to params are safe for
+    those. Length is draft-and-commit instead (typing has zero live effect until Set is
+    clicked) purely so a change is deliberate and gets logged -- _get_length() in the engine
+    also only reads it at boundary-fetch time, same as the others, so there's no mid-edit
+    risk either way; Set exists here for an explicit, logged confirmation of the new value."""
     for m in INDICATOR_REGISTRY.values():
         for c in m['conditions']:
             params.setdefault(c['param'], False)
 
     last_type = {'v': params.get('indicator_type', 'ema')}
+    length_draft = {'value': params.get('indicator_length', 20)}
 
     @ui.refreshable
     def conditions_row():
@@ -377,11 +382,28 @@ def render_indicator_section():
                 ui.switch(cond['label'], value=params.get(cond['param'], False)) \
                     .bind_value(params, cond['param']).props('dense color=green')
 
+    def _set_indicator_length():
+        try:
+            n = int(float(length_draft['value']))
+        except (ValueError, TypeError):
+            ui.notify("Invalid Indicator Length", type='negative')
+            return
+        if n < 1:
+            ui.notify("Indicator Length must be at least 1", type='negative')
+            return
+        params['indicator_length'] = n
+        ts = datetime.now().strftime('%H:%M:%S')
+        shared_state.setdefault('activity_log', [])
+        shared_state['activity_log'].insert(0, f"[{ts}] ⚙️ Indicator Length updated: {n}")
+        shared_state['activity_log'] = shared_state['activity_log'][:100]
+        ui.notify("Indicator Length updated", type='positive')
+
     def on_type_change(e):
         old = INDICATOR_REGISTRY.get(last_type['v'], {})
         new = INDICATOR_REGISTRY.get(e.value, {})
         if new and old.get('default_length') != new.get('default_length'):
             params['indicator_length'] = new['default_length']
+            length_draft['value'] = new['default_length']
         last_type['v'] = e.value
         conditions_row.refresh()
 
@@ -395,8 +417,8 @@ def render_indicator_section():
                           value=params.get('indicator_type', 'ema'), on_change=on_type_change) \
                     .bind_value(params, 'indicator_type').props('outlined dense bg-color=white').classes('w-32')
                 ui.label('Length:').classes('text-xs text-gray-500 ml-4')
-                ui.input(value=str(params.get('indicator_length', 20))) \
-                    .bind_value(params, 'indicator_length').props('outlined dense bg-color=white').classes('w-20')
+                ui.input().bind_value(length_draft, 'value').props('outlined dense bg-color=white').classes('w-16')
+                ui.button('Set', on_click=_set_indicator_length).props('dense size=sm color=blue').classes('text-[10px]')
 
             with ui.row().classes('w-full items-center gap-2'):
                 ui.label('Intervals:').classes('text-xs text-gray-500 w-16')

@@ -1645,16 +1645,34 @@ def render_pattern_indicators():
     registered color (bullish=light green, bearish=light red -- see _pattern_row), plus a
     shared fetch-delay input (seconds to wait after a candle boundary closes before fetching
     it via the historical API -- gives the broker's candle data time to finalize; applies to
-    every pattern/interval). Detection itself runs from auto_run.run_bot_logic() via
-    PatternEngine.check_patterns(), independently for both NIFTY and SENSEX regardless of the
-    globally selected trading_index."""
+    every pattern/interval, and also to Indicator Alerts below, which reads this same
+    pattern_fetch_delay_sec param). Fetch Delay is draft-and-commit (typing has zero live
+    effect until Set is clicked), logged via _log_alert_action on change. Detection itself
+    runs from auto_run.run_bot_logic() via PatternEngine.check_patterns(), independently for
+    both NIFTY and SENSEX regardless of the globally selected trading_index."""
+    fetch_delay_draft = {'value': params.get('pattern_fetch_delay_sec', 5)}
+
+    def _set_fetch_delay():
+        try:
+            v = float(fetch_delay_draft['value'])
+        except (ValueError, TypeError):
+            ui.notify("Invalid Fetch Delay", type='negative')
+            return
+        if v < 0:
+            ui.notify("Fetch Delay cannot be negative", type='negative')
+            return
+        params['pattern_fetch_delay_sec'] = v
+        ui.notify("Fetch Delay updated", type='positive')
+        _log_alert_action(f"⚙️ Fetch Delay updated: {v:.0f}s")
+
     with ui.card().classes('w-full bg-white p-3 gap-3 rounded-xl shadow-sm mb-4 border border-gray-200'):
         with ui.row().classes('w-full justify-between items-center'):
             ui.label('CANDLESTICK PATTERN INDICATORS').classes('font-bold text-xs uppercase tracking-widest text-gray-500')
 
         with ui.row().classes('w-full items-center gap-2'):
             ui.label('Fetch Delay (sec, after candle close):').classes('text-xs text-gray-600')
-            ui.input().bind_value(params, 'pattern_fetch_delay_sec').props('outlined dense bg-color=white').classes('w-24')
+            ui.input().bind_value(fetch_delay_draft, 'value').props('outlined dense bg-color=white').classes('w-24')
+            ui.button('Set', on_click=_set_fetch_delay).props('dense size=sm color=blue').classes('text-[10px]')
 
         with ui.row().classes('w-full gap-3 items-stretch flex-wrap'):
             for key, meta in PATTERN_REGISTRY.items():
