@@ -8,19 +8,16 @@ import threading
 import gc
 from datetime import datetime, timedelta
 from pprint import pprint
-
-import numpy as np
-import pytz
-from kiteconnect import KiteConnect
-
-from redis_tick_client import RedisTickClient
+from zoneinfo import ZoneInfo
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OS-LEVEL MEMORY MANAGEMENT (< 35 MB RAM CEILING)
+# OS-LEVEL MEMORY MANAGEMENT (< 30 MB RAM CEILING)
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     import ctypes
     libc = ctypes.CDLL("libc.so.6")
+    # M_ARENA_MAX = -8 in glibc; restricts thread memory pools
+    libc.mallopt(-8, 2)
     def trim_memory():
         gc.collect()
         libc.malloc_trim(0)
@@ -28,12 +25,15 @@ except Exception:
     def trim_memory():
         gc.collect()
 
+# Timezone standard instance
+IST = ZoneInfo('Asia/Kolkata')
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TOP-LEVEL UNIFIED CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 SYMBOL                          = 'SENSEX'       # 'SENSEX' or 'NIFTY 50'
 CANDLE_FETCH_BUFFER_SECONDS     = 5              # Buffer seconds after bar close before fetch
-MONITORING_INTERVAL_SECONDS     = 60              # Safety check evaluation cadence in seconds
+MONITORING_INTERVAL_SECONDS     = 60              # Round interval cadence for safety checks
 TOKEN_SWAP_TIME                 = "09:00"        # Supervisor wake-up time
 RESULTS_FOLDER                  = 'Sensex_reverse_supertrend_selling_websockts_results'
 GD_PATH                         = '/app/data/'
@@ -89,7 +89,7 @@ DAY_CONFIG = {
 }
 
 def get_day_config():
-    today_weekday = datetime.now().weekday()
+    today_weekday = datetime.now(IST).weekday()
     return DAY_CONFIG.get(today_weekday, DAY_CONFIG[0])
 
 # Global streaming storage
@@ -97,111 +97,115 @@ live_market_data = {}
 tick_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ULTRA-FAST, ZERO-PANDAS INDICATOR ENGINE (Exact TradingView ta.supertrend)
+# ZERO-PANDAS, ZERO-NUMPY SUPERTREND & EMA ENGINE (TradingView ta.supertrend)
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_ist_dt(dt):
-    """Converts a Kite datetime object to a timezone-naive IST datetime."""
-    kolkata = pytz.timezone('Asia/Kolkata')
+    """Converts a datetime object or ISO string to a naive IST datetime."""
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
     if dt.tzinfo is not None:
-        return dt.astimezone(kolkata).replace(tzinfo=None)
+        return dt.astimezone(IST).replace(tzinfo=None)
     return dt
 
 def calculate_ema(data, period=200):
-    """Pure NumPy implementation of standard EMA matching TA-Lib EMA exactly."""
+    """Calculates EMA over a float list matching TA-Lib EMA exactly."""
     n = len(data)
-    ema = np.zeros(n, dtype=np.float64)
+    ema = [0.0] * n
     if n < period:
         if n > 0:
-            ema[:] = np.mean(data)
+            m = sum(data) / n
+            ema = [m] * n
         return ema
-    seed = np.mean(data[:period])
-    ema[period - 1] = seed
+
+    seed = sum(data[:period]) / period
+    for i in range(period):
+        ema[i] = seed
+
     alpha = 2.0 / (period + 1.0)
     for i in range(period, n):
         ema[i] = ema[i - 1] * (1.0 - alpha) + data[i] * alpha
-    ema[:period - 1] = seed
+
     return ema
 
 def calculate_supertrend_data(candles, supertrend_multiplier):
     """
     Wilder's RMA Supertrend matching TradingView ta.supertrend() verbatim.
-    Runs on pure NumPy arrays in ~0.2ms for 300 bars with zero Pandas overhead.
+    Pure Python math runs on 300 bars in ~0.05ms with zero C-extension allocations.
     """
     n = len(candles)
     if n == 0:
         return candles
 
-    high = np.array([c['high'] for c in candles], dtype=np.float64)
-    low = np.array([c['low'] for c in candles], dtype=np.float64)
-    close = np.array([c['close'] for c in candles], dtype=np.float64)
+    highs = [float(c['high']) for c in candles]
+    lows = [float(c['low']) for c in candles]
+    closes = [float(c['close']) for c in candles]
 
     # 1. True Range
-    tr = np.zeros(n, dtype=np.float64)
-    tr[0] = high[0] - low[0]
+    tr = [0.0] * n
+    tr[0] = highs[0] - lows[0]
     for i in range(1, n):
-        hl = high[i] - low[i]
-        hpc = abs(high[i] - close[i - 1])
-        lpc = abs(low[i] - close[i - 1])
+        hl = highs[i] - lows[i]
+        hpc = abs(highs[i] - closes[i - 1])
+        lpc = abs(lows[i] - closes[i - 1])
         tr[i] = hl if (hl >= hpc and hl >= lpc) else (hpc if hpc >= lpc else lpc)
 
-    # 2. Wilder's RMA ATR
+    # 2. Wilder's RMA ATR (Period 10)
     atr_period = 10
-    atr = np.zeros(n, dtype=np.float64)
+    atr = [0.0] * n
     if n >= atr_period:
-        seed = np.sum(tr[:atr_period]) / atr_period
+        seed = sum(tr[:atr_period]) / atr_period
         atr[atr_period - 1] = seed
         alpha = 1.0 / atr_period
         for i in range(atr_period, n):
             atr[i] = atr[i - 1] * (1.0 - alpha) + tr[i] * alpha
 
-    # 3. Supertrend Upper & Lower Bands
-    final_ub = np.zeros(n, dtype=np.float64)
-    final_lb = np.zeros(n, dtype=np.float64)
-    st = np.zeros(n, dtype=np.float64)
-    direction = np.zeros(n, dtype=np.int8)
+    # 3. Supertrend Upper and Lower Bands
+    final_ub = [0.0] * n
+    final_lb = [0.0] * n
+    st = [0.0] * n
+    direction = [0] * n
 
     p = atr_period - 1
     if n > p:
-        hl2_p = (high[p] + low[p]) * 0.5
+        hl2_p = (highs[p] + lows[p]) * 0.5
         final_ub[p] = hl2_p + supertrend_multiplier * atr[p]
         final_lb[p] = hl2_p - supertrend_multiplier * atr[p]
         st[p] = final_ub[p]
         direction[p] = -1
 
         for i in range(p + 1, n):
-            hl2 = (high[i] + low[i]) * 0.5
+            hl2 = (highs[i] + lows[i]) * 0.5
             basic_ub = hl2 + supertrend_multiplier * atr[i]
             basic_lb = hl2 - supertrend_multiplier * atr[i]
 
-            if basic_ub < final_ub[i - 1] or close[i - 1] > final_ub[i - 1]:
+            if basic_ub < final_ub[i - 1] or closes[i - 1] > final_ub[i - 1]:
                 final_ub[i] = basic_ub
             else:
                 final_ub[i] = final_ub[i - 1]
 
-            if basic_lb > final_lb[i - 1] or close[i - 1] < final_lb[i - 1]:
+            if basic_lb > final_lb[i - 1] or closes[i - 1] < final_lb[i - 1]:
                 final_lb[i] = basic_lb
             else:
                 final_lb[i] = final_lb[i - 1]
 
             if st[i - 1] == final_ub[i - 1]:
-                if close[i] > final_ub[i]:
+                if closes[i] > final_ub[i]:
                     st[i] = final_lb[i]
                     direction[i] = 1
                 else:
                     st[i] = final_ub[i]
                     direction[i] = -1
             else:
-                if close[i] < final_lb[i]:
+                if closes[i] < final_lb[i]:
                     st[i] = final_ub[i]
                     direction[i] = -1
                 else:
                     st[i] = final_lb[i]
                     direction[i] = 1
 
-    # 4. 200 EMA of ATR
+    # 4. 200-Period EMA of Wilder's ATR
     atr_ema = calculate_ema(atr, period=200)
 
-    # Enrich candle dicts directly
     for i in range(n):
         candles[i]['atr'] = atr[i]
         candles[i]['supertrend'] = st[i]
@@ -392,7 +396,7 @@ def place_order(kite, sym, qty, side, live_mode):
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_verified_5m_candles(kite, instrument_token, expected_start_time, retries=5):
     """
-    Fetches 5-minute candles and strictly strips out any currently forming / 
+    Fetches 5m candles and immediately strips out any currently forming / 
     incomplete bars (timestamp > expected_start_time). Matches instantly on attempt #1.
     """
     ed = datetime.now()
@@ -438,7 +442,11 @@ def fetch_verified_5m_candles(kite, instrument_token, expected_start_time, retri
 # LIVE TRADING WORKER PROCESS
 # ─────────────────────────────────────────────────────────────────────────────
 def run_trading_worker():
-    now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+    # Lazy-load heavy networking clients inside the worker only
+    from kiteconnect import KiteConnect
+    from redis_tick_client import RedisTickClient
+
+    now_ist = datetime.now(IST)
     if now_ist.weekday() in [5, 6]:
         print("[SUPERVISOR] Today is a weekend. Terminating worker.")
         return
@@ -482,7 +490,7 @@ def run_trading_worker():
     print("\n" + "=" * 80)
     print("  SYSTEM INITIALIZATION | LOW-RAM SENSEX REVERSE MOMENTUM ENGINE")
     print("=" * 80)
-    print(f"Timestamp         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    print(f"Timestamp         : {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST")
     print(f"Underlying Symbol : {SYMBOL} (Lot Size: {LOT_SIZE} | Strike Step: {STRIKE_DIFFERENCE})")
     print(f"Execution Mode    : {'LIVE TRADING' if live_mode == 1 else 'PAPER TRADING'}")
     print(f"Lots Num / Qty    : {lots_num} Lots ({qty} Qty) | Global Day Stop: Rs. {global_day_stop:,.2f}")
@@ -511,7 +519,7 @@ def run_trading_worker():
     if len(candles) > 300:
         candles = candles[-300:]
 
-    today_date = datetime.now().date()
+    today_date = datetime.now(IST).date()
     today_candles = [c for c in candles if c['date'].date() == today_date]
 
     # Display today's morning candles (09:15 to 09:40) with Supertrend value & direction
@@ -551,31 +559,34 @@ def run_trading_worker():
     trim_memory()
 
     # ─────────────────────────────────────────────────────────────────────────────
-    # EVENT-DRIVEN INTRADAY EXECUTION & 1-SECOND MONITORING LOOP
+    # EVENT-DRIVEN INTRADAY EXECUTION & INTERVAL MONITORING LOOP
     # ─────────────────────────────────────────────────────────────────────────────
     trades_taken = 0
+    trades_pnl_list = []
     cumulative_realized_pnl = 0.0
     active_trade = None
 
     last_processed_5m_bar = expected_0940
-    last_monitoring_time = datetime.now() - timedelta(seconds=MONITORING_INTERVAL_SECONDS)
+    last_monitored_marker = (-1, -1)
     last_pnl_print_minute = -1
 
     while True:
         time.sleep(1)
-        now = datetime.now()
+        now = datetime.now(IST)
 
         # EOD Square-Off
         if now.time() >= exit_time:
             print(f"\n[EOD REACHED] Current time {now.strftime('%H:%M:%S')} >= Exit time {exit_time}. Closing positions.")
             if active_trade:
-                active_trade = close_trade(kite, active_trade, "EOD Exit (15:19)", tradebook_path, live_mode, hedgeless_mode)
+                active_trade = close_trade(kite, active_trade, "EOD Exit (15:19)", tradebook_path, live_mode, hedgeless_mode, cumulative_realized_pnl)
                 cumulative_realized_pnl += active_trade['net_pnl']
+                trades_pnl_list.append(round(active_trade['net_pnl'], 2))
+                active_trade = None
             break
 
         # ── 1. Every 5 Minutes: Fetch Completed Bar at :05s ──
         if now.minute % 5 == 0 and now.second >= CANDLE_FETCH_BUFFER_SECONDS:
-            expected_bar = (now - timedelta(minutes=5)).replace(second=0, microsecond=0)
+            expected_bar = (now - timedelta(minutes=5)).replace(second=0, microsecond=0).replace(tzinfo=None)
 
             if expected_bar > last_processed_5m_bar:
                 candles = fetch_verified_5m_candles(kite, INSTRUMENT_TOKEN, expected_bar, retries=5)
@@ -603,8 +614,9 @@ def run_trading_worker():
                     prev_dir = curr_dir
 
                     if active_trade is not None:
-                        active_trade = close_trade(kite, active_trade, "ST Reversal Exit", tradebook_path, live_mode, hedgeless_mode)
+                        active_trade = close_trade(kite, active_trade, "ST Reversal Exit", tradebook_path, live_mode, hedgeless_mode, cumulative_realized_pnl)
                         cumulative_realized_pnl += active_trade['net_pnl']
+                        trades_pnl_list.append(round(active_trade['net_pnl'], 2))
                         active_trade = None
 
                     if trades_taken >= max_positions:
@@ -630,13 +642,22 @@ def run_trading_worker():
                             atr_tp_multiplier=atr_tp_multiplier,
                             hedgeless_mode=hedgeless_mode,
                             live_mode=live_mode,
-                            tradebook_path=tradebook_path
+                            tradebook_path=tradebook_path,
+                            cumulative_realized_pnl=cumulative_realized_pnl
                         )
                 trim_memory()
 
-        # ── 2. Position Monitoring at MONITORING_INTERVAL_SECONDS ──
-        if (now - last_monitoring_time).total_seconds() >= MONITORING_INTERVAL_SECONDS:
-            last_monitoring_time = now
+        # ── 2. Decoupled Monitoring & Minute PnL Output ──
+        current_second_marker = (now.minute, now.second)
+        is_monitoring_tick = (now.second % MONITORING_INTERVAL_SECONDS == 0) and (current_second_marker != last_monitored_marker)
+        is_minute_tick = (now.second == 0) and (now.minute != last_pnl_print_minute)
+
+        if is_monitoring_tick or is_minute_tick:
+            if is_monitoring_tick:
+                last_monitored_marker = current_second_marker
+            if is_minute_tick:
+                last_pnl_print_minute = now.minute
+
             spot_px = get_live_price(INSTRUMENT_TOKEN, 0.0)
 
             if active_trade is not None:
@@ -648,9 +669,8 @@ def run_trading_worker():
                 unrealized_pnl = opt_pnl + hedge_pnl
                 total_day_pnl = cumulative_realized_pnl + unrealized_pnl
 
-                # ── Throttled Minute PnL Output (Strictly at :00s) ──
-                if now.second == 0 and now.minute != last_pnl_print_minute:
-                    last_pnl_print_minute = now.minute
+                # Guaranteed 1-minute throttled console print at :00s
+                if is_minute_tick:
                     print(f"[{now.strftime('%H:%M:%S')}] Spot: {spot_px:.2f} | Stop: {active_trade['spot_stop']:.2f} | Target: {active_trade['spot_tp']:.2f} | "
                           f"{active_trade['side']} LTP: {cur_opt_px:.2f} (Entry: {active_trade['opt_entry_px']:.2f}) | "
                           f"Pos PnL: {unrealized_pnl:+,.2f} | Day Net: {total_day_pnl:+,.2f}")
@@ -659,8 +679,9 @@ def run_trading_worker():
                 # A. Global Day Circuit Breaker
                 if total_day_pnl <= global_day_stop:
                     print(f"\n[GLOBAL STOP TRIGGERED] Total PnL ({total_day_pnl:.2f}) <= Limit ({global_day_stop:.2f})")
-                    active_trade = close_trade(kite, active_trade, "Global Day Stop Hit", tradebook_path, live_mode, hedgeless_mode)
+                    active_trade = close_trade(kite, active_trade, "Global Day Stop Hit", tradebook_path, live_mode, hedgeless_mode, cumulative_realized_pnl)
                     cumulative_realized_pnl += active_trade['net_pnl']
+                    trades_pnl_list.append(round(active_trade['net_pnl'], 2))
                     active_trade = None
                     break
 
@@ -669,8 +690,9 @@ def run_trading_worker():
                                 (active_trade['side'] == 'PE' and spot_px <= active_trade['spot_stop'])
                 if spot_stop_hit:
                     print(f"\n[SPOT STOP TRIGGERED] Spot {spot_px:.2f} crossed stop {active_trade['spot_stop']:.2f}")
-                    active_trade = close_trade(kite, active_trade, "Spot ATR Stop Hit", tradebook_path, live_mode, hedgeless_mode)
+                    active_trade = close_trade(kite, active_trade, "Spot ATR Stop Hit", tradebook_path, live_mode, hedgeless_mode, cumulative_realized_pnl)
                     cumulative_realized_pnl += active_trade['net_pnl']
+                    trades_pnl_list.append(round(active_trade['net_pnl'], 2))
                     active_trade = None
                     continue
 
@@ -679,14 +701,13 @@ def run_trading_worker():
                               (active_trade['side'] == 'PE' and spot_px >= active_trade['spot_tp'])
                 if spot_tp_hit:
                     print(f"\n[SPOT TARGET TRIGGERED] Spot {spot_px:.2f} hit target {active_trade['spot_tp']:.2f}")
-                    active_trade = close_trade(kite, active_trade, "Spot ATR Target Hit", tradebook_path, live_mode, hedgeless_mode)
+                    active_trade = close_trade(kite, active_trade, "Spot ATR Target Hit", tradebook_path, live_mode, hedgeless_mode, cumulative_realized_pnl)
                     cumulative_realized_pnl += active_trade['net_pnl']
+                    trades_pnl_list.append(round(active_trade['net_pnl'], 2))
                     active_trade = None
                     continue
             else:
-                # Heartbeat output every 5 minutes when standing by
-                if now.second == 0 and now.minute % 5 == 0 and now.minute != last_pnl_print_minute:
-                    last_pnl_print_minute = now.minute
+                if is_minute_tick and (now.minute % 5 == 0):
                     print(f"[{now.strftime('%H:%M:%S')}] Standing By | Spot: {spot_px:.2f} | ST Dir: {prev_dir} | Day Realized: Rs. {cumulative_realized_pnl:+,.2f}")
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -696,6 +717,7 @@ def run_trading_worker():
     print(f"  DAILY PERFORMANCE SUMMARY | {today_date}")
     print("=" * 80)
     print(f"Total Trades Executed : {trades_taken} / {max_positions}")
+    print(f"Itemized Trades PnL   : {trades_pnl_list}")
     print(f"Final Realized PnL    : Rs. {cumulative_realized_pnl:+,.2f}")
     print(f"Starting Capital      : Rs. {100000 * lots_num:,.2f}")
     print(f"Results Saved To      : {daily_pnl_path}")
@@ -706,14 +728,14 @@ def run_trading_worker():
         writer = csv.writer(f)
         if not summary_exists:
             writer.writerow(['Date', 'Symbol', 'Trades_Taken', 'Final_PnL'])
-        writer.writerow([today_date, SYMBOL, trades_taken, round(cumulative_realized_pnl, 2)])
+        writer.writerow([today_date, SYMBOL, str(trades_pnl_list), round(cumulative_realized_pnl, 2)])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRADE EXECUTION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def enter_trade(kite, direction, underlying_price, atr_ema, trades_taken, options_map,
                 tick_client, lots_num, qty, itm_gap, atr_stop_multiplier, atr_tp_multiplier,
-                hedgeless_mode, live_mode, tradebook_path):
+                hedgeless_mode, live_mode, tradebook_path, cumulative_realized_pnl):
     raw_atm = int(round(underlying_price / STRIKE_DIFFERENCE) * STRIKE_DIFFERENCE)
     atm_strike = get_best_atm_strike(kite, raw_atm, options_map)
 
@@ -772,7 +794,7 @@ def enter_trade(kite, direction, underlying_price, atr_ema, trades_taken, option
     print("\n" + "=" * 80)
     print(f"  TRADE {trades_taken} ENTRY TRIGGERED | {'BULLISH (SELL PE)' if direction == 1 else 'BEARISH (SELL CE)'}")
     print("=" * 80)
-    print(f"Trigger Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    print(f"Trigger Time      : {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST")
     print(f"Index Spot Price  : {underlying_price:.2f} | 200 EMA ATR: {atr_ema:.2f}")
     print(f"Best ATM Strike   : {atm_strike} (Raw ATM: {raw_atm})")
     print(f"Sold Leg          : {main_sym} ({side} {main_strike}) @ Rs. {main_entry_px:.2f} | Qty: {qty}")
@@ -782,7 +804,8 @@ def enter_trade(kite, direction, underlying_price, atr_ema, trades_taken, option
     print(f"Spot Target Level : {spot_tp:.2f} ({'+' if direction == 1 else '-'}{atr_tp_multiplier * atr_ema:.2f} pts)")
     print("=" * 80 + "\n")
 
-    write_tradebook_entry(tradebook_path, main_strike, side, main_entry_px, 0.0, 0.0, 0.0, f"Open - Trade_{trades_taken}")
+    # Record current cumulative realized PnL on entry
+    write_tradebook_entry(tradebook_path, main_strike, side, main_entry_px, 0.0, 0.0, cumulative_realized_pnl, f"Open - Trade_{trades_taken}")
 
     return {
         'trades_taken': trades_taken,
@@ -799,10 +822,10 @@ def enter_trade(kite, direction, underlying_price, atr_ema, trades_taken, option
         'qty': qty,
         'spot_stop': spot_stop,
         'spot_tp': spot_tp,
-        'entry_time': datetime.now()
+        'entry_time': datetime.now(IST)
     }
 
-def close_trade(kite, trade, reason, tradebook_path, live_mode, hedgeless_mode):
+def close_trade(kite, trade, reason, tradebook_path, live_mode, hedgeless_mode, cumulative_realized_pnl):
     qty = trade['qty']
 
     exit_opt_px = get_live_price(trade['opt_token'], trade['opt_entry_px'])
@@ -819,21 +842,24 @@ def close_trade(kite, trade, reason, tradebook_path, live_mode, hedgeless_mode):
     hedge_comm = commission(qty, trade['hedge_entry_px'], exit_hedge_px) if hedgeless_mode == 0 else 0.0
 
     net_pnl = (opt_gross - opt_comm) + (hedge_gross - hedge_comm)
+    updated_cumulative_pnl = cumulative_realized_pnl + net_pnl
 
     print("\n" + "=" * 80)
     print(f"  TRADE {trade['trades_taken']} EXIT | [{reason.upper()}]")
     print("=" * 80)
-    print(f"Exit Time         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    print(f"Exit Time         : {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST")
     print(f"Instrument Closed : {trade['opt_sym']} @ Rs. {exit_opt_px:.2f} (Entry: Rs. {trade['opt_entry_px']:.2f})")
     if hedgeless_mode == 0:
         print(f"Hedge Closed      : {trade['hedge_sym']} @ Rs. {exit_hedge_px:.2f} (Entry: Rs. {trade['hedge_entry_px']:.2f})")
     print(f"Gross PnL         : Rs. {(opt_gross + hedge_gross):+,.2f}")
     print(f"Statutory Charges : Rs. {(opt_comm + hedge_comm):,.2f}")
     print(f"Net Realized PnL  : Rs. {net_pnl:+,.2f}")
+    print(f"Cumulative PnL    : Rs. {updated_cumulative_pnl:+,.2f}")
     print("=" * 80 + "\n")
 
+    # Record updated cumulative realized PnL on exit
     write_tradebook_entry(tradebook_path, trade['opt_strike'], trade['side'], trade['opt_entry_px'],
-                          exit_opt_px, net_pnl, 0.0, f"Close - {reason}")
+                          exit_opt_px, net_pnl, updated_cumulative_pnl, f"Close - {reason}")
 
     trade['net_pnl'] = net_pnl
     trim_memory()
@@ -846,7 +872,7 @@ def write_tradebook_entry(filepath, strike, side, entry_px, exit_px, pnl, cum_pn
         if not file_exists:
             writer.writerow(['Timestamp', 'Strike', 'Type', 'Entry_Price', 'Exit_Price', 'PnL', 'Cumulative_PnL', 'Status'])
         writer.writerow([
-            datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S'),
+            datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'),
             strike, side, entry_px, exit_px, round(pnl, 2), round(cum_pnl, 2), status
         ])
 
@@ -862,15 +888,15 @@ if __name__ == "__main__":
 
         try:
             while True:
-                now_str = datetime.now().strftime("%H:%M")
+                now_str = datetime.now(IST).strftime("%H:%M")
                 if now_str == TOKEN_SWAP_TIME:
-                    if datetime.now().weekday() in [5, 6]:
+                    if datetime.now(IST).weekday() in [5, 6]:
                         print("[SUPERVISOR] Weekend detected. Sleeping...", flush=True)
                         time.sleep(70)
                         continue
 
                     print("\n" + "*" * 50, flush=True)
-                    print(f"LAUNCHING DAILY TRADING WORKER: {datetime.now().date()}", flush=True)
+                    print(f"LAUNCHING DAILY TRADING WORKER: {datetime.now(IST).date()}", flush=True)
                     print("*" * 50 + "\n", flush=True)
 
                     try:

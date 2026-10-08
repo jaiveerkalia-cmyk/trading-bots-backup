@@ -1,0 +1,1148 @@
+from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE, FORCE_EXIT_TIME, EOD_TIME, get_eval_price
+from csv_manager import CsvManager
+from datetime import datetime, time as dtime, timedelta
+from nicegui import ui
+import pandas as pd
+import os
+import uuid
+import time
+
+class LogicEngine:
+    def __init__(self, ticker_client, instrument_manager):
+        self.ticker = ticker_client; self.inst_manager = instrument_manager; self.csv_manager = CsvManager()
+        self.last_trigger_time = {'1m': None, '5m': None, '15m': None, '60m': None, 'chart': None}
+        self.alert_triggered = {'upper': False, 'lower': False}
+        self.trading_active = True
+        # Enter via Stop (stop_via_candle_engine.py): wired in from auto_run.py after both are
+        # constructed. Stays None if never wired -- every call site below checks for that and
+        # falls straight through to the original immediate-action behavior.
+        self.stop_via_candle_engine = None
+        # Global field-clear callback (auto_run.AutoController.clear_leg_fields): wired in
+        # from auto_run.py after the controller is constructed. Stays None if never wired --
+        # _check_global_limits() below checks for that before calling it. Wired this way
+        # (rather than importing AutoController here) to avoid a circular import, matching the
+        # same loosely-coupled pattern already used for stop_via_candle_engine.
+        self.clear_leg_fields_callback = None
+        # Tick-scoped log of every position closed during the CURRENT check_triggers() call,
+        # regardless of which code path closed it (PnL/Index/Premium stop or target, manual
+        # close, close_all_positions, etc). Reset to [] at the start of every check_triggers()
+        # call and appended to by close_position() itself -- see both for details. Used by
+        # _check_global_limits/_check_global_pnl_floor so their own fired-event breakdown
+        # (_log_limit_fire) can show EVERY trade that closed this tick, not just the ones
+        # close_all_positions() itself closed as part of that specific call -- e.g. a trade
+        # that closed via an Index Stop moments earlier in the same tick, whose loss is what
+        # actually pushed the total past a Global Stop's threshold, now shows up in that
+        # Global Stop's own breakdown line instead of only as a separate CLOSED log entry
+        # above it that has to be manually cross-referenced.
+        self._closed_this_tick = []
+
+    def log_action(self, message, details=""):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{timestamp}] {message}"
+        if details: full_msg += f" | {details}"
+        shared_state['activity_log'].insert(0, full_msg)
+        shared_state['activity_log'] = shared_state['activity_log'][:100]
+        print(full_msg)
+
+    def play_sound(self, type='alert'):
+        if params['mute_sound']: return
+        shared_state['sound_queue'].append(type)
+
+    def play_alert_sound(self, sound_name, duration):
+        """Pushes a user-selectable (sound, duration) alert sound. Distinct tuple shape from
+        the legacy string entries ('open'/'close'/'error'/'alert') so existing sound_queue
+        consumers keep working unchanged; consumers check for this tuple shape additively."""
+        if params['mute_sound']: return
+        try: dur = float(duration)
+        except (ValueError, TypeError): dur = 5
+        if dur <= 0: dur = 5
+        shared_state['sound_queue'].append(('alert_custom', sound_name, dur))
+
+    def add_chart_marker(self, text, value):
+        t = datetime.now().strftime("%H:%M")
+        shared_state['chart_data']['markers'].append({
+            'name': text, 'coord': [t, value], 'value': value,
+            'itemStyle': {'color': 'red' if 'Close' in text else 'green'}
+        })
+
+    def update_chart_data(self):
+        now = datetime.now(); curr_min = now.minute
+        if self.last_trigger_time['chart'] != curr_min:
+            t_str = now.strftime("%H:%M")
+            total_pnl = shared_state['pnl']['realized'] + shared_state['pnl']['unrealized']
+            shared_state['chart_data']['times'].append(t_str)
+            shared_state['chart_data']['pnl'].append(round(total_pnl, 2))
+            self.last_trigger_time['chart'] = curr_min
+
+    def commission(self, amount, buy_price, sell_price):
+        """Zerodha F&O Options charges, per https://zerodha.com/charges#tab-equities
+        (verified current as of the last update to this function):
+          - Brokerage: flat Rs. 20 per executed order (charged here for BOTH legs of a
+            round trip -- entry + exit -- since this is called once per full leg's
+            buy+sell pair).
+          - STT: 0.15% of premium on the SELL side only.
+          - Exchange transaction charges (NSE): 0.03553% on premium, both sides.
+          - SEBI charges: Rs. 10/crore (0.0001%), both sides.
+          - GST: 18% on (brokerage + exchange transaction charges + SEBI charges).
+          - Stamp duty: 0.003% on premium, BUY side only.
+          - IPFT (NSE): Rs. 0.01/crore + GST on premium (0.000001%), both sides."""
+        buy_turnover = amount * buy_price
+        sell_turnover = amount * sell_price
+        total_turnover = buy_turnover + sell_turnover
+
+        brokerage = 20 + 20
+        stt = 0.0015 * sell_turnover
+        exchange_txn = 0.0003553 * total_turnover
+        sebi = 0.000001 * total_turnover
+        gst = 0.18 * (brokerage + exchange_txn + sebi)
+        stamp_duty = 0.00003 * buy_turnover
+        ipft = 0.00000005 * total_turnover
+
+        return round(brokerage + stt + exchange_txn + sebi + gst + stamp_duty + ipft, 2)
+    
+    def _place_live_order(self, symbol, txn_type, qty, product, exchange):
+        kite = self.inst_manager.kite
+        attempts = 0
+        while attempts < 3:
+            try:
+                order_id = kite.place_order(variety=kite.VARIETY_REGULAR, exchange=exchange, tradingsymbol=symbol, transaction_type=txn_type, quantity=qty, product=product, order_type=kite.ORDER_TYPE_MARKET)
+                self.log_action(f"✅ ORDER: {symbol} {txn_type}", f"ID: {order_id}")
+                return True
+            except Exception as e:
+                attempts += 1; self.log_action(f"⚠️ RETRY {attempts}: {symbol}", str(e)); time.sleep(1)
+        self.log_action(f"❌ FAILED: {symbol}", "Manual Check Req"); self.play_sound('error'); return False
+
+    def open_position(self, side, manual_strike=None, reason="Manual", qty_override=None, strike_offset=None):
+        if not self.trading_active: return False, "Trading Stopped"
+        index_name = params['trading_index']
+        # Strike selection is ALWAYS spot-based, regardless of Futures Mode (option strikes
+        # are spot-relative, not futures-relative) -- spot_ltp drives strike math below.
+        # eval_ltp is the Futures-Mode-aware price (near-month future when the mode is on and
+        # resolved, otherwise identical to spot_ltp) used ONLY for the trade's recorded
+        # index_entry_price/index_current_price fields, never for strike calc.
+        spot_ltp = shared_state[index_name]['ltp']
+        eval_ltp = get_eval_price(index_name)
+        step = INDICES[index_name]['step']; lot_size = INDICES[index_name]['lot_size']
+        segment = INDICES[index_name]['segment']
+        buy_mode = params.get('options_buy_mode', False)
+        # Buy Mode is always hedgeless (enforced here defensively too, not just in the UI guard).
+        hedgeless = True if buy_mode else params.get('hedgeless_mode', False)
+
+        if spot_ltp == 0: return False, "Index Price 0"
+        if shared_state['active_trades'][side] is not None: return False, "Position Open"
+
+        if manual_strike:
+            main_strike = manual_strike
+        elif strike_offset is not None:
+            # Unified card strike selection: 0 = ATM, positive = ITM steps, negative = OTM steps.
+            try: offset = float(strike_offset)
+            except: offset = 0
+            atm = round(spot_ltp / step) * step
+            main_strike = (atm - (offset * step)) if side == 'Call' else (atm + (offset * step))
+        else:
+            entry_mode = params['call_entry_mode'] if side == 'Call' else params['put_entry_mode']
+            manual_key = 'call_manual_strike' if side == 'Call' else 'put_manual_strike'
+            if entry_mode == 'ATM': main_strike = round(spot_ltp / step) * step
+            else:
+                try: main_strike = float(params[manual_key])
+                except: return False, "Invalid Strike"
+
+        opt_type = 'CE' if side == 'Call' else 'PE'
+        main_token, main_symbol = self.inst_manager.get_atm_token(index_name, main_strike, opt_type)
+        if not main_token: return False, "Token Not Found"
+
+        qty = int(qty_override) * lot_size if qty_override is not None else int(params['lots']) * lot_size
+        kite = self.inst_manager.kite
+
+        if hedgeless:
+            # Hedgeless: only place one order on main (SELL when option-selling, BUY when
+            # Options Buy Mode is on), no hedge lookup or order either way.
+            main_txn = kite.TRANSACTION_TYPE_BUY if buy_mode else kite.TRANSACTION_TYPE_SELL
+            if params['live_trading'] == 'On':
+                if not self._place_live_order(main_symbol, main_txn, qty, kite.PRODUCT_MIS, segment):
+                    return False, "Main Fail"
+
+            self.ticker.subscribe_new([main_token])
+            if main_token not in shared_state['option_chain']:
+                shared_state['option_chain'][main_token] = {'ltp': 0.0, 'symbol': main_symbol}
+
+            # Realistic fill price via live market depth (kite.quote()), quantity-weighted
+            # across the book -- used for BOTH live and paper trading, so paper-trade PnL
+            # reflects what a real market order of this size would actually get filled at,
+            # not an idealized LTP. main_is_buy: True when Options Buy Mode BUYS the main leg
+            # (opens long), False when Sell Mode SELLS it (opens short) -- a market order
+            # walks the OPPOSITE side of the book from the direction being traded (a BUY
+            # fills against the ask/depth['sell'] ladder, a SELL against the bid/
+            # depth['buy'] ladder -- see instrument_manager.get_fill_price docstring).
+            m_ltp = shared_state['option_chain'][main_token]['ltp']
+            m_pr, m_used_depth = self.inst_manager.get_fill_price(main_token, main_symbol, segment, qty, is_buy=buy_mode)
+            trade_id = str(uuid.uuid4())[:8]
+            trade = {
+                'id': trade_id, 'type': opt_type, 'direction': 'BUY' if buy_mode else 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
+                'index_entry_price': eval_ltp, 'index_current_price': eval_ltp, 'csv_synced': False,
+                'entry_time': datetime.now().strftime("%H:%M:%S"), 'trigger': reason,
+                'main': {'symbol': main_symbol, 'token': main_token, 'strike': main_strike, 'entry_price': m_pr, 'current_price': m_pr},
+                'hedge': None
+            }
+            shared_state['active_trades'][side] = trade
+            self.csv_manager.log_open(trade_id, trade)
+            mode_label = "BUY (Hedgeless)" if buy_mode else "HEDGELESS"
+            depth_note = f" [depth, LTP was {m_ltp:.2f}]" if (m_used_depth and abs(m_pr - m_ltp) > 0.001) else ""
+            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}{depth_note}) | {mode_label}"
+            self.log_action(f"OPENED {side} {mode_label} ({reason})", dtls)
+            self.play_sound('open')
+            self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
+            return True, f"Opened {side} ({mode_label})"
+
+        else:
+            # Normal sell mode: buy hedge + sell main. (Not reachable when buy_mode is True,
+            # since hedgeless is forced True above in that case.)
+            hedge_strike = main_strike + (10 * step) if side == 'Call' else main_strike - (10 * step)
+            hedge_token, hedge_symbol = self.inst_manager.get_atm_token(index_name, hedge_strike, opt_type)
+            if not hedge_token: return False, "Hedge Token Not Found"
+
+            if params['live_trading'] == 'On':
+                if not self._place_live_order(hedge_symbol, kite.TRANSACTION_TYPE_BUY, qty, kite.PRODUCT_MIS, segment): return False, "Hedge Fail"
+                time.sleep(1)
+                if not self._place_live_order(main_symbol, kite.TRANSACTION_TYPE_SELL, qty, kite.PRODUCT_MIS, segment): return False, "Main Fail"
+
+            self.ticker.subscribe_new([main_token, hedge_token])
+            for t, s in [(main_token, main_symbol), (hedge_token, hedge_symbol)]:
+                if t not in shared_state['option_chain']: shared_state['option_chain'][t] = {'ltp': 0.0, 'symbol': s}
+
+            # Main leg is SOLD (is_buy=False -> fills against the bid/depth['buy'] ladder);
+            # hedge leg is always BOUGHT (is_buy=True -> fills against the ask/depth['sell']
+            # ladder) -- same realistic depth-based fill logic as the hedgeless branch above,
+            # for both live and paper trading.
+            m_ltp = shared_state['option_chain'][main_token]['ltp']
+            h_ltp = shared_state['option_chain'][hedge_token]['ltp']
+            m_pr, m_used_depth = self.inst_manager.get_fill_price(main_token, main_symbol, segment, qty, is_buy=False)
+            h_pr, h_used_depth = self.inst_manager.get_fill_price(hedge_token, hedge_symbol, segment, qty, is_buy=True)
+
+            trade_id = str(uuid.uuid4())[:8]
+            trade = {
+                'id': trade_id, 'type': opt_type, 'direction': 'SELL', 'qty': qty, 'status': 'OPEN', 'pnl': 0.0,
+                'index_entry_price': eval_ltp, 'index_current_price': eval_ltp, 'csv_synced': False,
+                'entry_time': datetime.now().strftime("%H:%M:%S"), 'trigger': reason,
+                'main': {'symbol': main_symbol, 'token': main_token, 'strike': main_strike, 'entry_price': m_pr, 'current_price': m_pr},
+                'hedge': {'symbol': hedge_symbol, 'token': hedge_token, 'strike': hedge_strike, 'entry_price': h_pr, 'current_price': h_pr}
+            }
+            shared_state['active_trades'][side] = trade
+            self.csv_manager.log_open(trade_id, trade)
+            m_note = f" [depth, LTP was {m_ltp:.2f}]" if (m_used_depth and abs(m_pr - m_ltp) > 0.001) else ""
+            h_note = f" [depth, LTP was {h_ltp:.2f}]" if (h_used_depth and abs(h_pr - h_ltp) > 0.001) else ""
+            dtls = f"Idx: {eval_ltp:.2f} | M: {main_strike} ({m_pr:.2f}{m_note}) | H: {hedge_strike} ({h_pr:.2f}{h_note})"
+            self.log_action(f"OPENED {side} ({reason})", dtls)
+            self.play_sound('open')
+            self.add_chart_marker(f"Open {side}", shared_state['pnl']['realized'])
+            return True, f"Opened {side}"
+
+    def close_position(self, side, reason="Manual"):
+        trade = shared_state['active_trades'][side]
+        if not trade: return False, "No Position"
+        m = trade['main']
+        h = trade['hedge']  # may be None in hedgeless mode
+        is_buy = trade.get('direction', 'SELL') == 'BUY'
+
+        kite = self.inst_manager.kite
+        segment = INDICES[params['trading_index']]['segment']
+
+        if params['live_trading'] == 'On':
+            # Cover the main leg: SELL to close if it was bought (Buy Mode), BUY to cover if
+            # it was sold (Sell Mode, existing behavior).
+            main_close_txn = kite.TRANSACTION_TYPE_SELL if is_buy else kite.TRANSACTION_TYPE_BUY
+            if not self._place_live_order(m['symbol'], main_close_txn, trade['qty'], kite.PRODUCT_MIS, segment):
+                return False, "Cover Fail"
+            # Only sell hedge if it exists (never present in Buy Mode)
+            if h:
+                time.sleep(1)
+                if not self._place_live_order(h['symbol'], kite.TRANSACTION_TYPE_SELL, trade['qty'], kite.PRODUCT_MIS, segment):
+                    self.log_action("⚠️ Hedge Exit Fail"); self.play_sound('error')
+
+        # Realistic fill price via live market depth on CLOSE too -- both live and paper
+        # trading. Closing the main leg trades in the OPPOSITE direction from how it was
+        # opened: a BUY-mode (long) position is SOLD to close (is_buy=False -> bid ladder); a
+        # SELL-mode (short) position is BOUGHT-to-cover to close (is_buy=True -> ask ladder).
+        m_ltp = shared_state['option_chain'].get(m['token'], {}).get('ltp', 0)
+        m_curr, m_used_depth = self.inst_manager.get_fill_price(m['token'], m['symbol'], segment, trade['qty'], is_buy=(not is_buy))
+        m_entry = m['entry_price'] if m['entry_price'] > 0 else m_curr
+        # Index price shown/logged on close is Futures-Mode-aware (index_entry_price on this
+        # trade was already recorded the same way at open, in open_position() above), never
+        # affects the option PnL math below, which is always premium-based.
+        idx_curr = get_eval_price(params['trading_index'])
+
+        if h:
+            # Hedge is always CLOSED by selling it (it was bought at entry regardless of
+            # mode -- see open_position) -> is_buy=False, bid ladder.
+            h_ltp = shared_state['option_chain'].get(h['token'], {}).get('ltp', 0)
+            h_curr, h_used_depth = self.inst_manager.get_fill_price(h['token'], h['symbol'], segment, trade['qty'], is_buy=False)
+            h_entry = h['entry_price'] if h['entry_price'] > 0 else h_curr
+            net_pnl = ((m_entry - m_curr) * trade['qty']) + ((h_curr - h_entry) * trade['qty'])
+            net_pnl -= (self.commission(trade['qty'], m_curr, m_entry) + self.commission(trade['qty'], h_curr, h_entry))
+            h_exit_price = h_curr
+        else:
+            h_curr = 0; h_entry = 0; h_exit_price = 0; h_ltp = 0; h_used_depth = False
+            if is_buy:
+                # Bought main, now selling to close: profit as price rises.
+                net_pnl = (m_curr - m_entry) * trade['qty']
+                # commission(qty, buy_price, sell_price): entry was the buy leg, exit is the sell leg.
+                net_pnl -= self.commission(trade['qty'], m_entry, m_curr)
+            else:
+                net_pnl = (m_entry - m_curr) * trade['qty']
+                net_pnl -= self.commission(trade['qty'], m_curr, m_entry)
+
+        shared_state['pnl']['realized'] += net_pnl
+        shared_state['pnl']['trades_history'].append({'symbol': f"{m['symbol']}", 'pnl': round(net_pnl, 2), 'reason': reason})
+        self.csv_manager.log_close(trade['id'], {'main_price': m_curr, 'hedge_price': h_exit_price, 'index_price': idx_curr}, round(net_pnl, 2))
+        shared_state['active_trades'][side] = None
+
+        m_note = f" [depth, LTP was {m_ltp:.2f}]" if (m_used_depth and abs(m_curr - m_ltp) > 0.001) else ""
+        h_note = f" [depth, LTP was {h_ltp:.2f}]" if (h and h_used_depth and abs(h_curr - h_ltp) > 0.001) else ""
+        dtls = f"Idx: {idx_curr:.2f} | PnL: {net_pnl:.0f} | M_Ex: {m_curr:.2f}{m_note}" + (f" | H_Ex: {h_curr:.2f}{h_note}" if h else " | HEDGELESS")
+        self.log_action(f"CLOSED {side} ({reason})", dtls)
+        self.play_sound('close')
+        self.add_chart_marker(f"Close {side}", shared_state['pnl']['realized'])
+        shared_state['reset_queue'].append(side)
+        # Returned alongside the (success, message) tuple for callers that need this specific
+        # close's PnL (e.g. close_all_positions()'s breakdown below) without re-deriving it
+        # from shared_state['pnl']['trades_history'] (which is a running, ever-growing list
+        # covering the WHOLE session, not just this one call).
+        self._last_close_pnl = round(net_pnl, 2)
+        self._last_close_side = side
+        # Tick-scoped record of this close, appended regardless of which code path called
+        # close_position() (PnL/Index/Premium stop or target, manual close button,
+        # close_all_positions, EOD square-off, etc) -- see _closed_this_tick's declaration in
+        # __init__ and its usage in _check_global_limits/_check_global_pnl_floor for why.
+        self._closed_this_tick.append({'side': side, 'symbol': m['symbol'], 'pnl': self._last_close_pnl})
+        return True, "Closed"
+
+    def close_all_positions(self, reason="Global Exit", save_pnl=True):
+        """Closes every open position (Call/Put). Returns a list of {'side','symbol','pnl'}
+        dicts, one per position actually closed by THIS call -- NOT the full-session
+        shared_state['pnl']['trades_history'] (which keeps growing all day), and NOT
+        necessarily the same as self._closed_this_tick (which can also include trades closed
+        by an EARLIER call this same tick, e.g. an Index Stop firing moments before a Global
+        Stop that then calls this method) -- so callers that need to report exactly what
+        THIS specific close-all call closed still have that available here, while
+        _log_limit_fire's own breakdown (see _check_global_limits/_check_global_pnl_floor)
+        instead uses the broader self._closed_this_tick when logging a fired global limit."""
+        closed = []
+        for side in ['Call', 'Put']:
+            trade = shared_state['active_trades'][side]
+            if trade:
+                symbol = trade['main']['symbol']
+                success, _ = self.close_position(side, reason)
+                if success:
+                    closed.append({'side': side, 'symbol': symbol, 'pnl': self._last_close_pnl})
+        if save_pnl:
+            self.csv_manager.save_daily_report()
+            self.log_action("📊 Daily Report Saved", f"{reason}")
+        else:
+            self.log_action("ℹ️ All Positions Closed", f"{reason}")
+        return closed
+
+    def _cancel_opposite_pending(self, side, reason=""):
+        """Called after a TARGET-triggered close (PnL/Index/Premium). Cancels any pending
+        entry order and any active conditional exit orders on the OPPOSITE side -- i.e. every
+        row that would show up in the Open Orders section for that side. Additive/defensive
+        only: harmless no-op for flags that are already off, and doesn't touch anything on the
+        side that just hit its target."""
+        opp_side = 'Put' if side == 'Call' else 'Call'
+        opp_prefix = 'put' if side == 'Call' else 'call'
+        cancelled = []
+
+        if params.get(f'{opp_prefix}_armed'):
+            params[f'{opp_prefix}_armed'] = False
+            cancelled.append('pending entry')
+
+        for label, key in [
+            ('prem stop', f'{opp_prefix}_prem_stop_active'), ('prem target', f'{opp_prefix}_prem_tgt_active'),
+            ('index stop', f'{opp_prefix}_index_stop_active'), ('index target', f'{opp_prefix}_index_tgt_active'),
+        ]:
+            if params.get(key):
+                params[key] = False
+                cancelled.append(label)
+
+        if cancelled:
+            self.log_action(f"🚫 Target hit on {side}{(' (' + reason + ')') if reason else ''}: cancelled {opp_side} orders", ', '.join(cancelled))
+
+    def update_pnl(self):
+        """Updates each open trade's live 'pnl' field (shown throughout the UI as running/
+        unrealized PnL) and the aggregate shared_state['pnl']['unrealized'].
+
+        Commission is now ALWAYS included here, recomputed every tick from the CURRENT mark
+        price (not just once at entry) -- so the running PnL shown live always reflects what
+        would actually be realized if the position were closed at that exact moment, exactly
+        matching close_position()'s own commission accounting (same commission() formula,
+        same qty/buy-price/sell-price convention per leg). Previously this method only
+        computed raw mark-to-market PnL with no commission at all, so the live number always
+        overstated the true PnL by the exit (and, for hedged trades, both legs') commission
+        that close_position() would go on to actually deduct -- the live and post-close
+        numbers could visibly jump the moment a position was closed. Direction/hedge-mode
+        commission conventions mirror close_position() exactly: for a SELL leg, entry was the
+        sell and the current mark is the hypothetical buy-to-cover, so commission(qty,
+        buy_price=current, sell_price=entry); for a BUY leg, entry was the buy and current
+        mark is the hypothetical sell-to-close, so commission(qty, buy_price=entry,
+        sell_price=current). The hedge leg (when present) is always a BUY at entry that would
+        be sold to close, so commission(qty, buy_price=entry, sell_price=current) there too.
+
+        Futures Mode: trade['index_current_price'] (index-linked reference/display field
+        only, never part of the premium PnL math above/below) uses get_eval_price() so it
+        tracks the near-month future when the mode is on, exactly like index_entry_price was
+        recorded at open in open_position().
+
+        NOTE: this method deliberately stays LTP-based (shared_state['option_chain'][...]
+        ['ltp'], populated by the ticker) rather than calling
+        instrument_manager.get_fill_price() -- it runs every single tick (about once a
+        second) for every open position, and hitting kite.quote() that often would burn
+        through Kite's REST rate limit for no real benefit, since this is a continuous
+        DISPLAY estimate of unrealized PnL, not an actual fill event. Realistic
+        depth-based fill prices are used at the actual moment of a fill instead -- see
+        open_position()/close_position() above, both for live AND paper trading -- so the
+        REALIZED PnL recorded when a position actually closes reflects a real market fill,
+        even though the live ticking number in between is an LTP-based approximation.
+
+        Called TWICE per tick as of this fix: once early inside check_triggers() (right
+        after _check_exits/_check_unified_open, before _check_global_limits/
+        _check_global_pnl_floor read any PnL total -- see check_triggers() below) so those
+        checks never read a stale/mixed total, and again later in auto_run.py's
+        run_bot_logic() loop body for the general UI-display refresh. The second call is a
+        cheap, harmless re-confirmation once nothing changed between the two -- it exists
+        for the same reason it always did (keeping the live display current every tick) and
+        is left in place rather than removed, to avoid disturbing other timing assumptions
+        downstream of it."""
+        unrealized = 0.0
+        idx_eval = get_eval_price(params['trading_index'])
+        for side in ['Call', 'Put']:
+            trade = shared_state['active_trades'][side]
+            if trade:
+                trade['index_current_price'] = idx_eval
+                m_ltp = shared_state['option_chain'].get(trade['main']['token'], {}).get('ltp', 0)
+                trade['main']['current_price'] = m_ltp
+                if trade['main']['entry_price'] == 0 and m_ltp > 0: trade['main']['entry_price'] = m_ltp
+                is_buy = trade.get('direction', 'SELL') == 'BUY'
+
+                if trade['hedge']:
+                    h_ltp = shared_state['option_chain'].get(trade['hedge']['token'], {}).get('ltp', 0)
+                    trade['hedge']['current_price'] = h_ltp
+                    if trade['hedge']['entry_price'] == 0 and h_ltp > 0: trade['hedge']['entry_price'] = h_ltp
+                    if not trade['csv_synced'] and trade['main']['entry_price'] > 0:
+                        self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], trade['hedge']['entry_price'], idx_eval)
+                        self.log_action("📝 Entry Prices Confirmed", f"M: {trade['main']['entry_price']:.2f} | H: {trade['hedge']['entry_price']:.2f}")
+                        trade['csv_synced'] = True
+                    m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
+                    h_pnl = (h_ltp - trade['hedge']['entry_price']) * trade['qty'] if h_ltp > 0 else 0
+                    est_commission = 0.0
+                    if m_ltp > 0:
+                        est_commission += self.commission(trade['qty'], m_ltp, trade['main']['entry_price'])
+                    if h_ltp > 0:
+                        est_commission += self.commission(trade['qty'], trade['hedge']['entry_price'], h_ltp)
+                    trade['pnl'] = m_pnl + h_pnl - est_commission
+                else:
+                    # Hedgeless: PnL is only from the main leg. Direction determines sign:
+                    # SELL (existing) profits as price falls; BUY (Options Buy Mode) profits
+                    # as price rises.
+                    if not trade['csv_synced'] and trade['main']['entry_price'] > 0:
+                        sync_label = "📝 Entry Price Confirmed (Buy Mode)" if is_buy else "📝 Entry Price Confirmed (Hedgeless)"
+                        self.csv_manager.update_entry_log(trade['id'], trade['main']['entry_price'], 0, idx_eval)
+                        self.log_action(sync_label, f"M: {trade['main']['entry_price']:.2f}")
+                        trade['csv_synced'] = True
+                    est_commission = 0.0
+                    if is_buy:
+                        m_pnl = (m_ltp - trade['main']['entry_price']) * trade['qty'] if m_ltp > 0 else 0
+                        if m_ltp > 0:
+                            est_commission = self.commission(trade['qty'], trade['main']['entry_price'], m_ltp)
+                    else:
+                        m_pnl = (trade['main']['entry_price'] - m_ltp) * trade['qty'] if m_ltp > 0 else 0
+                        if m_ltp > 0:
+                            est_commission = self.commission(trade['qty'], m_ltp, trade['main']['entry_price'])
+                    trade['pnl'] = m_pnl - est_commission
+
+                unrealized += trade['pnl']
+        shared_state['pnl']['unrealized'] = unrealized
+        self.update_chart_data()
+
+    def _live_total_pnl(self):
+        """Computes total PnL fresh from currently-open trades, never from the cached
+        shared_state['pnl']['unrealized'] snapshot -- that snapshot is only refreshed once
+        per tick by update_pnl(), so if a trade opened AND/OR closed earlier in this same
+        tick (e.g. inside _check_exits/_check_unified_open, both of which run before this
+        is called from check_triggers()), the cache could still be holding a just-closed
+        trade's last-known unrealized PnL, while shared_state['pnl']['realized'] has
+        ALREADY been updated (synchronously, inside close_position()) with that same
+        trade's realized close -- double-counting that one trade's loss/profit for the
+        single tick between its close and the next update_pnl() refresh. This was
+        confirmed as the cause of a Global Stop firing at a total (₹-10438) that did not
+        match the sum of any actually-closed trades: a Put closed and a Call opened in the
+        same tick, and _check_global_limits() read realized (already updated by the Put's
+        close) plus a still-stale unrealized (still holding the Put's own last-known
+        live PnL, not yet zeroed out because update_pnl() hadn't run again yet) --
+        effectively counting the Put's loss twice.
+
+        Summing trade['pnl'] directly from shared_state['active_trades'] AS IT STANDS
+        RIGHT NOW sidesteps this entirely: a just-closed trade is no longer in
+        active_trades by the time this runs (close_position() sets it to None
+        synchronously), so it cannot contribute a second time via a stale cached figure.
+        A freshly-opened trade's pnl is correctly ~0 at this point (it hasn't had a tick
+        to move yet), which is the accurate state of the world, not a bug -- see also the
+        update_pnl() call added earlier in check_triggers(), which additionally keeps the
+        CACHED unrealized figure (used for the UI display and by AutoController.run_loop's
+        own SECOND_LEG global-stop check) consistent for the rest of this same tick, not
+        just for this method.
+
+        Used by every Global Stop/Target/PnL Floor check so each always compares against
+        what's actually true at the instant it checks, never a snapshot that can lag by
+        exactly the trades that just happened."""
+        unrealized = sum(t['pnl'] for t in shared_state['active_trades'].values() if t is not None)
+        return shared_state['pnl']['realized'] + unrealized
+
+    def check_triggers(self):
+        if not self.trading_active: return
+        now = datetime.now()
+        # Reset the tick-scoped closed-trades log at the very start of this tick's
+        # processing -- see _closed_this_tick's declaration in __init__ and close_position()
+        # for how it's populated, and _check_global_limits/_check_global_pnl_floor for how
+        # it's consumed. Every entry appended below (by any close_position() call anywhere
+        # in this tick, from any code path) reflects ONLY this tick's closes.
+        self._closed_this_tick = []
+        # Futures Mode: every entry/exit evaluation below reads the Futures-Mode-aware price
+        # (near-month future when the mode is on and resolved, otherwise identical to spot --
+        # see config.get_eval_price()). Strike selection (inside open_position/
+        # _check_unified_open's strike_offset math) is computed separately and always stays
+        # spot-based; it is NOT affected by this variable.
+        idx_ltp = get_eval_price(params['trading_index'])
+        # Strict candle-close timing: fire exactly once per minute-boundary crossing (no
+        # second-based grace window). More precise (no longer fires anywhere in a 0-4 second
+        # window after the minute rolls over) AND more robust (can't be missed even if a tick
+        # runs long, since it compares "have we already processed this minute" not "are we
+        # within a narrow second window").
+        curr_min = now.minute
+        fire_1m = self.last_trigger_time['1m'] != curr_min
+        fire_5m = (curr_min % 5 == 0) and self.last_trigger_time['5m'] != curr_min
+        fire_15m = (curr_min % 15 == 0) and self.last_trigger_time['15m'] != curr_min
+        fire_60m = (curr_min == 0) and self.last_trigger_time['60m'] != curr_min
+
+        # EOD_TIME Auto-Squareoff. NOTE: in the current wiring this branch is effectively
+        # unreachable in practice, since run_bot_logic() (auto_run.py) only calls
+        # check_triggers() while now.time() < config.EOD_TIME -- the actual EOD save happens
+        # in AutoController.run_loop()'s own priority block instead (also gated on
+        # config.EOD_TIME, the single source of truth for this time -- see config.py). Kept
+        # here as a defensive fallback (e.g. if that gating is ever changed) and shares the
+        # SAME 'daily_pnl_written' flag as every other close_all_positions(save_pnl=True)
+        # call, so that even if this branch ever does run, final_daily_pnl.csv still only
+        # gets written once per day, never twice. Upper bound is EOD_TIME + 1 minute (rather
+        # than a separately hardcoded time) so this stays a narrow one-shot guard window
+        # regardless of what EOD_TIME is set to.
+        if now.time() >= EOD_TIME and now.time() < (datetime.combine(datetime.today(), EOD_TIME) + timedelta(minutes=1)).time() and not shared_state.get('daily_pnl_written', False):
+            self.close_all_positions("EOD Auto-SQ", save_pnl=True)
+            shared_state['daily_pnl_written'] = True
+            self.log_action("⚠️ EOD Day End Executed")
+
+        if shared_state['active_trades']['Call'] is None and params['short_trigger_active']:
+            self._check_single_open('Call', 'short', idx_ltp, fire_1m, fire_5m)
+        if shared_state['active_trades']['Put'] is None and params['long_trigger_active']:
+            self._check_single_open('Put', 'long', idx_ltp, fire_1m, fire_5m)
+
+        # Unified Open Short/Long cards (index-based, order-type + fire-on aware)
+        if shared_state['active_trades']['Call'] is None and params.get('call_armed'):
+            self._check_unified_open('Call', now, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+        else:
+            shared_state['unified_debug']['Call'] = None
+        if shared_state['active_trades']['Put'] is None and params.get('put_armed'):
+            self._check_unified_open('Put', now, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m)
+        else:
+            shared_state['unified_debug']['Put'] = None
+
+        self._check_exits(now, idx_ltp, fire_1m, fire_5m)
+
+        # Refresh unrealized PnL (and each open trade's own pnl field) NOW, before any
+        # global check below reads a PnL total -- entries/exits above this line can have
+        # opened and/or closed a position THIS SAME TICK, and without this call the global
+        # checks below would read shared_state['pnl']['unrealized'] as it stood BEFORE
+        # those opens/closes, which can double-count a trade that just closed (its loss/
+        # profit already landed in 'realized' synchronously, but its last-known live pnl
+        # could still be sitting in the stale 'unrealized' cache for one more tick). See
+        # _live_total_pnl()'s docstring for the full incident this fixes. This call also
+        # keeps the CACHED unrealized figure fresh for anything else that reads it later
+        # this same tick (the UI display, and AutoController.run_loop's own SECOND_LEG
+        # global-stop check in auto_run.py), not just the two methods immediately below.
+        self.update_pnl()
+
+        self._check_global_limits()
+        self._check_global_pnl_floor()
+        # Alerts are index-tagged (see ui_components._add_alert_card's 'index' field, added
+        # to each new alert at creation time to lock it to whichever index -- NIFTY or
+        # SENSEX -- was selected when the alert was created) and must be evaluated against
+        # THEIR OWN index's price, never whichever index happens to be currently selected in
+        # params['trading_index']. Both indices tick continuously in shared_state regardless
+        # of the active selection (ticker_engine subscribes both permanently), so both
+        # Futures-Mode-aware prices are computed here and handed to _check_alerts, which picks
+        # the right one per alert.
+        idx_prices = {name: get_eval_price(name) for name in INDICES}
+        self._check_alerts(idx_prices, fire_1m, fire_5m)
+
+        if fire_1m: self.last_trigger_time['1m'] = curr_min
+        if fire_5m: self.last_trigger_time['5m'] = curr_min
+        if fire_15m: self.last_trigger_time['15m'] = curr_min
+        if fire_60m: self.last_trigger_time['60m'] = curr_min
+
+    def _check_single_open(self, side, prefix, idx_ltp, fire_1m, fire_5m):
+        mode = params[f'{prefix}_open_mode']
+        try: trigger_price = float(params[f'{prefix}_open_amount'])
+        except: return
+        try: strike = float(params[f'{prefix}_open_strike'])
+        except: strike = 0
+        should_fire = False
+        reason = f"{mode} < {trigger_price}" if side == 'Call' else f"{mode} > {trigger_price}"
+
+        if side == 'Call':
+            if mode == 'Current' and idx_ltp > 0 and idx_ltp < trigger_price: should_fire = True
+            elif mode == '1m' and fire_1m and idx_ltp < trigger_price: should_fire = True
+            elif mode == '5m' and fire_5m and idx_ltp < trigger_price: should_fire = True
+            elif mode == 'Loss':
+                opp = shared_state['active_trades']['Put']
+                if opp and opp['pnl'] < -abs(trigger_price): should_fire = True; reason = f"Put Loss {opp['pnl']}"
+        else:
+            if mode == 'Current' and idx_ltp > 0 and idx_ltp > trigger_price: should_fire = True
+            elif mode == '1m' and fire_1m and idx_ltp > trigger_price: should_fire = True
+            elif mode == '5m' and fire_5m and idx_ltp > trigger_price: should_fire = True
+            elif mode == 'Loss':
+                opp = shared_state['active_trades']['Call']
+                if opp and opp['pnl'] < -abs(trigger_price): should_fire = True; reason = f"Call Loss {opp['pnl']}"
+
+        if should_fire:
+            self.log_action(f"⚡ TRIGGER FIRED: {side} ({reason})")
+            success, msg = self.open_position(side, manual_strike=strike if strike > 0 else None, reason=reason)
+            if not success:
+                self.log_action(f"⚠️ Trigger Fired but Open Failed: {msg}")
+                params[f'{prefix}_trigger_active'] = False
+                self.play_sound('error')
+
+    def _check_unified_open(self, side, now, idx_ltp, fire_1m, fire_5m, fire_15m, fire_60m):
+        """Checks/fires the new unified Open Short/Long card (order type + fire-on timeframe).
+        Trigger direction depends on options_buy_mode: Sell Mode (existing) treats Call/Put as
+        short-bias reversal entries; Options Buy Mode treats Call as a bullish breakout-buy and
+        Put as a bearish breakdown-buy, so the Stop-Market/Limit comparisons flip.
+
+        Timing fix: fire_1m/5m/15m/60m are TRUE for the entire minute in which that boundary
+        was crossed (they only turn False again once check_triggers() has processed that
+        minute once for that timeframe). If a card is armed mid-way through a minute that
+        already satisfies the boundary (e.g. armed at 10:35:20 with fire_on='5m'), the very
+        next tick would see fire_5m=True and fire instantly -- one tick after arming, not
+        after waiting for the NEXT candle close as the trader intends. Fixed by stamping
+        params['{prefix}_armed_at'] with the datetime the card was armed (unified_entry_card /
+        MODIFY-CONFIRM in ui_components.py), and requiring 'now' to be strictly after that
+        timestamp AND in a later boundary-minute than when it was armed.
+
+        Enter via Stop (stop_via_candle_engine.py): when a Stop-Market condition (never Market
+        or Limit) is confirmed true on a candle-close timeframe (never 'Live'), and
+        params['enter_via_stop'] is on and the engine is wired, the entry is handed off to the
+        candle-stop engine instead of being opened immediately -- see the should_fire block
+        below. Falls through to the exact original immediate-open behavior otherwise.
+
+        idx_ltp here is already the Futures-Mode-aware evaluation price (passed down from
+        check_triggers()). Strike selection in open_position() below is computed separately
+        from spot, regardless of what idx_ltp equals here."""
+        prefix = 'call' if side == 'Call' else 'put'
+        order_type = params.get(f'{prefix}_order_type', 'Market')
+        fire_on = params.get(f'{prefix}_fire_on', 'Live')
+        buy_mode = params.get('options_buy_mode', False)
+
+        raw_trigger = params.get(f'{prefix}_trigger_price', 0)
+        try: trigger_price = float(raw_trigger)
+        except (ValueError, TypeError): trigger_price = 0
+        try: strike_offset = float(params.get(f'{prefix}_strike_offset', 1))
+        except (ValueError, TypeError): strike_offset = 1
+        try: qty = int(float(params.get(f'{prefix}_qty', 4)))
+        except (ValueError, TypeError): qty = 4
+
+        # Gate by the selected candle-close timeframe. 'Live' checks every tick. For 1m/5m/
+        # 15m/60m, additionally require the current moment to be AFTER the minute in which
+        # this order was armed -- otherwise arming during a boundary-minute fires instantly.
+        armed_at = params.get(f'{prefix}_armed_at')
+        after_arm_minute = True
+        if armed_at is not None and fire_on != 'Live':
+            after_arm_minute = (now.replace(second=0, microsecond=0) > armed_at.replace(second=0, microsecond=0))
+
+        if fire_on == 'Live': timing_ok = True
+        elif fire_on == '1m': timing_ok = fire_1m and after_arm_minute
+        elif fire_on == '5m': timing_ok = fire_5m and after_arm_minute
+        elif fire_on == '15m': timing_ok = fire_15m and after_arm_minute
+        elif fire_on == '60m': timing_ok = fire_60m and after_arm_minute
+        else: timing_ok = True
+
+        should_fire = False
+        # Only meaningful when should_fire is set via a Stop-Market branch below: True = the
+        # confirmed condition was a downside cross (idx_ltp <= trigger_price), False = upside
+        # cross (idx_ltp >= trigger_price). None for Market/Limit. Used by the "Enter via
+        # Stop" hand-off below to know which side of the closed candle to arm against.
+        is_downside_breakout = None
+        reason = f"{order_type} @ {trigger_price} ({fire_on})"
+        skip_reason = None
+
+        if idx_ltp <= 0:
+            skip_reason = "idx price is 0 (no tick yet)"
+        elif order_type == 'Market':
+            # Market orders fire immediately via the UI callback, not through this polling
+            # path. Kept here defensively in case armed is ever set for a Market order.
+            should_fire = True
+            reason = "Market (Immediate)"
+        elif not timing_ok:
+            skip_reason = f"waiting for {fire_on} candle close" if after_arm_minute else f"waiting for next {fire_on} candle close after arming"
+        elif not buy_mode:
+            # --- Sell Mode (existing, unchanged) ---
+            if order_type == 'Stop-Market':
+                # Breakout confirmation in the direction of the trade's original bias.
+                if side == 'Call' and idx_ltp <= trigger_price: should_fire = True; is_downside_breakout = True
+                elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True; is_downside_breakout = False
+            elif order_type == 'Limit':
+                # Wait for a better (opposite-direction) entry price.
+                if side == 'Call' and idx_ltp >= trigger_price: should_fire = True
+                elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True
+        else:
+            # --- Options Buy Mode: directions flipped. Call = buy CE on breakout above;
+            # Put = buy PE on breakdown below. ---
+            if order_type == 'Stop-Market':
+                if side == 'Call' and idx_ltp >= trigger_price: should_fire = True; is_downside_breakout = False
+                elif side == 'Put' and idx_ltp <= trigger_price: should_fire = True; is_downside_breakout = True
+            elif order_type == 'Limit':
+                if side == 'Call' and idx_ltp <= trigger_price: should_fire = True
+                elif side == 'Put' and idx_ltp >= trigger_price: should_fire = True
+
+        # Live diagnostic snapshot (overwritten every tick, never logged/appended -> zero log
+        # spam). Read by the Order Book UI so a stuck pending order is debuggable at a glance.
+        shared_state['unified_debug'][side] = {
+            'idx_ltp': idx_ltp, 'trigger_price': trigger_price, 'raw_trigger': raw_trigger,
+            'order_type': order_type, 'fire_on': fire_on, 'timing_ok': timing_ok,
+            'should_fire': should_fire, 'skip_reason': skip_reason,
+            'updated': datetime.now().strftime('%H:%M:%S'),
+        }
+
+        if skip_reason and not should_fire:
+            return
+
+        if should_fire:
+            # --- Enter via Stop: intercept Stop-Market entries confirmed on a candle-close
+            # timeframe (never Market/Limit, never 'Live'). Instead of opening now, hand off
+            # to the candle-stop engine, which arms a real Stop-Market trigger one tick beyond
+            # the just-closed candle's high/low (mirroring this condition's breakout
+            # direction) and opens the position only once price actually trades through it. ---
+            defer_via_stop = (
+                order_type == 'Stop-Market' and is_downside_breakout is not None and fire_on != 'Live'
+                and params.get('enter_via_stop', True) and self.stop_via_candle_engine is not None
+            )
+            if defer_via_stop:
+                self.stop_via_candle_engine.defer_entry(
+                    side=side, prefix=prefix, interval=fire_on, now=now,
+                    index_name=params['trading_index'], is_downside=is_downside_breakout,
+                    qty=qty, strike_offset=strike_offset,
+                    new_stop=params.get(f'{prefix}_new_stop', ''),
+                    new_target=params.get(f'{prefix}_new_target', ''),
+                    reason=reason,
+                )
+                params[f'{prefix}_armed'] = False
+                params[f'{prefix}_armed_at'] = None
+                shared_state['unified_debug'][side] = None
+                return
+
+            self.log_action(f"⚡ UNIFIED TRIGGER FIRED: {side} ({reason})")
+            success, msg = self.open_position(side, reason=reason, qty_override=qty, strike_offset=strike_offset)
+            if success:
+                params[f'{prefix}_armed'] = False
+                params[f'{prefix}_armed_at'] = None
+                shared_state['unified_debug'][side] = None
+                # Optional stop/target set at entry, applied via the existing PnL exit engine.
+                try:
+                    new_stop = float(params.get(f'{prefix}_new_stop', ''))
+                    if new_stop > 0:
+                        params[f'{prefix}_stop_val'] = new_stop
+                        params[f'{prefix}_stop_active'] = True
+                except (ValueError, TypeError): pass
+                try:
+                    new_target = float(params.get(f'{prefix}_new_target', ''))
+                    if new_target > 0:
+                        params[f'{prefix}_target_val'] = new_target
+                        params[f'{prefix}_target_active'] = True
+                except (ValueError, TypeError): pass
+            else:
+                self.log_action(f"⚠️ Unified Trigger Fired but Open Failed: {msg}")
+                params[f'{prefix}_armed'] = False
+                params[f'{prefix}_armed_at'] = None
+                shared_state['unified_debug'][side] = None
+                self.play_sound('error')
+
+    def _fire_or_defer_stop(self, kind, side, val, period, is_downside, reason, now=None):
+        """Shared by the Index Stop and Premium Stop branches of _check_exits ONLY -- never
+        the Target branches, which are untouched and always close immediately regardless of
+        enter_via_stop.
+
+        If Enter via Stop is on, the candle-stop engine is wired, AND this stop's period is
+        candle-close-based (1m/5m, not 'Current'), hands off to the deferred flow instead of
+        closing the position immediately: disables this stop's own active flag (one-shot
+        hand-off, exactly like a successful unified entry disarms itself) so it can't
+        re-trigger on a later boundary, and lets the candle-stop engine arm a real Stop-Market
+        trigger just beyond the closed candle's high/low. Falls through to the exact original
+        close_position(...) call otherwise -- zero behavior change whenever Enter via Stop is
+        off or the engine isn't wired."""
+        eligible = (
+            period != 'Current'
+            and params.get('enter_via_stop', True)
+            and self.stop_via_candle_engine is not None
+        )
+        if not eligible:
+            self.close_position(side, reason)
+            return
+
+        now = now or datetime.now()
+        if kind == 'index_stop':
+            self.stop_via_candle_engine.defer_index_stop(
+                side=side, interval=period, now=now, index_name=params['trading_index'],
+                is_downside=is_downside, reason=reason,
+            )
+            params[f'{side.lower()}_index_stop_active'] = False
+        elif kind == 'premium_stop':
+            trade = shared_state['active_trades'][side]
+            if trade is None:
+                # Defensive only -- callers already confirmed a trade exists before calling.
+                self.close_position(side, reason)
+                return
+            self.stop_via_candle_engine.defer_premium_stop(
+                side=side, interval=period, now=now,
+                trade_token=trade['main']['token'], trade_symbol=trade['main']['symbol'],
+                is_downside=is_downside, reason=reason,
+            )
+            params[f'{side.lower()}_prem_stop_active'] = False
+
+    def _check_exits(self, now, idx_ltp, fire_1m, fire_5m):
+        buy_mode = params.get('options_buy_mode', False)
+        for side in ['Call', 'Put']:
+            trade = shared_state['active_trades'][side]
+            if not trade: continue
+
+            # --- PNL EXITS ---
+            # (trade['pnl'] is already mode-aware via update_pnl(), so target/stop comparisons
+            # need no change here for either mode.)
+            try: tgt = float(params[f'{side.lower()}_target_val']) if str(params[f'{side.lower()}_target_val']).strip() != '' else 0.0
+            except ValueError: tgt = 0.0
+            try: stp = float(params[f'{side.lower()}_stop_val']) if str(params[f'{side.lower()}_stop_val']).strip() != '' else 0.0
+            except ValueError: stp = 0.0
+
+            if params[f'{side.lower()}_target_active'] and tgt > 0 and trade['pnl'] >= tgt:
+                self.close_position(side, f"Auto Profit {tgt}")
+                self._cancel_opposite_pending(side, f"PnL Target {tgt}")
+            if params[f'{side.lower()}_stop_active'] and stp > 0 and trade['pnl'] <= -stp:
+                self.close_position(side, f"Auto Loss {stp}")
+
+            # Re-check if position still open after PnL exits
+            trade = shared_state['active_trades'][side]
+            if not trade: continue
+
+            # --- INDEX EXITS ---
+            # idx_ltp (param) is already the Futures-Mode-aware evaluation price, passed down
+            # from check_triggers() via get_eval_price().
+            try: s_val = float(params[f'{side.lower()}_index_stop_val']) if str(params[f'{side.lower()}_index_stop_val']).strip() != '' else 0.0
+            except ValueError: s_val = 0.0
+            try: t_val = float(params[f'{side.lower()}_index_target_val']) if str(params[f'{side.lower()}_index_target_val']).strip() != '' else 0.0
+            except ValueError: t_val = 0.0
+
+            st_key = f'{side.lower()}_index_stop_time'; check_stop = (params[st_key] == 'Current') or (params[st_key] == '1m' and fire_1m) or (params[st_key] == '5m' and fire_5m)
+            tt_key = f'{side.lower()}_index_target_time'; check_tgt = (params[tt_key] == 'Current') or (params[tt_key] == '1m' and fire_1m) or (params[tt_key] == '5m' and fire_5m)
+            s_active = params[f'{side.lower()}_index_stop_active']; t_active = params[f'{side.lower()}_index_tgt_active']
+
+            if not buy_mode:
+                # --- Sell Mode (existing, unchanged) ---
+                if side == 'Call':
+                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=False, reason=f"Idx Stop {s_val}", now=now)
+                    if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+                else:
+                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=True, reason=f"Idx Stop {s_val}", now=now)
+                    if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+            else:
+                # --- Options Buy Mode: directions flipped (Call profits as idx rises,
+                # Put profits as idx falls). ---
+                if side == 'Call':
+                    if check_stop and s_active and s_val > 0 and idx_ltp <= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=True, reason=f"Idx Stop {s_val}", now=now)
+                    if check_tgt and t_active and t_val > 0 and idx_ltp >= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+                else:
+                    if check_stop and s_active and s_val > 0 and idx_ltp >= s_val:
+                        self._fire_or_defer_stop('index_stop', side, s_val, params[st_key], is_downside=False, reason=f"Idx Stop {s_val}", now=now)
+                    if check_tgt and t_active and t_val > 0 and idx_ltp <= t_val:
+                        self.close_position(side, f"Idx Target {t_val}")
+                        self._cancel_opposite_pending(side, f"Idx Target {t_val}")
+
+            # Re-check if position still open after index exits
+            trade = shared_state['active_trades'][side]
+            if not trade: continue
+
+            # --- PREMIUM EXITS ---
+            main_ltp = shared_state['option_chain'].get(trade['main']['token'], {}).get('ltp', 0)
+            if main_ltp <= 0: continue
+
+            ps_key = f'{side.lower()}_prem_stop_time'
+            pt_key = f'{side.lower()}_prem_target_time'
+            check_ps = (params[ps_key] == 'Current') or (params[ps_key] == '1m' and fire_1m) or (params[ps_key] == '5m' and fire_5m)
+            check_pt = (params[pt_key] == 'Current') or (params[pt_key] == '1m' and fire_1m) or (params[pt_key] == '5m' and fire_5m)
+
+            try: ps_val = float(params[f'{side.lower()}_prem_stop_val']) if str(params[f'{side.lower()}_prem_stop_val']).strip() != '' else 0.0
+            except ValueError: ps_val = 0.0
+            try: pt_val = float(params[f'{side.lower()}_prem_target_val']) if str(params[f'{side.lower()}_prem_target_val']).strip() != '' else 0.0
+            except ValueError: pt_val = 0.0
+
+            is_buy = trade.get('direction', 'SELL') == 'BUY'
+            if not is_buy:
+                # --- Sell Mode (existing, unchanged) ---
+                # Stop: premium rises above stop value (loss on short)
+                if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp >= ps_val:
+                    self._fire_or_defer_stop('premium_stop', side, ps_val, params[ps_key], is_downside=False, reason=f"Prem Stop {ps_val}", now=now)
+
+                trade = shared_state['active_trades'][side]
+                if not trade: continue
+
+                # Target: premium falls below target value (profit on short)
+                if check_pt and params[f'{side.lower()}_prem_tgt_active'] and pt_val > 0 and main_ltp <= pt_val:
+                    self.close_position(side, f"Prem Target {pt_val}")
+                    self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
+            else:
+                # --- Options Buy Mode: comparisons flipped ---
+                # Stop: premium falls below stop value (loss on long)
+                if check_ps and params[f'{side.lower()}_prem_stop_active'] and ps_val > 0 and main_ltp <= ps_val:
+                    self._fire_or_defer_stop('premium_stop', side, ps_val, params[ps_key], is_downside=True, reason=f"Prem Stop {ps_val}", now=now)
+
+                trade = shared_state['active_trades'][side]
+                if not trade: continue
+
+                # Target: premium rises above target value (profit on long)
+                if check_pt and params[f'{side.lower()}_prem_tgt_active'] and pt_val > 0 and main_ltp >= pt_val:
+                    self.close_position(side, f"Prem Target {pt_val}")
+                    self._cancel_opposite_pending(side, f"Prem Target {pt_val}")
+
+    def _log_limit_fire(self, label, threshold_value, total_at_fire, closed_trades):
+        """Shared diagnostic logging for when a Global Stop/Target/PnL Floor limit actually
+        fires. Logs three things, so a limit firing earlier or later than expected can be
+        confirmed after the fact purely from the Trade Event Log, without needing to inspect
+        params/shared_state directly (as previously required to diagnose a Global Stop
+        firing at a total PnL that didn't match its configured threshold):
+          1. The exact threshold value that was configured/armed at the moment this fired.
+          2. The exact combined realized+unrealized total PnL at the moment it fired.
+          3. A per-trade PnL breakdown of every position closed THIS TICK (from
+             self._closed_this_tick, passed in by the caller) -- NOT just what
+             close_all_positions() itself closed as part of THIS specific call. If a
+             different exit (e.g. an Index Stop) already closed a position earlier in the
+             same tick, before this limit's own check ran, that trade's PnL is what
+             actually contributed to total_at_fire -- so it now appears in this same
+             breakdown line instead of only as a separate CLOSED log entry above that has
+             to be manually cross-referenced to explain the total."""
+        self.log_action(
+            f"🎯 {label} FIRED: threshold=₹{threshold_value:.0f} | total PnL at fire=₹{total_at_fire:.0f}"
+        )
+        if closed_trades:
+            breakdown = ', '.join(f"{t['side']} {t['symbol']}: ₹{t['pnl']:.0f}" for t in closed_trades)
+            self.log_action(f"📋 {label}: trades closed this event -> {breakdown}")
+        else:
+            self.log_action(f"📋 {label}: no open positions to close at fire time")
+
+    def _check_global_limits(self):
+        """Manual 'Global Stop Loss' / 'Global Target' cards (params['global_stop_value']/
+        'global_target_value', combined realized+unrealized PnL across BOTH sides).
+
+        total is computed via _live_total_pnl() -- summed fresh from currently-open trades,
+        NOT from the cached shared_state['pnl']['unrealized'] snapshot -- so this always
+        reflects reality at the instant it's checked, even if a trade opened and/or closed
+        earlier in this same tick (see _live_total_pnl()'s docstring for the incident this
+        fixes: a stale cached unrealized figure double-counting a trade that had already
+        closed and landed in 'realized'). check_triggers() ALSO now calls update_pnl()
+        immediately before this method runs, so the cached 'unrealized' figure itself
+        (read by the UI and by AutoController.run_loop's own SECOND_LEG check) is fresh
+        too by this point -- _live_total_pnl() and the cache should therefore always agree
+        with each other now; _live_total_pnl() is used here regardless as the more
+        directly-verifiable source of truth for this specific decision.
+
+        On hit:
+          - Every per-side field on BOTH Call and Put -- PnL/Index/Premium stop-target
+            values+active-flags, and any pending Unified Entry order (armed/trigger_price/
+            armed_at/new_stop/new_target) -- is wiped via clear_leg_fields_callback, wired in
+            from auto_run.AutoController.clear_leg_fields. This matches what Auto Pilot's own
+            internal global stop already does in AutoController.run_loop() (SECOND_LEG block).
+          - Both sides deliberately, not just whichever side had a position open: an armed
+            entry order on the OTHER side (no position yet) is just as much a 'still open
+            order' that needs cancelling as an active exit order on the side that just closed.
+          - Any pending/armed Enter via Stop job (stop_via_candle_engine.py) is also cancelled
+            outright via cancel_all(), rather than left to expire on its own later.
+          - The exact threshold value, the exact total PnL at fire time, and a per-trade PnL
+            breakdown of EVERY position closed this tick (self._closed_this_tick, not just
+            what close_all_positions() itself closed here) are logged via _log_limit_fire, so
+            a limit firing at an unexpected PnL level can be diagnosed later purely from the
+            Trade Event Log -- even when another exit closed a position moments earlier in
+            the same tick and that closure's PnL is what actually drove the total past the
+            threshold.
+          - ONLY this limit's OWN active flag is switched off (one-shot, so it doesn't
+            immediately refire against the same still-low/still-high PnL on the very next
+            tick). Trading is deliberately NOT globally halted (self.trading_active stays
+            True) -- new positions can be opened immediately afterward via Auto Pilot,
+            manual entry, or unified entries, same as any other moment. This also means the
+            ticker/market data connection is completely untouched here; it was never stopped
+            by this flag to begin with (self.trading_active only ever gated
+            open_position()). Each of Global Stop, Global Target, and the Global PnL Floor
+            below remain fully independent -- firing one never disables another, and each
+            can be re-armed by the person at any time to protect the next round of trades.
+        """
+        total = self._live_total_pnl()
+
+        try: stop = float(params['global_stop_value']) if str(params['global_stop_value']).strip() != '' else 0.0
+        except ValueError: stop = 0.0
+        try: target = float(params['global_target_value']) if str(params['global_target_value']).strip() != '' else 0.0
+        except ValueError: target = 0.0
+
+        # save_pnl=False on both: positions are still closed immediately here (that's a real
+        # trading action, not deferred), but the daily PnL CSV write is intentionally NOT done
+        # here. It's written exactly once per day, at the EOD_TIME routine in
+        # AutoController.run_loop() (auto_run.py), which will correctly include whatever PnL
+        # this event locked in, since close_position() already appended it to
+        # shared_state['pnl']['trades_history'].
+        if params['global_stop_active'] and stop > 0 and total <= -stop:
+            self.close_all_positions("Global Stop", save_pnl=False)
+            self._clear_all_fields_and_orders("Global Stop")
+            params['global_stop_active'] = False
+            self.play_sound('error')
+            self._log_limit_fire("Global Stop", stop, total, self._closed_this_tick)
+        if params['global_tgt_active'] and target > 0 and total >= target:
+            self.close_all_positions("Global Target", save_pnl=False)
+            self._clear_all_fields_and_orders("Global Target")
+            params['global_tgt_active'] = False
+            self.play_sound('error')
+            self._log_limit_fire("Global Target", target, total, self._closed_this_tick)
+
+    def _check_global_pnl_floor(self):
+        """Global PnL Floor (params['global_trailing_active']/'global_trailing_value' --
+        internal param names kept as global_trailing_* to minimize code churn, though this
+        is NOT a trailing/drawdown-from-peak stop): a THIRD, fully independent limit type
+        alongside the absolute Global Stop/Target above -- does not touch or interact with
+        params['global_stop_value']/'global_target_value'/'global_stop_active'/
+        'global_tgt_active' in any way.
+
+        total is computed via _live_total_pnl() -- see _check_global_limits() above and
+        _live_total_pnl()'s own docstring for why this reads fresh state rather than the
+        cached shared_state['pnl']['unrealized'] snapshot.
+
+        This is a plain ABSOLUTE PnL level (typically a positive number, meant to lock in a
+        minimum acceptable profit -- the negative/loss side is already covered by Global Stop
+        Loss above): fires the moment combined realized+unrealized PnL drops to OR BELOW this
+        exact configured value, with NO peak-tracking of any kind. E.g. set to 100 -> fires
+        the instant total PnL <= 100, regardless of what PnL was earlier in the session (it
+        could have been 8000 an hour ago, or never above 100 at all -- doesn't matter, only
+        the CURRENT total relative to the configured floor matters).
+
+        (An earlier version of this method tracked shared_state['pnl']['peak_total'] and
+        fired on a drawdown-from-peak basis instead. That caused the floor to fire
+        IMMEDIATELY whenever it was armed after PnL had already pulled back from an earlier
+        high in the session -- e.g. arming a 100 drawdown when PnL had already fallen from a
+        4254 peak to 3461 fired instantly, since 3461 was already >100 below 4254. That
+        peak-tracking behavior did not match the intended use of this control and has been
+        removed entirely; peak_total is no longer read or written by this method.)
+
+        On hit: reuses the EXACT SAME close-out sequence as _check_global_limits above
+        (close_all_positions(save_pnl=False), _clear_all_fields_and_orders, error sound,
+        _log_limit_fire diagnostic logging with self._closed_this_tick -- see
+        _check_global_limits's docstring for why this whole-tick list is used instead of
+        just what close_all_positions() itself closed here), and -- matching
+        _check_global_limits -- only this control's OWN active flag is switched off on fire
+        (one-shot); trading is not globally halted and every other limit remains
+        independently armed/re-armable."""
+        if not params.get('global_trailing_active', False):
+            return
+
+        total = self._live_total_pnl()
+
+        try: floor_value = float(params['global_trailing_value']) if str(params['global_trailing_value']).strip() != '' else 0.0
+        except ValueError: floor_value = 0.0
+
+        if floor_value > 0 and total <= floor_value:
+            self.close_all_positions("Global PnL Floor", save_pnl=False)
+            self._clear_all_fields_and_orders("Global PnL Floor")
+            params['global_trailing_active'] = False
+            self.play_sound('error')
+            self._log_limit_fire("Global PnL Floor", floor_value, total, self._closed_this_tick)
+
+    def _clear_all_fields_and_orders(self, reason):
+        """Wipes every per-side field on BOTH Call and Put (via clear_leg_fields_callback, if
+        wired) and cancels any pending/armed Enter via Stop job (via
+        stop_via_candle_engine.cancel_all(), if wired). Shared by both branches of
+        _check_global_limits() above (and by _check_global_pnl_floor()). Both callbacks
+        are no-ops if never wired (e.g. a future caller that constructs LogicEngine
+        standalone), so this is always safe to call."""
+        if self.clear_leg_fields_callback:
+            self.clear_leg_fields_callback('Call')
+            self.clear_leg_fields_callback('Put')
+            self.log_action(f"🧹 {reason}: cleared all fields & cancelled all open orders (both sides)")
+        if self.stop_via_candle_engine is not None:
+            self.stop_via_candle_engine.cancel_all(reason)
+
+    def _check_alerts(self, idx_prices, fire_1m, fire_5m):
+        """Multi-alert system: shared_state['alerts'] holds any number of independent price
+        alerts (multiple allowed in the same direction). Each is evaluated against its own
+        'period' (Current/1m/5m) and 'direction' (upper: fires when the index's LTP >= value;
+        lower: fires when it's <= value). A fired alert is removed from the list (one-shot,
+        same semantics as the old single-slot alert_upper_active/alert_lower_active flags).
+
+        idx_prices is a dict {index_name: eval_price}, one entry per index in config.INDICES
+        (both NIFTY and SENSEX), computed once in check_triggers() via get_eval_price() for
+        each -- Futures-Mode-aware per index. Every alert is index-tagged at creation time
+        (see ui_components._add_alert_card's 'index' field), and is evaluated ONLY against
+        idx_prices[alert['index']] -- NEVER against whichever index happens to be the
+        currently selected params['trading_index']. This is what stops an alert set while on
+        NIFTY from silently firing against SENSEX's price (or vice versa) the moment the
+        trading index is switched in the UI: each alert's price source is fixed for its
+        lifetime to the index it was created under, not to the live selection. Alerts created
+        before this field existed have no 'index' key; those default to 'NIFTY' defensively
+        (rather than crashing) via alert.get('index', 'NIFTY') -- a one-day edge case at
+        most, since alerts are cleared every EOD (see auto_run.AutoController.run_loop()).
+
+        NOTE: message text intentionally avoids the word "alert" (case-insensitive). The
+        global ui.notify interceptor in auto_run.py auto-queues its own generic fallback
+        sound (fixed sound, no duration limit) whenever a notification's text contains
+        "alert", which was silently overriding/mixing with the user's chosen sound+duration
+        from play_alert_sound() below. "Price Hit" conveys the same info without colliding.
+
+        Iterates a shallow copy of the list since firing mutates (removes from) the original;
+        modifying a list while iterating it directly would skip entries / raise."""
+        alerts = shared_state.get('alerts', [])
+        if not alerts: return
+
+        fired_ids = []
+        for alert in list(alerts):
+            try: value = float(alert.get('value', 0))
+            except (ValueError, TypeError): continue
+            if value <= 0: continue
+
+            alert_index = alert.get('index', 'NIFTY')
+            idx_ltp = idx_prices.get(alert_index, 0)
+            if idx_ltp <= 0: continue
+
+            period = alert.get('period', 'Current')
+            check_now = (period == 'Current') or (period == '1m' and fire_1m) or (period == '5m' and fire_5m)
+            if not check_now: continue
+
+            direction = alert.get('direction')
+            should_fire = False
+            if direction == 'upper' and idx_ltp >= value: should_fire = True
+            elif direction == 'lower' and idx_ltp <= value: should_fire = True
+            if not should_fire: continue
+
+            cmp_sym = '>' if direction == 'upper' else '<'
+            label = 'Upper' if direction == 'upper' else 'Lower'
+            ui.notify(f"Price Hit ({alert_index}): {idx_ltp} {cmp_sym} {value}", type='warning', close_button=True)
+            self.log_action(f"🔔 Price Hit ({alert_index}, {label}, {period}): {idx_ltp} vs {value}")
+            self.play_alert_sound(alert.get('sound', 'Wood Plank'), alert.get('duration', 5))
+            fired_ids.append(alert.get('id'))
+
+        if fired_ids:
+            shared_state['alerts'] = [a for a in shared_state['alerts'] if a.get('id') not in fired_ids]
