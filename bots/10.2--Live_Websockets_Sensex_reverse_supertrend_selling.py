@@ -33,9 +33,9 @@ IST = ZoneInfo('Asia/Kolkata')
 # ─────────────────────────────────────────────────────────────────────────────
 SYMBOL                          = 'SENSEX'       # 'SENSEX' or 'NIFTY 50'
 CANDLE_FETCH_BUFFER_SECONDS     = 5              # Buffer seconds after bar close before fetch
-MONITORING_INTERVAL_SECONDS     = 60              # Round interval cadence for safety checks
+MONITORING_INTERVAL_SECONDS     = 1              # Round interval cadence for safety checks
 TOKEN_SWAP_TIME                 = "09:00"        # Supervisor wake-up time
-RESULTS_FOLDER                  = 'Sensex_reverse_supertrend_selling_websockts_results'
+RESULTS_FOLDER                  = 'Sensex_reverse_supertrend_selling_websockets_results'
 GD_PATH                         = '/app/data/'
 CONFIG_PATH                     = '/app/config/'
 
