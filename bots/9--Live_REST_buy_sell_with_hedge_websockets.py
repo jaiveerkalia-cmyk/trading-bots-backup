@@ -2,6 +2,7 @@ import sys
 import subprocess
 import time
 import math
+import csv
 import pandas as pd
 from datetime import datetime
 import pytz
@@ -133,6 +134,11 @@ DEFAULT_CONFIGURATION = DAY_CONFIGURATION[0]
 # ==============================================================================
 
 IST = pytz.timezone('Asia/Kolkata')
+
+
+def append_csv_row(csv_path, row):
+    with open(csv_path, 'a', newline='') as f:
+        csv.writer(f).writerow(row)
 
 
 def get_current_day_config():
@@ -449,19 +455,13 @@ def get_latest_atr_ema(kite, spot_symbol, current_dt, atr_ema_window=20, lookbac
         eligible_rows = df_m[(df_m['date'] < current_date) & df_m['atr_ema'].notna()]
         if eligible_rows.empty:
             print(f"ATR fetch failed: no completed ATR EMA value available for {spot_symbol}", flush=True)
-            return None, df_m
-
-        display_cols = ['date', 'open', 'high', 'low', 'close', 'atr', 'atr_ema']
-        print("ATR EMA last 5 rows:", flush=True)
-        print(df_m[display_cols].tail(5).to_string(index=False), flush=True)
+            return None, None
 
         selected_row = eligible_rows.iloc[-1]
-        print("ATR EMA row used for latest ATR:", flush=True)
-        print(selected_row[display_cols].to_frame().T.to_string(index=False), flush=True)
         print(f"Using ATR candle: {selected_row['date']}", flush=True)
 
         latest_atr = float(selected_row['atr_ema'])
-        return latest_atr, df_m
+        return latest_atr, None
 
     except Exception as e:
         print(f"ATR fetch failed for {spot_symbol}: {e}", flush=True)
@@ -498,21 +498,16 @@ def get_vix_stop_per_lot(kite, current_dt, lookback_days=400):
         eligible_rows = df_vix[df_vix['date'] < current_date].copy()
         if len(eligible_rows) < 252:
             print(f"VIX fetch failed: need at least 252 prior daily candles, found {len(eligible_rows)}", flush=True)
-            return None, df_vix
+            return None, None
 
         trailing_window = eligible_rows['close'].astype(float).tail(252)
         vix_rank_pct = trailing_window.rank(pct=True).iloc[-1]
         stop_per_lot = 4000 if vix_rank_pct > 0.5 else 3000
 
-        display_cols = ['date', 'open', 'high', 'low', 'close']
-        print("VIX last 5 prior-day eligible rows:", flush=True)
-        print(eligible_rows[display_cols].tail(5).to_string(index=False), flush=True)
         selected_row = eligible_rows.iloc[-1]
-        print("VIX row used for stop decision:", flush=True)
-        print(selected_row[display_cols].to_frame().T.to_string(index=False), flush=True)
         print(f"Using VIX candle: {selected_row['date']} | Rank pct over trailing 252: {vix_rank_pct:.4f} | Stop/Lot: {stop_per_lot}", flush=True)
 
-        return stop_per_lot, df_vix
+        return stop_per_lot, None
 
     except Exception as e:
         print(f"VIX stop fetch failed for {VIX_SYMBOL}: {e}", flush=True)
@@ -591,11 +586,6 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
         last_candle = prev_day_with_atr.iloc[-1]
         atr_value = float(last_candle['atr'])
 
-        display_cols = ['date', 'open', 'high', 'low', 'close', 'atr']
-        print(f"[INDEX_ENTRY_ATR] Last 5 candles of previous trading day ({last_trading_date}) with ATR:", flush=True)
-        print(prev_day_with_atr[display_cols].tail(5).to_string(index=False), flush=True)
-        print(f"[INDEX_ENTRY_ATR] Selected candle (last of previous day):", flush=True)
-        print(last_candle[display_cols].to_frame().T.to_string(index=False), flush=True)
         print(f"[INDEX_ENTRY_ATR] ATR({INDEX_ENTRY_ATR_PERIOD}) value from previous day last candle: {atr_value:.4f}", flush=True)
 
         return atr_value
@@ -780,7 +770,9 @@ def run_trading_process():
                 return
 
             current_expiry = nifty_options['expiry'].unique()[0] 
-            nifty_options = nifty_options[nifty_options['expiry'] == current_expiry]
+            nifty_options = nifty_options[nifty_options['expiry'] == current_expiry].copy()
+            del instruments_list
+            del instruments_df
             is_expiry_day = (datetime.now().date() == pd.to_datetime(current_expiry).date())
             print(f"[{get_now_str()}] Expiry Date: {current_expiry} (Is Today Expiry? {is_expiry_day})", flush=True)
             
@@ -996,8 +988,6 @@ def run_trading_process():
         # ----------------------------------------------------------------------
         # 7. TRADING LOOP
         # ----------------------------------------------------------------------
-        tradebook_df = pd.read_csv(TRADEBOOK_CSV_PATH)
-        
         flag_sell_put, flag_sell_call = 0, 0
         flag_buy_put, flag_buy_call = 0, 0
         
@@ -1057,7 +1047,7 @@ def run_trading_process():
                 print(f"    HEDGE | Entry: {entry_price_hedge_put} | Exit: {exec_hedge}", flush=True)
             print(f"    STATS | Net PnL: {total_leg_pnl:.2f} (Comm: {comm_main+comm_hedge:.2f})", flush=True)
             
-            tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, exec_price, total_leg_pnl, final_realized_pnl, f'Close - Put_Side_{reason}']
+            append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, exec_price, total_leg_pnl, final_realized_pnl, f'Close - Put_Side_{reason}'])
             flag_sell_put = 2 
             
             # --- TOTAL PROFIT CHANGE LOGIC ---
@@ -1105,7 +1095,7 @@ def run_trading_process():
                 print(f"    HEDGE | Entry: {entry_price_hedge_call} | Exit: {exec_hedge}", flush=True)
             print(f"    STATS | Net PnL: {total_leg_pnl:.2f} (Comm: {comm_main+comm_hedge:.2f})", flush=True)
 
-            tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, exec_price, total_leg_pnl, final_realized_pnl, f'Close - Call_Side_{reason}']
+            append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, exec_price, total_leg_pnl, final_realized_pnl, f'Close - Call_Side_{reason}'])
             flag_sell_call = 2
 
             # --- TOTAL PROFIT CHANGE LOGIC ---
@@ -1128,7 +1118,7 @@ def run_trading_process():
                 final_realized_main_pnl += net 
                 
                 print(f"[{get_now_str()}] CLOSED BUY PUT | Entry: {entry_price_put_bought} | Exit: {exec_price} | PnL: {net:.2f}", flush=True)
-                tradebook_df.loc[len(tradebook_df)] = [get_now_str(), buy_strike_pe, 'PE', initial_bp_price, entry_price_put_bought, exec_price, net, final_realized_pnl, f'Close - Put_Bought_{reason}']
+                append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), buy_strike_pe, 'PE', initial_bp_price, entry_price_put_bought, exec_price, net, final_realized_pnl, f'Close - Put_Bought_{reason}'])
                 flag_buy_put = 2
 
             if flag_buy_call == 1:
@@ -1143,7 +1133,7 @@ def run_trading_process():
                 final_realized_main_pnl += net
                 
                 print(f"[{get_now_str()}] CLOSED BUY CALL | Entry: {entry_price_call_bought} | Exit: {exec_price} | PnL: {net:.2f}", flush=True)
-                tradebook_df.loc[len(tradebook_df)] = [get_now_str(), buy_strike_ce, 'CE', initial_bc_price, entry_price_call_bought, exec_price, net, final_realized_pnl, f'Close - Call_Bought_{reason}']
+                append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), buy_strike_ce, 'CE', initial_bc_price, entry_price_call_bought, exec_price, net, final_realized_pnl, f'Close - Call_Bought_{reason}'])
                 flag_buy_call = 2
 
         def close_all_positions(reason):
@@ -1212,7 +1202,7 @@ def run_trading_process():
                     stop_put = entry_price_put_sold * (1 + stop_percent * 0.01)
                     print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] PUT stop recomputed from fill price | Fill: {entry_price_put_sold} | Stop: {stop_put:.2f} ({stop_percent}%)", flush=True)
                 print(f"[{get_now_str()}] OPENED PUT SIDE | Main: {entry_price_put_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_put} | Stop: {stop_put:.2f}", flush=True)
-                tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, 0, 0, final_realized_pnl, 'Open - Put_Sold']
+                append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), entry_put_strike, 'PE', initial_ep_price, entry_price_put_sold, 0, 0, final_realized_pnl, 'Open - Put_Sold'])
                 
             if call_entry_condition and flag_sell_call == 0:
                 if INDEX_BASED_ENTRY:
@@ -1233,7 +1223,7 @@ def run_trading_process():
                     stop_call = entry_price_call_sold * (1 + stop_percent * 0.01)
                     print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] CALL stop recomputed from fill price | Fill: {entry_price_call_sold} | Stop: {stop_call:.2f} ({stop_percent}%)", flush=True)
                 print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_call} | Stop: {stop_call:.2f}", flush=True)
-                tradebook_df.loc[len(tradebook_df)] = [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, 0, 0, final_realized_pnl, 'Open - Call_Sold']
+                append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, 0, 0, final_realized_pnl, 'Open - Call_Sold'])
 
             # --- BUYS (unchanged — always option-price based) ---
             if use_buy_legs:
@@ -1243,7 +1233,7 @@ def run_trading_process():
                     entry_price_put_bought = get_quote_price(kite, sym_buy_pe, 'BUY', exchange=OPT_EXCHANGE)
                     flag_buy_put = 1
                     print(f"[{get_now_str()}] OPENED BUY PUT | Entry: {entry_price_put_bought}", flush=True)
-                    tradebook_df.loc[len(tradebook_df)] = [get_now_str(), buy_strike_pe, 'PE', initial_bp_price, entry_price_put_bought, 0, 0, final_realized_pnl, 'Open - Put_Bought']
+                    append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), buy_strike_pe, 'PE', initial_bp_price, entry_price_put_bought, 0, 0, final_realized_pnl, 'Open - Put_Bought'])
                 
                 if flag_buy_call == 0 and ltp_buy_call >= (2 * initial_bc_price):
                     print(f"\n[{get_now_str()}] >>> ENTRY BUY CALL | LTP: {ltp_buy_call} >= Trigger: {2 * initial_bc_price:.2f}", flush=True)
@@ -1251,7 +1241,7 @@ def run_trading_process():
                     entry_price_call_bought = get_quote_price(kite, sym_buy_ce, 'BUY', exchange=OPT_EXCHANGE)
                     flag_buy_call = 1
                     print(f"[{get_now_str()}] OPENED BUY CALL | Entry: {entry_price_call_bought}", flush=True)
-                    tradebook_df.loc[len(tradebook_df)] = [get_now_str(), buy_strike_ce, 'CE', initial_bc_price, entry_price_call_bought, 0, 0, final_realized_pnl, 'Open - Call_Bought']
+                    append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), buy_strike_ce, 'CE', initial_bc_price, entry_price_call_bought, 0, 0, final_realized_pnl, 'Open - Call_Bought'])
 
             # --- PNL CALCULATION ---
             pnl_sp = (QUANTITY * (entry_price_put_sold - ltp_put)) if flag_sell_put == 1 else 0
@@ -1391,7 +1381,6 @@ def run_trading_process():
         print(f"FINAL DAY PNL: {final_realized_pnl:.2f}", flush=True)
         print(f"{'='*30}\n", flush=True)
         
-        tradebook_df.to_csv(TRADEBOOK_CSV_PATH, index=False)
         print("Tradebook Saved to CSV.", flush=True)
         
         final_pnl_df = pd.read_csv(DAILY_PNL_CSV_PATH)
