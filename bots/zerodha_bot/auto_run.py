@@ -1,3 +1,63 @@
+# --- LEAN MANAGER (default OFF; enable with env ZB_LEAN_MANAGER=1) -------------------------------
+# The manager process (plain `python auto_run.py`) only supervises the --worker child, yet the heavy
+# imports below (nicegui, ui_components, engines, ...) would load fully into it as well, leaving two
+# complete copies of the app in RAM. With ZB_LEAN_MANAGER=1 the same supervisor loop runs HERE, with
+# the standard library only, before any heavy import. The original MANAGER MODE block at the bottom of
+# this file stays untouched and is simply never reached in this mode. Worker behaviour is unchanged.
+import sys as _zb_sys, os as _zb_os
+if __name__ == "__main__" and "--worker" not in _zb_sys.argv and _zb_os.environ.get("ZB_LEAN_MANAGER") == "1":
+    import subprocess as _zb_sp, time as _zb_time
+    from datetime import datetime as _zb_dt, timedelta as _zb_td
+    print(f"[{_zb_dt.now().strftime('%Y-%m-%d %H:%M:%S')}] --- MANAGER STARTED (lean) ---")
+    if _zb_os.path.exists(".automode_state"): _zb_os.remove(".automode_state")
+    _zb_p = None
+    while True:
+        try:
+            _zb_p = _zb_sp.Popen([_zb_sys.executable, __file__, "--worker"])
+            _zb_p.wait()
+            _zb_next_on = False
+            if _zb_os.path.exists(".automode_state"):
+                with open(".automode_state", "r") as _zb_f:
+                    if _zb_f.read().strip() == 'ON': _zb_next_on = True
+            if _zb_next_on:
+                with open(".automode_state", "w") as _zb_f: _zb_f.write("ON")
+            _zb_now = _zb_dt.now()
+            _zb_ts = _zb_now.strftime('%Y-%m-%d %H:%M:%S')
+            if (_zb_now.weekday() == 4 and _zb_now.hour >= 22) or _zb_now.weekday() in [5, 6]:
+                print(f"[{_zb_ts}] 📅 WEEKEND DETECTED. Sleeping until Monday...")
+                _zb_days = 7 - _zb_now.weekday()
+                if _zb_now.weekday() == 4: _zb_days = 3
+                if _zb_now.weekday() == 6: _zb_days = 1
+                _zb_target = _zb_now.replace(hour=8, minute=55, second=0, microsecond=0) + _zb_td(days=_zb_days)
+                _zb_time.sleep(max(1, (_zb_target - _zb_now).total_seconds()))
+            elif _zb_now.hour >= 22 or _zb_now.hour < 8:
+                print(f"[{_zb_ts}] 💤 NIGHT MODE: Sleeping until Morning...")
+                _zb_target = _zb_now.replace(hour=8, minute=55, second=0, microsecond=0)
+                if _zb_now.hour >= 22: _zb_target += _zb_td(days=1)
+                _zb_time.sleep(max(1, (_zb_target - _zb_now).total_seconds()))
+            else:
+                print(f"[{_zb_ts}] ⚠️ WORKER RESTARTING IN 2s...")
+                _zb_time.sleep(2)
+        except KeyboardInterrupt:
+            print("\n--- MANAGER STOPPING ---")
+            if _zb_p is not None: _zb_p.terminate()
+            break
+    _zb_sys.exit(0)
+
+# --- ZB_NO_KITE_TICKER (default OFF; enable with env ZB_NO_KITE_TICKER=1) -------------------------
+# `import kiteconnect` eagerly imports kiteconnect.ticker (KiteTicker), which pulls in twisted,
+# autobahn and OpenSSL (~15-25 MB RSS). This bot reads ticks from Redis (RedisTickClient) and never
+# uses KiteTicker, so a stub module is pre-seeded and the real one is never imported. Instantiating
+# the stub raises a clear error, so any unexpected use fails loudly instead of misbehaving silently.
+if _zb_os.environ.get("ZB_NO_KITE_TICKER") == "1" and "kiteconnect" not in _zb_sys.modules:
+    import types as _zb_types
+    _zb_stub = _zb_types.ModuleType("kiteconnect.ticker")
+    class _ZbKiteTickerDisabled:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("KiteTicker is disabled (ZB_NO_KITE_TICKER=1); ticks come from Redis")
+    _zb_stub.KiteTicker = _ZbKiteTickerDisabled
+    _zb_sys.modules["kiteconnect.ticker"] = _zb_stub
+
 import sys
 import time
 import csv

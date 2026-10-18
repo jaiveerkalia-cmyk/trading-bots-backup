@@ -2,7 +2,9 @@ from config import shared_state, params, INDICES, TRADEBOOK_FILE, DAILY_PNL_FILE
 from csv_manager import CsvManager
 from datetime import datetime, time as dtime, timedelta
 from nicegui import ui
-import pandas as pd
+import os as _zb_os
+if _zb_os.environ.get('ZB_NO_PANDAS') != '1':
+    import pandas as pd  # unused in this file; skipped under ZB_NO_PANDAS=1 so pandas never loads
 import os
 import uuid
 import time

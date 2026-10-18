@@ -33,7 +33,7 @@ IST = ZoneInfo('Asia/Kolkata')
 # ─────────────────────────────────────────────────────────────────────────────
 SYMBOL                          = 'SENSEX'       # 'SENSEX' or 'NIFTY 50'
 CANDLE_FETCH_BUFFER_SECONDS     = 5              # Buffer seconds after bar close before fetch
-MONITORING_INTERVAL_SECONDS     = 1              # Round interval cadence for safety checks
+MONITORING_INTERVAL_SECONDS     = 1             # Round interval cadence for safety checks
 TOKEN_SWAP_TIME                 = "09:00"        # Supervisor wake-up time
 RESULTS_FOLDER                  = 'Sensex_reverse_supertrend_selling_websockets_results'
 GD_PATH                         = '/app/data/'
@@ -69,23 +69,23 @@ DAY_CONFIG = {
     0: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
         'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
     1: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
         'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
     2: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
         'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
     3: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
         'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
     4: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
         'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
 }
 
 def get_day_config():
@@ -468,6 +468,7 @@ def run_trading_worker():
     atr_stop_multiplier = cfg['atr_stop_multiplier']
     atr_tp_multiplier   = cfg['atr_tp_multiplier']
     max_positions       = cfg['max_positions_per_day']
+    entry_on_open       = cfg.get('entry_on_open', 0)
     cutoff_time         = datetime.strptime(cfg['position_cutoff_time'], '%H:%M').time()
     exit_time           = datetime.strptime(cfg['exit_time'], '%H:%M').time()
 
@@ -497,6 +498,7 @@ def run_trading_worker():
     print(f"Strategy Param    : Supertrend Period={supertrend_period} | ITM Gap={itm_gap}")
     print(f"ATR Multipliers   : Stop = {atr_stop_multiplier}x | Target = {atr_tp_multiplier}x")
     print(f"Max Positions/Day : {max_positions}")
+    print(f"Entry on Open     : {'ENABLED (Enter at 09:45:05)' if entry_on_open == 1 else 'DISABLED (Wait for Reversal)'}")
     print(f"Hedges Active     : {'NO (Hedgeless Mode)' if hedgeless_mode == 1 else 'YES (OTM +10 Gap)'}")
     print(f"Option Expiry     : {current_expiry}")
     print(f"Results Storage   : {results_dir}")
@@ -569,6 +571,33 @@ def run_trading_worker():
     last_processed_5m_bar = expected_0940
     last_monitored_marker = (-1, -1)
     last_pnl_print_minute = -1
+
+    # Optional immediate entry on consistency confirmation
+    if entry_on_open == 1:
+        print("\n" + "#" * 80)
+        print("  ENTRY ON OPEN TRIGGERED: Taking initial position in morning trend direction")
+        print("#" * 80 + "\n")
+        trades_taken += 1
+        latest_bar = candles[-1]
+        active_trade = enter_trade(
+            kite=kite,
+            direction=first_dir,
+            underlying_price=latest_bar['close'],
+            atr_ema=latest_bar['atr_ema'],
+            trades_taken=trades_taken,
+            options_map=options_map,
+            tick_client=tick_client,
+            lots_num=lots_num,
+            qty=qty,
+            itm_gap=itm_gap,
+            atr_stop_multiplier=atr_stop_multiplier,
+            atr_tp_multiplier=atr_tp_multiplier,
+            hedgeless_mode=hedgeless_mode,
+            live_mode=live_mode,
+            tradebook_path=tradebook_path,
+            cumulative_realized_pnl=cumulative_realized_pnl
+        )
+        trim_memory()
 
     while True:
         time.sleep(1)
@@ -934,3 +963,6 @@ if __name__ == "__main__":
                 except Exception:
                     worker_process.kill()
                 print("[SUPERVISOR] Worker terminated.", flush=True)
+```<FollowUp>
+Would you like to run a mock paper test on Monday to verify that Trade 1 executes at 09:45:05 without waiting for a reversal?
+</FollowUp>

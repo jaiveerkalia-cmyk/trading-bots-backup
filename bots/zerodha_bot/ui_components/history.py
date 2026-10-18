@@ -1,16 +1,24 @@
 """Order History: the complete, all-time options_tradebook.csv log."""
 from nicegui import ui
 from config import TRADEBOOK_FILE, ui_refs
-import pandas as pd
+import os as _zb_os
+_NO_PANDAS = _zb_os.environ.get('ZB_NO_PANDAS') == '1'
+if _NO_PANDAS:
+    import lean_io as _lean_io
+else:
+    import pandas as pd
 
 # --- ORDER HISTORY (full options_tradebook.csv) ---
 
 def _refresh_history_table():
     try:
-        df = pd.read_csv(TRADEBOOK_FILE)
-        df = df.iloc[::-1]  # most recent (last appended) first
-        cols = [{'name': c, 'label': c.replace('_', ' '), 'field': c, 'sortable': True, 'align': 'left'} for c in df.columns]
-        rows = df.to_dict('records')
+        if _NO_PANDAS:
+            cols, rows = _lean_io.history_table_data(TRADEBOOK_FILE)
+        else:
+            df = pd.read_csv(TRADEBOOK_FILE)
+            df = df.iloc[::-1]  # most recent (last appended) first
+            cols = [{'name': c, 'label': c.replace('_', ' '), 'field': c, 'sortable': True, 'align': 'left'} for c in df.columns]
+            rows = df.to_dict('records')
         tbl = ui_refs.get('history_table')
         if tbl:
             tbl.columns = cols

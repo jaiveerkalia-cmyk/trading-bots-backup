@@ -1,5 +1,7 @@
 # instrument_manager.py
-import pandas as pd
+import os as _zb_os
+if _zb_os.environ.get('ZB_NO_PANDAS') != '1':
+    import pandas as pd
 from datetime import date
 import os
 from config import INDICES, MASTER_INSTRUMENTS_FILE, shared_state
@@ -275,3 +277,13 @@ class InstrumentManager:
                 return float(cached_ltp or 0), False
             except Exception:
                 return 0.0, False
+
+
+# --- ZB_NO_PANDAS=1 (default off): bind the DataFrame-free scan/lookup implementations ---
+# (lean_io.py). Writes the same master/options CSVs, keeps the near-month futures from the scan
+# in memory instead of re-reading the 9 MB master CSV, and frees the scan's heap afterwards.
+if _zb_os.environ.get('ZB_NO_PANDAS') == '1':
+    import lean_io as _lean_io
+    InstrumentManager.fetch_and_process_instruments = _lean_io.inst_fetch_and_process_instruments
+    InstrumentManager.get_atm_token = _lean_io.inst_get_atm_token
+    InstrumentManager.get_near_month_future = _lean_io.inst_get_near_month_future

@@ -1,6 +1,8 @@
 from config import shared_state, params, TRADEBOOK_FILE, DAILY_PNL_FILE
 from datetime import datetime
-import pandas as pd
+import os as _zb_os
+if _zb_os.environ.get('ZB_NO_PANDAS') != '1':
+    import pandas as pd
 import os
 
 class CsvManager:
@@ -53,3 +55,13 @@ class CsvManager:
         new_row = pd.DataFrame([{'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'Net_Profit': round(net_profit, 2), 'Trade_Num': len(trades), 'Trades_List': str(pnl_list)}])
         df = pd.concat([df, new_row], ignore_index=True)
         df.to_csv(DAILY_PNL_FILE, index=False)
+
+
+# --- ZB_NO_PANDAS=1 (default off): bind the stdlib-csv implementations from lean_io.py ---
+if _zb_os.environ.get('ZB_NO_PANDAS') == '1':
+    import lean_io as _lean_io
+    CsvManager.init_files = _lean_io.csv_init_files
+    CsvManager.log_open = _lean_io.csv_log_open
+    CsvManager.update_entry_log = _lean_io.csv_update_entry_log
+    CsvManager.log_close = _lean_io.csv_log_close
+    CsvManager.save_daily_report = _lean_io.csv_save_daily_report

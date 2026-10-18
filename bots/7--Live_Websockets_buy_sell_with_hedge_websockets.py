@@ -499,8 +499,8 @@ def get_vix_stop_per_lot(kite, current_dt, lookback_days=400):
 
 def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
     """
-    Fetches 1-minute OHLC candles for the spot index and returns the ATR(INDEX_ENTRY_ATR_PERIOD)
-    value from the last completed 1-minute candle of the previous trading day.
+    Fetches 1-minute OHLC candles for the spot index and returns the 200-period ATR EMA
+    from the last eligible candle of the previous trading day.
     Used exclusively for index_based_entry mode.
     """
     try:
@@ -525,6 +525,7 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
 
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
+        df = df[df['date'].dt.time <= datetime.strptime('15:14', '%H:%M').time()].reset_index(drop=True)
         print(f"[INDEX_ENTRY_ATR] Total 1m candles fetched: {len(df)}", flush=True)
 
         # Determine today's date, timezone-aware if needed
@@ -544,7 +545,7 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
         prev_day_only = prev_day_candles[prev_day_candles['date'].dt.date == last_trading_date].copy()
         print(f"[INDEX_ENTRY_ATR] Previous trading day identified: {last_trading_date} | Candles in that day: {len(prev_day_only)}", flush=True)
 
-        # Calculate ATR(INDEX_ENTRY_ATR_PERIOD) on ALL available prior candles (need enough history)
+        # Calculate ATR and its 200-period EMA on all eligible prior candles.
         high = prev_day_candles['high'].astype(float)
         low  = prev_day_candles['low'].astype(float)
         close = prev_day_candles['close'].astype(float)
@@ -556,21 +557,22 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
         atr_series = talib.ATR(high.values, low.values, close.values, timeperiod=INDEX_ENTRY_ATR_PERIOD)
         prev_day_candles = prev_day_candles.copy()
         prev_day_candles['atr'] = atr_series
+        prev_day_candles['atr_ema'] = prev_day_candles['atr'].ewm(span=200, adjust=False, min_periods=200).mean()
 
-        # Get candles from the previous trading day that have a valid ATR
+        # Get candles from the previous trading day that have a valid ATR EMA.
         prev_day_with_atr = prev_day_candles[
             (prev_day_candles['date'].dt.date == last_trading_date) &
-            prev_day_candles['atr'].notna()
+            prev_day_candles['atr_ema'].notna()
         ]
 
         if prev_day_with_atr.empty:
-            print(f"[INDEX_ENTRY_ATR] FAILED: no valid ATR values on previous trading day {last_trading_date}", flush=True)
+            print(f"[INDEX_ENTRY_ATR] FAILED: no valid ATR EMA values on previous trading day {last_trading_date}", flush=True)
             return None
 
         last_candle = prev_day_with_atr.iloc[-1]
-        atr_value = float(last_candle['atr'])
+        atr_value = float(last_candle['atr_ema'])
 
-        print(f"[INDEX_ENTRY_ATR] ATR({INDEX_ENTRY_ATR_PERIOD}) value from previous day last candle: {atr_value:.4f}", flush=True)
+        print(f"[INDEX_ENTRY_ATR] ATR({INDEX_ENTRY_ATR_PERIOD}) EMA(200) value from previous day last eligible candle: {atr_value:.4f}", flush=True)
 
         return atr_value
 
