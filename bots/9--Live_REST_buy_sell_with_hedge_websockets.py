@@ -80,11 +80,17 @@ INDEX_DETAILS = {
 # ------------------------------------------------------------------------------
 DAY_CONFIGURATION = {
     # Monday (NIFTY)
-    0: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
-        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
+    # 0: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
+    #     'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
+    #     'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
+    #     'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
+    #     'index_based_entry': False, 'atr_entry_multiplier': 2},
+
+    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
+        'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
-        'index_based_entry': False, 'atr_entry_multiplier': 2},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': True, 'hedgeless_mode': True,
+        'index_based_entry': True, 'atr_entry_multiplier': 2},
 
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,

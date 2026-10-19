@@ -66,25 +66,25 @@ else:
 # Keys: 0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
-    0: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
+    0: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:30',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
-        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
+        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 20.0, 'atr_tp_multiplier': 10.0,
         'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
-    1: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
+    1: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:30',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
-        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
+        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 20.0, 'atr_tp_multiplier': 10.0,
         'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
-    2: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
+    2: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:30',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
-        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
-    3: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
+        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 20.0, 'atr_tp_multiplier': 10.0,
+        'max_positions_per_day': 3, 'entry_on_open': 0, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+    3: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:30',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
-        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
-        'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
-    4: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:40',
+        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 20.0, 'atr_tp_multiplier': 10.0,
+        'max_positions_per_day': 3, 'entry_on_open': 0, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
+    4: {'lots_num': 3, 'live_mode': 0, 'start_time': '09:20', 'consistency_time': '09:30',
         'supertrend_period': 3, 'stop_percent': 75, 'global_stop_per_lot': 40000,
-        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 2.0, 'atr_tp_multiplier': 10.0,
+        'hedgeless_mode': 1, 'itm_gap': 2, 'atr_stop_multiplier': 20.0, 'atr_tp_multiplier': 10.0,
         'max_positions_per_day': 3, 'entry_on_open': 1, 'position_cutoff_time': '15:15', 'exit_time': '15:19'},
 }
 
@@ -459,18 +459,19 @@ def run_trading_worker():
     kite.set_access_token(access_token)
 
     cfg = get_day_config()
-    lots_num            = cfg['lots_num']
-    live_mode           = cfg['live_mode']
-    supertrend_period   = cfg['supertrend_period']
-    global_stop_per_lot = cfg['global_stop_per_lot']
-    hedgeless_mode      = cfg['hedgeless_mode']
-    itm_gap             = cfg['itm_gap']
-    atr_stop_multiplier = cfg['atr_stop_multiplier']
-    atr_tp_multiplier   = cfg['atr_tp_multiplier']
-    max_positions       = cfg['max_positions_per_day']
-    entry_on_open       = cfg.get('entry_on_open', 0)
-    cutoff_time         = datetime.strptime(cfg['position_cutoff_time'], '%H:%M').time()
-    exit_time           = datetime.strptime(cfg['exit_time'], '%H:%M').time()
+    lots_num             = cfg['lots_num']
+    live_mode            = cfg['live_mode']
+    supertrend_period    = cfg['supertrend_period']
+    global_stop_per_lot  = cfg['global_stop_per_lot']
+    hedgeless_mode       = cfg['hedgeless_mode']
+    itm_gap              = cfg['itm_gap']
+    atr_stop_multiplier  = cfg['atr_stop_multiplier']
+    atr_tp_multiplier    = cfg['atr_tp_multiplier']
+    max_positions        = cfg['max_positions_per_day']
+    entry_on_open        = cfg.get('entry_on_open', 0)
+    consistency_time_str = cfg.get('consistency_time', '09:30')
+    cutoff_time          = datetime.strptime(cfg['position_cutoff_time'], '%H:%M').time()
+    exit_time            = datetime.strptime(cfg['exit_time'], '%H:%M').time()
 
     qty = lots_num * LOT_SIZE
     global_day_stop = -abs(global_stop_per_lot * lots_num)
@@ -488,6 +489,12 @@ def run_trading_worker():
     tick_client.start()
     tick_client.subscribe([INSTRUMENT_TOKEN])
 
+    # Dynamic calculation of consistency target candle and fetch standby time
+    cons_hour, cons_minute = map(int, consistency_time_str.split(':'))
+    today_date = datetime.now(IST).date()
+    expected_consistency_bar = datetime(today_date.year, today_date.month, today_date.day, cons_hour, cons_minute, 0)
+    fetch_time_dt = expected_consistency_bar + timedelta(minutes=5, seconds=CANDLE_FETCH_BUFFER_SECONDS)
+
     print("\n" + "=" * 80)
     print("  SYSTEM INITIALIZATION | LOW-RAM SENSEX REVERSE MOMENTUM ENGINE")
     print("=" * 80)
@@ -498,35 +505,34 @@ def run_trading_worker():
     print(f"Strategy Param    : Supertrend Period={supertrend_period} | ITM Gap={itm_gap}")
     print(f"ATR Multipliers   : Stop = {atr_stop_multiplier}x | Target = {atr_tp_multiplier}x")
     print(f"Max Positions/Day : {max_positions}")
-    print(f"Entry on Open     : {'ENABLED (Enter at 09:45:05)' if entry_on_open == 1 else 'DISABLED (Wait for Reversal)'}")
+    print(f"Consistency Time  : {consistency_time_str} IST (Candle Closes at {fetch_time_dt.strftime('%H:%M:%S')} IST)")
+    print(f"Entry on Open     : {'ENABLED (Enter at ' + fetch_time_dt.strftime('%H:%M:%S') + ')' if entry_on_open == 1 else 'DISABLED (Wait for Reversal)'}")
     print(f"Hedges Active     : {'NO (Hedgeless Mode)' if hedgeless_mode == 1 else 'YES (OTM +10 Gap)'}")
     print(f"Option Expiry     : {current_expiry}")
     print(f"Results Storage   : {results_dir}")
     print("=" * 80 + "\n")
 
-    # Standby until 09:45:05 IST (When the 09:40 candle is fully completed)
-    target_consistency_dt = datetime.now().replace(hour=9, minute=45, second=CANDLE_FETCH_BUFFER_SECONDS, microsecond=0)
-    time_to_wait = (target_consistency_dt - datetime.now()).total_seconds()
+    # Standby dynamically until the consistency_time candle is fully completed
+    now_naive = datetime.now(IST).replace(tzinfo=None)
+    time_to_wait = (fetch_time_dt - now_naive).total_seconds()
     if time_to_wait > 0:
-        print(f"[STANDBY] Waiting {time_to_wait:.1f}s until 09:45:05 IST for 09:40 candle close...")
+        print(f"[STANDBY] Waiting {time_to_wait:.1f}s until {fetch_time_dt.strftime('%H:%M:%S')} IST for {consistency_time_str} candle close...")
         time.sleep(time_to_wait)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # MORNING TREND CONSISTENCY GATE (09:15 - 09:40)
+    # MORNING TREND CONSISTENCY GATE (09:15 - consistency_time)
     # ─────────────────────────────────────────────────────────────────────────
-    expected_0940 = datetime.now().replace(hour=9, minute=40, second=0, microsecond=0)
-    candles = fetch_verified_5m_candles(kite, INSTRUMENT_TOKEN, expected_0940, retries=5)
+    candles = fetch_verified_5m_candles(kite, INSTRUMENT_TOKEN, expected_consistency_bar, retries=5)
     candles = calculate_supertrend_data(candles, supertrend_period)
 
     if len(candles) > 300:
         candles = candles[-300:]
 
-    today_date = datetime.now(IST).date()
     today_candles = [c for c in candles if c['date'].date() == today_date]
 
-    # Display today's morning candles (09:15 to 09:40) with Supertrend value & direction
+    # Display today's morning candles (09:15 to consistency_time) with Supertrend value & direction
     print("\n" + "=" * 115)
-    print("  TODAY'S INTRADAY 5-MINUTE CANDLES (09:15 - 09:40)")
+    print(f"  TODAY'S INTRADAY 5-MINUTE CANDLES (09:15 - {consistency_time_str})")
     print("=" * 115)
     print(f"{'Timestamp (IST)':<20} | {'Open':<9} | {'High':<9} | {'Low':<9} | {'Close':<9} | {'Volume':<10} | {'Supertrend':<10} | {'ST Direction'}")
     print("-" * 115)
@@ -536,10 +542,10 @@ def run_trading_worker():
         print(f"{t_str:<20} | {c['open']:<9.2f} | {c['high']:<9.2f} | {c['low']:<9.2f} | {c['close']:<9.2f} | {int(c['volume']):<10} | {c['supertrend']:<10.2f} | {dir_str}")
     print("=" * 115)
 
-    # Consistency validation: 09:15 through 09:40 must have identical direction
+    # Consistency validation: 09:15 through consistency_time must have identical direction
     t_0915 = datetime.strptime('09:15', '%H:%M').time()
-    t_0940 = datetime.strptime('09:40', '%H:%M').time()
-    consistency_candles = [c for c in today_candles if t_0915 <= c['date'].time() <= t_0940]
+    t_cons = datetime.strptime(consistency_time_str, '%H:%M').time()
+    consistency_candles = [c for c in today_candles if t_0915 <= c['date'].time() <= t_cons]
     dirs = [c['direction'] for c in consistency_candles if c['direction'] != 0]
 
     if len(dirs) == 0:
@@ -551,7 +557,7 @@ def run_trading_worker():
 
     if not is_consistent:
         print("\n" + "#" * 80)
-        print("  MORNING CONSISTENCY GATE: FAILED (Direction flipped between 09:15 and 09:40)")
+        print(f"  MORNING CONSISTENCY GATE: FAILED (Direction flipped between 09:15 and {consistency_time_str})")
         print("  Market is choppy/non-directional. Strategy will remain dormant today.")
         print("#" * 80 + "\n")
         return
@@ -568,7 +574,7 @@ def run_trading_worker():
     cumulative_realized_pnl = 0.0
     active_trade = None
 
-    last_processed_5m_bar = expected_0940
+    last_processed_5m_bar = expected_consistency_bar
     last_monitored_marker = (-1, -1)
     last_pnl_print_minute = -1
 
@@ -963,6 +969,3 @@ if __name__ == "__main__":
                 except Exception:
                     worker_process.kill()
                 print("[SUPERVISOR] Worker terminated.", flush=True)
-```<FollowUp>
-Would you like to run a mock paper test on Monday to verify that Trade 1 executes at 09:45:05 without waiting for a reversal?
-</FollowUp>
