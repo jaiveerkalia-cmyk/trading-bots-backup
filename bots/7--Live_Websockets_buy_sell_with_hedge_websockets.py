@@ -4,8 +4,7 @@ import threading
 import time
 import math
 import csv
-import pandas as pd
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import pytz
 import talib
 from kiteconnect import KiteConnect, KiteTicker
@@ -80,18 +79,12 @@ INDEX_DETAILS = {
 # ------------------------------------------------------------------------------
 DAY_CONFIGURATION = {
     # Monday (NIFTY)
-        # 0: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
-        #     'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
-        #     'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        #     'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
-        #     'index_based_entry': False, 'atr_entry_multiplier': 2},
-    
-    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
-            'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
+    0: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
+            'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
             'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-            'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': True, 'hedgeless_mode': True,
-            'index_based_entry': True, 'atr_entry_multiplier': 2},
-
+            'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
+            'index_based_entry': False, 'atr_entry_multiplier': 2},
+    
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
@@ -149,6 +142,42 @@ def append_csv_row(csv_path, row):
         csv.writer(f).writerow(row)
 
 
+def _as_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    raise TypeError(f"Unsupported date value: {value!r}")
+
+
+def _midnight_for_candle(current_dt, candle_dt):
+    midnight = datetime.combine(current_dt.date(), datetime.min.time())
+    tzinfo = candle_dt.tzinfo
+    if tzinfo is None:
+        return midnight
+    if hasattr(tzinfo, 'localize'):
+        return tzinfo.localize(midnight)
+    return midnight.replace(tzinfo=tzinfo)
+
+
+def _ema_adjust_false(values, span, min_periods):
+    alpha = 2.0 / (span + 1.0)
+    ema = None
+    valid_count = 0
+    result = []
+    for value in values:
+        if value is None or not math.isfinite(float(value)):
+            result.append(None)
+            continue
+        value = float(value)
+        valid_count += 1
+        ema = value if ema is None else ((1.0 - alpha) * ema) + (alpha * value)
+        result.append(ema if valid_count >= min_periods else None)
+    return result
+
+
 def get_current_day_config():
     """Returns the configuration dictionary for the current day of the week."""
     day_index = datetime.now().weekday()
@@ -160,9 +189,9 @@ def get_day_config_for_day_index(day_index):
 
 def get_next_trading_day_info():
     """Returns the next trading date and its day configuration, skipping weekends."""
-    next_dt = datetime.now() + pd.Timedelta(days=1)
+    next_dt = datetime.now() + timedelta(days=1)
     while next_dt.weekday() in [5, 6]:
-        next_dt += pd.Timedelta(days=1)
+        next_dt += timedelta(days=1)
     return next_dt, get_day_config_for_day_index(next_dt.weekday())
 
 def get_now_str():
@@ -376,8 +405,8 @@ def get_initial_spot_price(kite, spot_symbol, start_time_str):
         start_hour, start_minute = map(int, start_time_str.split(':'))
         today = datetime.now(IST).date()
         candle_start = IST.localize(datetime.combine(today, datetime.min.time()).replace(hour=start_hour, minute=start_minute, second=0, microsecond=0))
-        candle_end = candle_start + pd.Timedelta(minutes=1)
-        candle_ready_at = candle_start + pd.Timedelta(minutes=1, seconds=10)
+        candle_end = candle_start + timedelta(minutes=1)
+        candle_ready_at = candle_start + timedelta(minutes=1, seconds=10)
 
         while datetime.now(IST) < candle_ready_at:
             wait_seconds = min(1, max(0, (candle_ready_at - datetime.now(IST)).total_seconds()))
@@ -417,40 +446,33 @@ def get_latest_atr_ema(kite, spot_symbol, current_dt, atr_ema_window=20, lookbac
             print(f"ATR fetch failed: instrument token missing for {spot_symbol}", flush=True)
             return None, None
 
-        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        from_dt = current_dt - timedelta(days=lookback_days)
         candles = kite.historical_data(instrument_token, from_dt, current_dt, '60minute')
         if not candles:
             print(f"ATR fetch failed: no historical candles returned for {spot_symbol}", flush=True)
             return None, None
 
-        df_m = pd.DataFrame(candles)
-        if df_m.empty or 'date' not in df_m.columns:
+        if not candles or 'date' not in candles[0]:
             print(f"ATR fetch failed: invalid historical candle data for {spot_symbol}", flush=True)
             return None, None
 
-        df_m['date'] = pd.to_datetime(df_m['date'])
-        df_m = df_m.sort_values('date').reset_index(drop=True)
-        high = df_m['high'].astype(float)
-        low = df_m['low'].astype(float)
-        close = df_m['close'].astype(float)
-        atr_series = talib.ATR(high, low, close, timeperiod=ATR_PERIOD)
-        df_m['atr'] = atr_series
-        df_m['atr_ema'] = df_m['atr'].ewm(span=atr_ema_window, adjust=False, min_periods=atr_ema_window).mean()
-
-        candle_tz = df_m['date'].dt.tz
-        current_date = pd.Timestamp(current_dt.date())
-        if candle_tz is not None:
-            current_date = current_date.tz_localize(candle_tz)
-
-        eligible_rows = df_m[(df_m['date'] < current_date) & df_m['atr_ema'].notna()]
-        if eligible_rows.empty:
+        candles = sorted(candles, key=lambda candle: _as_datetime(candle['date']))
+        dates = [_as_datetime(candle['date']) for candle in candles]
+        high = [float(candle['high']) for candle in candles]
+        low = [float(candle['low']) for candle in candles]
+        close = [float(candle['close']) for candle in candles]
+        atr_values = talib.ATR(high, low, close, timeperiod=ATR_PERIOD)
+        atr_ema_values = _ema_adjust_false(atr_values, atr_ema_window, atr_ema_window)
+        current_date = _midnight_for_candle(current_dt, dates[0])
+        eligible_indexes = [i for i, candle_date in enumerate(dates)
+                            if candle_date < current_date and atr_ema_values[i] is not None]
+        if not eligible_indexes:
             print(f"ATR fetch failed: no completed ATR EMA value available for {spot_symbol}", flush=True)
             return None, None
 
-        selected_row = eligible_rows.iloc[-1]
-        print(f"Using ATR candle: {selected_row['date']}", flush=True)
-
-        latest_atr = float(selected_row['atr_ema'])
+        selected_index = eligible_indexes[-1]
+        print(f"Using ATR candle: {dates[selected_index]}", flush=True)
+        latest_atr = float(atr_ema_values[selected_index])
         return latest_atr, None
 
     except Exception as e:
@@ -466,36 +488,32 @@ def get_vix_stop_per_lot(kite, current_dt, lookback_days=400):
             print(f"VIX fetch failed: instrument token missing for {VIX_SYMBOL}", flush=True)
             return None, None
 
-        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        from_dt = current_dt - timedelta(days=lookback_days)
         candles = kite.historical_data(instrument_token, from_dt, current_dt, 'day')
         if not candles:
             print(f"VIX fetch failed: no historical candles returned for {VIX_SYMBOL}", flush=True)
             return None, None
 
-        df_vix = pd.DataFrame(candles)
-        if df_vix.empty or 'date' not in df_vix.columns:
+        if not candles or 'date' not in candles[0]:
             print(f"VIX fetch failed: invalid historical candle data for {VIX_SYMBOL}", flush=True)
             return None, None
 
-        df_vix['date'] = pd.to_datetime(df_vix['date'])
-        df_vix = df_vix.sort_values('date').reset_index(drop=True)
-
-        candle_tz = df_vix['date'].dt.tz
-        current_date = pd.Timestamp(current_dt.date())
-        if candle_tz is not None:
-            current_date = current_date.tz_localize(candle_tz)
-
-        eligible_rows = df_vix[df_vix['date'] < current_date].copy()
+        candles = sorted(candles, key=lambda candle: _as_datetime(candle['date']))
+        current_date = _midnight_for_candle(current_dt, _as_datetime(candles[0]['date']))
+        eligible_rows = [candle for candle in candles if _as_datetime(candle['date']) < current_date]
         if len(eligible_rows) < 252:
             print(f"VIX fetch failed: need at least 252 prior daily candles, found {len(eligible_rows)}", flush=True)
             return None, None
 
-        trailing_window = eligible_rows['close'].astype(float).tail(252)
-        vix_rank_pct = trailing_window.rank(pct=True).iloc[-1]
+        trailing_window = [float(candle['close']) for candle in eligible_rows[-252:]]
+        latest_close = trailing_window[-1]
+        less_count = sum(value < latest_close for value in trailing_window)
+        equal_count = sum(value == latest_close for value in trailing_window)
+        vix_rank_pct = (less_count + (equal_count + 1) / 2) / len(trailing_window)
         stop_per_lot = 4000 if vix_rank_pct > 0.5 else 3000
 
-        selected_row = eligible_rows.iloc[-1]
-        print(f"Using VIX candle: {selected_row['date']} | Rank pct over trailing 252: {vix_rank_pct:.4f} | Stop/Lot: {stop_per_lot}", flush=True)
+        selected_row = eligible_rows[-1]
+        print(f"Using VIX candle: {_as_datetime(selected_row['date'])} | Rank pct over trailing 252: {vix_rank_pct:.4f} | Stop/Lot: {stop_per_lot}", flush=True)
 
         return stop_per_lot, None
 
@@ -517,66 +535,59 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
             print(f"[INDEX_ENTRY_ATR] FAILED: instrument token missing for {spot_symbol}", flush=True)
             return None
 
-        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        from_dt = current_dt - timedelta(days=lookback_days)
         print(f"[INDEX_ENTRY_ATR] Fetching 1m candles for {spot_symbol} from {from_dt} to {current_dt}...", flush=True)
         candles = kite.historical_data(instrument_token, from_dt, current_dt, 'minute')
         if not candles:
             print(f"[INDEX_ENTRY_ATR] FAILED: no 1m candles returned for {spot_symbol}", flush=True)
             return None
 
-        df = pd.DataFrame(candles)
-        if df.empty or 'date' not in df.columns:
+        if not candles or 'date' not in candles[0]:
             print(f"[INDEX_ENTRY_ATR] FAILED: invalid candle data for {spot_symbol}", flush=True)
             return None
 
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        df = df[df['date'].dt.time <= datetime.strptime('15:14', '%H:%M').time()].reset_index(drop=True)
-        print(f"[INDEX_ENTRY_ATR] Total 1m candles fetched: {len(df)}", flush=True)
+        candles = sorted(candles, key=lambda candle: _as_datetime(candle['date']))
+        candles = [candle for candle in candles
+                   if (_as_datetime(candle['date']).hour, _as_datetime(candle['date']).minute) <= (15, 14)]
+        print(f"[INDEX_ENTRY_ATR] Total 1m candles fetched: {len(candles)}", flush=True)
+        if not candles:
+            print(f"[INDEX_ENTRY_ATR] FAILED: no eligible 1m candles at or before 15:14 for {spot_symbol}", flush=True)
+            return None
 
-        # Determine today's date, timezone-aware if needed
-        candle_tz = df['date'].dt.tz
-        current_date = pd.Timestamp(current_dt.date())
-        if candle_tz is not None:
-            current_date = current_date.tz_localize(candle_tz)
-
-        # Keep only candles strictly before today (previous trading day and earlier)
-        prev_day_candles = df[df['date'] < current_date].copy()
-        if prev_day_candles.empty:
+        current_date = _midnight_for_candle(current_dt, _as_datetime(candles[0]['date']))
+        prev_day_candles = [candle for candle in candles if _as_datetime(candle['date']) < current_date]
+        if not prev_day_candles:
             print(f"[INDEX_ENTRY_ATR] FAILED: no candles found before today ({current_date})", flush=True)
             return None
 
         # Identify the last trading day date
-        last_trading_date = prev_day_candles['date'].dt.date.max()
-        prev_day_only = prev_day_candles[prev_day_candles['date'].dt.date == last_trading_date].copy()
+        last_trading_date = max(_as_datetime(candle['date']).date() for candle in prev_day_candles)
+        prev_day_only = [candle for candle in prev_day_candles
+                         if _as_datetime(candle['date']).date() == last_trading_date]
         print(f"[INDEX_ENTRY_ATR] Previous trading day identified: {last_trading_date} | Candles in that day: {len(prev_day_only)}", flush=True)
 
         # Calculate ATR and its 200-period EMA on all eligible prior candles.
-        high = prev_day_candles['high'].astype(float)
-        low  = prev_day_candles['low'].astype(float)
-        close = prev_day_candles['close'].astype(float)
+        high = [float(candle['high']) for candle in prev_day_candles]
+        low = [float(candle['low']) for candle in prev_day_candles]
+        close = [float(candle['close']) for candle in prev_day_candles]
 
         if len(prev_day_candles) < INDEX_ENTRY_ATR_PERIOD + 1:
             print(f"[INDEX_ENTRY_ATR] FAILED: not enough candles ({len(prev_day_candles)}) to compute ATR({INDEX_ENTRY_ATR_PERIOD})", flush=True)
             return None
 
-        atr_series = talib.ATR(high.values, low.values, close.values, timeperiod=INDEX_ENTRY_ATR_PERIOD)
-        prev_day_candles = prev_day_candles.copy()
-        prev_day_candles['atr'] = atr_series
-        prev_day_candles['atr_ema'] = prev_day_candles['atr'].ewm(span=200, adjust=False, min_periods=200).mean()
+        atr_series = talib.ATR(high, low, close, timeperiod=INDEX_ENTRY_ATR_PERIOD)
+        atr_ema_values = _ema_adjust_false(atr_series, 200, 200)
 
         # Get candles from the previous trading day that have a valid ATR EMA.
-        prev_day_with_atr = prev_day_candles[
-            (prev_day_candles['date'].dt.date == last_trading_date) &
-            prev_day_candles['atr_ema'].notna()
-        ]
+        eligible_indexes = [i for i, candle in enumerate(prev_day_candles)
+                            if _as_datetime(candle['date']).date() == last_trading_date
+                            and atr_ema_values[i] is not None]
 
-        if prev_day_with_atr.empty:
+        if not eligible_indexes:
             print(f"[INDEX_ENTRY_ATR] FAILED: no valid ATR EMA values on previous trading day {last_trading_date}", flush=True)
             return None
 
-        last_candle = prev_day_with_atr.iloc[-1]
-        atr_value = float(last_candle['atr_ema'])
+        atr_value = float(atr_ema_values[eligible_indexes[-1]])
 
         print(f"[INDEX_ENTRY_ATR] ATR({INDEX_ENTRY_ATR_PERIOD}) EMA(200) value from previous day last eligible candle: {atr_value:.4f}", flush=True)
 
@@ -606,13 +617,15 @@ def find_best_atm_strike(kite, mathematical_atm, instruments_df, step, exchange=
     
     for strike in candidates:
         try:
-            ce_row = instruments_df[(instruments_df['strike'] == strike) & (instruments_df['instrument_type'] == 'CE')]
-            pe_row = instruments_df[(instruments_df['strike'] == strike) & (instruments_df['instrument_type'] == 'PE')]
+            ce_row = next((row for row in instruments_df
+                           if row['strike'] == strike and row['instrument_type'] == 'CE'), None)
+            pe_row = next((row for row in instruments_df
+                           if row['strike'] == strike and row['instrument_type'] == 'PE'), None)
             
-            if ce_row.empty or pe_row.empty: continue
+            if ce_row is None or pe_row is None: continue
             
-            ce_sym = ce_row.iloc[0]['tradingsymbol']
-            pe_sym = pe_row.iloc[0]['tradingsymbol']
+            ce_sym = ce_row['tradingsymbol']
+            pe_sym = pe_row['tradingsymbol']
             
             tokens_to_fetch.extend([f"{exchange}:{ce_sym}", f"{exchange}:{pe_sym}"])
             strike_map[strike] = {'CE': f"{exchange}:{ce_sym}", 'PE': f"{exchange}:{pe_sym}"}
@@ -645,20 +658,20 @@ def find_otm_buy_strikes(kite, atm_strike, instruments_df, exchange='NFO', targe
     """Finds deep OTM strikes close to target premium for hedging."""
     print(f"Finding OTM Buy Strikes (Target Premium: {target_premium})...", flush=True)
     try:
-        upper_strikes = instruments_df[instruments_df["strike"] > atm_strike].sort_values("strike").head(40)
-        lower_strikes = instruments_df[instruments_df["strike"] < atm_strike].sort_values("strike", ascending=False).head(40)
-        all_candidates = pd.concat([upper_strikes, lower_strikes])
+        upper_strikes = sorted((row for row in instruments_df if row['strike'] > atm_strike), key=lambda row: row['strike'])[:40]
+        lower_strikes = sorted((row for row in instruments_df if row['strike'] < atm_strike), key=lambda row: row['strike'], reverse=True)[:40]
+        all_candidates = upper_strikes + lower_strikes
         
-        candidate_symbols = [f"{exchange}:" + s for s in all_candidates["tradingsymbol"].unique()]
+        candidate_symbols = [f"{exchange}:{symbol}" for symbol in dict.fromkeys(row['tradingsymbol'] for row in all_candidates)]
         ltp_data = get_ltp_safe(kite, candidate_symbols)
         
-        ce_options = all_candidates[all_candidates['instrument_type'] == 'CE']
-        best_ce_strike = min(ce_options.to_dict('records'), 
-                             key=lambda x: abs(ltp_data.get(f"{exchange}:"+x["tradingsymbol"], {}).get('last_price', 999) - target_premium))['strike']
+        ce_options = [row for row in all_candidates if row['instrument_type'] == 'CE']
+        best_ce_strike = min(ce_options,
+                             key=lambda row: abs(ltp_data.get(f"{exchange}:" + row['tradingsymbol'], {}).get('last_price', 999) - target_premium))['strike']
         
-        pe_options = all_candidates[all_candidates['instrument_type'] == 'PE']
-        best_pe_strike = min(pe_options.to_dict('records'), 
-                             key=lambda x: abs(ltp_data.get(f"{exchange}:"+x["tradingsymbol"], {}).get('last_price', 999) - target_premium))['strike']
+        pe_options = [row for row in all_candidates if row['instrument_type'] == 'PE']
+        best_pe_strike = min(pe_options,
+                             key=lambda row: abs(ltp_data.get(f"{exchange}:" + row['tradingsymbol'], {}).get('last_price', 999) - target_premium))['strike']
         
         return best_ce_strike, best_pe_strike
     except Exception as e:
@@ -667,7 +680,8 @@ def find_otm_buy_strikes(kite, atm_strike, instruments_df, exchange='NFO', targe
     
 def get_token_and_symbol(df, strike, instrument_type):
     try:
-        row = df[(df['strike'] == strike) & (df['instrument_type'] == instrument_type)].iloc[0]
+        row = next(row for row in df
+                   if row['strike'] == strike and row['instrument_type'] == instrument_type)
         return int(row['instrument_token']), row['tradingsymbol']
     except: return None, None
 
@@ -774,22 +788,17 @@ def run_trading_process():
         print(f"[{get_now_str()}] Fetching Instruments for {OPT_EXCHANGE} from Kite API...", flush=True)
         try:
             instruments_list = kite.instruments(OPT_EXCHANGE)
-            instruments_df = pd.DataFrame(instruments_list)
+            nifty_options = [row for row in instruments_list
+                             if row['name'] == INDEX_FILTER and row['segment'] == f"{OPT_EXCHANGE}-OPT"]
             
-            nifty_options = instruments_df[
-                (instruments_df['name'] == INDEX_FILTER) & 
-                (instruments_df['segment'] == f"{OPT_EXCHANGE}-OPT")
-            ]
-            
-            if nifty_options.empty:
+            if not nifty_options:
                 print(f"[{get_now_str()}] CRITICAL: No instruments found for {INDEX_FILTER} in {OPT_EXCHANGE}. Check filters.", flush=True)
                 return
 
-            current_expiry = nifty_options['expiry'].unique()[0] 
-            nifty_options = nifty_options[nifty_options['expiry'] == current_expiry].copy()
+            current_expiry = nifty_options[0]['expiry']
+            nifty_options = [row for row in nifty_options if row['expiry'] == current_expiry]
             del instruments_list
-            del instruments_df
-            is_expiry_day = (datetime.now().date() == pd.to_datetime(current_expiry).date())
+            is_expiry_day = (datetime.now().date() == _as_datetime(current_expiry).date())
             print(f"[{get_now_str()}] Expiry Date: {current_expiry} (Is Today Expiry? {is_expiry_day})", flush=True)
             
         except Exception as e:
@@ -1437,14 +1446,12 @@ def run_trading_process():
         
         print("Tradebook Saved to CSV.", flush=True)
         
-        final_pnl_df = pd.read_csv(DAILY_PNL_CSV_PATH)
-        final_pnl_df.loc[len(final_pnl_df)] = [
+        append_csv_row(DAILY_PNL_CSV_PATH, [
             get_now_str(), entry_call_strike, entry_put_strike, buy_strike_ce, buy_strike_pe, 
             entry_price_call_sold, entry_price_put_sold, entry_price_call_bought, entry_price_put_bought, 
             exit_price_call_sold, exit_price_put_sold, exit_price_call_bought, exit_price_put_bought, 
             final_realized_pnl
-        ]
-        final_pnl_df.to_csv(DAILY_PNL_CSV_PATH, index=False)
+        ])
         print("Daily Process Finished Successfully.", flush=True)
 
     except Exception as e:
