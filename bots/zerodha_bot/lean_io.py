@@ -17,6 +17,7 @@ text untouched, blank/NA tokens -> empty), exactly as pandas would type and re-w
 import csv
 import ctypes
 import gc
+import io
 import os
 import re
 from datetime import date, datetime
@@ -396,7 +397,160 @@ def _futures_from_master(index_name):
     return out
 
 
+# ---------------------------------------------------------------------------
+# streaming scan (default OFF; env ZB_STREAM_SCAN=1). kite._get("market.instruments.all") returns the
+# raw CSV bytes (~9 MB) that kite.instruments() would parse into ~115k dicts (~160 MB peak). Here the
+# rows are cast exactly like kiteconnect's _parse_instruments does, written straight to the master
+# CSV, and only the few rows we actually need are kept. Output files are identical to the list path.
+# ---------------------------------------------------------------------------
+_NEED_COLS = ('instrument_token', 'tradingsymbol', 'name', 'last_price', 'expiry', 'strike',
+              'tick_size', 'lot_size', 'instrument_type', 'exchange')
+
+
+def _open_raw(raw):
+    if isinstance(raw, str):
+        raw = raw.encode('utf-8')
+    if not isinstance(raw, (bytes, bytearray)):
+        raise TypeError('unexpected instruments payload: ' + type(raw).__name__)
+    return csv.reader(io.TextIOWrapper(io.BytesIO(raw), encoding='utf-8', newline=''))
+
+
+def _cast_row(row, c):
+    out = list(row)
+    out[c['instrument_token']] = int(out[c['instrument_token']])
+    out[c['last_price']] = float(out[c['last_price']])
+    out[c['strike']] = float(out[c['strike']])
+    out[c['tick_size']] = float(out[c['tick_size']])
+    out[c['lot_size']] = int(out[c['lot_size']])
+    e = out[c['expiry']]
+    if len(e) == 10:
+        out[c['expiry']] = date.fromisoformat(e)
+    return out
+
+
+def _stream_scan(raw):
+    rd = _open_raw(raw)
+    names = next(rd)
+    c = {n: i for i, n in enumerate(names)}
+    for n in _NEED_COLS:
+        c[n]  # KeyError -> caller falls back to the list path
+    ncol = len(names)
+    ix_exch, ix_name, ix_sym = c['exchange'], c['name'], c['tradingsymbol']
+    ix_type, ix_exp, ix_tok = c['instrument_type'], c['expiry'], c['instrument_token']
+    ix_lot, ix_strike = c['lot_size'], c['strike']
+
+    sym_lookup = {}
+    for k, info in INDICES.items():
+        sym_lookup.setdefault((info['exchange'], info['name']), []).append(k)
+    seg_lookup = {(info['segment'], k): k for k, info in INDICES.items()}
+    index_token = {}
+    opt_exp = {k: set() for k in INDICES}
+    fut = {k: [] for k in INDICES}
+
+    # PASS 1: cast + write master CSV row by row; collect index tokens, option expiries, futures
+    count = 0
+    with open(MASTER_INSTRUMENTS_FILE, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f, lineterminator='\n')
+        w.writerow(names)
+        for row in rd:
+            if not row:
+                continue
+            if len(row) != ncol:
+                raise ValueError('malformed instruments row %d' % (count + 2))
+            cr = _cast_row(row, c)
+            w.writerow(cr)
+            count += 1
+            ex = row[ix_exch]
+            for k in sym_lookup.get((ex, row[ix_sym]), ()):
+                index_token.setdefault(k, cr[ix_tok])
+            k = seg_lookup.get((ex, row[ix_name]))
+            if k is not None:
+                itype = row[ix_type]
+                if itype in ('CE', 'PE'):
+                    opt_exp[k].add(_to_date(cr[ix_exp]))
+                elif itype == 'FUT':
+                    fut[k].append((_to_date(cr[ix_exp]), cr[ix_tok], row[ix_sym]))
+    print(f"✅ Saved Master List ({count} records)")
+
+    # current (nearest future) option expiry per index
+    today = date.today()
+    cur = {}
+    for k in INDICES:
+        valid = sorted([e for e in opt_exp[k] if e >= today])
+        cur[k] = valid[0] if valid else None
+
+    # PASS 2: only the current-expiry option rows of each index
+    finals = {k: [] for k in INDICES}
+    want = {(INDICES[k]['segment'], k): k for k in INDICES if cur[k] is not None}
+    if want:
+        exp_txt = {k: cur[k].isoformat() for k in INDICES if cur[k] is not None}
+        rd = _open_raw(raw)
+        next(rd)
+        for row in rd:
+            if not row:
+                continue
+            k = want.get((row[ix_exch], row[ix_name]))
+            if k is None or row[ix_type] not in ('CE', 'PE') or row[ix_exp] != exp_txt[k]:
+                continue
+            finals[k].append(_cast_row(row, c))
+
+    # per index: same steps, same log lines, same order as the list path
+    for index_key, info in INDICES.items():
+        tok = index_token.get(index_key)
+        if tok is not None:
+            INDICES[index_key]['token'] = int(tok)
+            print(f"🔹 {index_key} Token Updated: {int(tok)}")
+        else:
+            print(f"⚠️ Could not find Index Token for {info['name']}")
+        if not opt_exp[index_key]:
+            print(f"⚠️ No options found for {index_key} (Check filter logic)")
+            continue
+        current_expiry = cur[index_key]
+        if current_expiry is None:
+            print(f"⚠️ No future expiry found for {index_key}")
+            continue
+        shared_state['current_expiry'][index_key] = str(current_expiry)
+        final = finals[index_key]
+        try:
+            fetched_lot_size = int(final[0][ix_lot])
+            INDICES[index_key]['lot_size'] = fetched_lot_size
+            strikes = sorted(set(r[ix_strike] for r in final))
+            if len(strikes) > 1:
+                diffs = [strikes[i + 1] - strikes[i] for i in range(len(strikes) - 1)]
+                fetched_step = max(set(diffs), key=diffs.count)
+                INDICES[index_key]['step'] = fetched_step
+            print(f"🔹 {index_key} Metadata Updated -> Lot: {fetched_lot_size} | Step: {INDICES[index_key]['step']}")
+        except Exception as e:
+            print(f"⚠️ Error calculating metadata for {index_key}: {e}")
+        with open(info['opt_file'], 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f, lineterminator='\n')
+            w.writerow(names)
+            w.writerows(final)
+        print(f"✅ Generated {index_key} Options File: {len(final)} contracts (Expiry: {current_expiry})")
+
+    _FUT.clear()
+    for k in INDICES:
+        _FUT[k] = fut[k]
+
+
 def inst_fetch_and_process_instruments(self):
+    if os.environ.get('ZB_STREAM_SCAN') == '1':
+        raw = None
+        try:
+            print("⏳ Downloading Master Instrument List...")
+            raw = self.kite._get("market.instruments.all")
+            _stream_scan(raw)
+            shared_state['instruments_loaded'] = True
+            return True
+        except Exception as e:
+            print(f"⚠️ Streaming scan unavailable ({e}); falling back to list scan")
+        finally:
+            raw = None
+            trim_heap()
+    return _inst_fetch_list_path(self)
+
+
+def _inst_fetch_list_path(self):
     try:
         print("⏳ Downloading Master Instrument List...")
         instruments = self.kite.instruments()
