@@ -158,7 +158,7 @@ DAY_CONFIGURATION = {
         'pos1_stop'                   : 20000,  # Thu per-leg SL for 1st position
         'pos2_close_target'           : 50000,  # Thu total PnL target to close 2nd position
         'global_stop_atr_multiplier'  : 20.0,   # Thu
-        'global_target_atr_multiplier': 20.0,   # Thu
+        'global_target_atr_multiplier': 200.0,   # Thu
         'candle_close_threshold'      : 0.2,
         'HOURLY_LOGIC_ENABLED'       : True,
         'INSIDE_BAR_LOGIC_ENABLED'   : True,

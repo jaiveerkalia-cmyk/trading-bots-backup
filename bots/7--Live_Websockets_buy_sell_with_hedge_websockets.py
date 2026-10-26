@@ -78,7 +78,8 @@ INDEX_DETAILS = {
         'opt_exchange': 'NFO', 
         'strike_step': 50, 
         'std_lot_size': 65, 
-        'index_filter': 'NIFTY'
+        'index_filter': 'NIFTY',
+        'spot_token': 256265
     },
     'SENSEX': {
         'index_name': 'SENSEX', 
@@ -86,7 +87,8 @@ INDEX_DETAILS = {
         'opt_exchange': 'BFO', 
         'strike_step': 100, 
         'std_lot_size': 20, 
-        'index_filter': 'SENSEX'
+        'index_filter': 'SENSEX',
+        'spot_token': 265
     }
 }
 
@@ -106,12 +108,6 @@ DAY_CONFIGURATION = {
             'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
             'index_based_entry': False, 'atr_entry_multiplier': 2},
     
-    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
-            'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
-            'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-            'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': True, 'hedgeless_mode': True,
-            'index_based_entry': True, 'atr_entry_multiplier': 2},
-
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': True, 'atr_mode_on': False, 'atr_ema_window': 20,
@@ -359,15 +355,41 @@ def place_order_with_retry(kite, symbol, qty, side, live_mode, exchange='NFO'):
     return False
 
 def get_ltp_safe(kite, symbol_list):
-    """Fetches LTP with retries."""
-    for _ in range(5):
+    """Fetches LTP with retries, adaptive fast backoff, and latency/error diagnostics."""
+    if not symbol_list:
+        return {}
+
+    delays = [0.2, 0.4, 0.8, 1.0, 1.0]
+    total_start = time.time()
+    last_error = None
+
+    for attempt in range(len(delays)):
+        t_req = time.time()
         try:
-            return kite.ltp(symbol_list)
-        except: time.sleep(1)
+            res = kite.ltp(symbol_list)
+            dur = time.time() - t_req
+            if dur > 1.0:
+                print(f"[{get_now_str()}] [API LATENCY] kite.ltp took {dur:.2f}s for {len(symbol_list)} symbols (Zerodha server/network load)", flush=True)
+            return res
+        except Exception as e:
+            last_error = e
+            dur = time.time() - t_req
+            delay = delays[attempt]
+            print(f"[{get_now_str()}] [API RETRY {attempt + 1}/{len(delays)}] kite.ltp failed after {dur:.2f}s for {len(symbol_list)} symbols: {e} | Retrying in {delay}s...", flush=True)
+            time.sleep(delay)
+
+    total_dur = time.time() - total_start
+    print(f"[{get_now_str()}] [API CRITICAL ERROR] All {len(delays)} attempts failed after {total_dur:.2f}s for {symbol_list[:3]}...: {last_error}", flush=True)
     return {}
 
-def get_initial_spot_price(kite, spot_symbol, start_time_str):
-    """Fetches the start spot price with live retries, then falls back to the start-minute candle open."""
+def get_initial_spot_price(kite, spot_symbol, start_time_str, spot_token=None):
+    """Fetches the start spot price from WebSocket if available, else live quote, then falls back to candle open."""
+    if spot_token:
+        with tick_lock:
+            ws_spot = live_market_data.get(spot_token, 0)
+        if ws_spot > 0:
+            print(f"[{get_now_str()}] Initial spot LTP fetched instantly from WebSocket: {ws_spot}", flush=True)
+            return float(ws_spot)
     live_retry_started_at = time.time()
     live_retry_limit_seconds = 60
     live_retry_delays = [1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -688,12 +710,13 @@ def get_token_and_symbol(options_data, strike, instrument_type):
     return None, None
 
 def find_best_atm_strike(kite, mathematical_atm, options_data, step, exchange='NFO'):
-    """Finds the strike with the lowest difference between CE and PE premiums."""
+    """Finds the strike with the lowest difference between CE and PE premiums and returns cached prices."""
     print(f"Scanning for Best ATM (Step: {step})...", flush=True)
     best_strike = mathematical_atm
     min_premium_diff = 999999.0
     
-    candidates = [int(mathematical_atm) + (x * step) for x in range(-3, 4)]
+    # Expanded candidate range from -4 to +4 (9 strikes) to cover all base entry + skew shifts in a single call
+    candidates = [int(mathematical_atm) + (x * step) for x in range(-4, 5)]
     tokens_to_fetch = []
     strike_map = {}
     
@@ -711,12 +734,16 @@ def find_best_atm_strike(kite, mathematical_atm, options_data, step, exchange='N
             continue
         
     if not tokens_to_fetch:
-        return mathematical_atm
+        return mathematical_atm, {}
 
     ltp_data = get_ltp_safe(kite, tokens_to_fetch)
     
     print(f"{'Strike':<10} | {'Diff':<10}", flush=True)
-    for strike, symbols in strike_map.items():
+    # Evaluate best ATM difference across the standard 7 central strikes
+    for strike in [int(mathematical_atm) + (x * step) for x in range(-3, 4)]:
+        symbols = strike_map.get(strike)
+        if not symbols:
+            continue
         try:
             ce_price = ltp_data.get(symbols['CE'], {}).get('last_price', 0)
             pe_price = ltp_data.get(symbols['PE'], {}).get('last_price', 0)
@@ -734,7 +761,7 @@ def find_best_atm_strike(kite, mathematical_atm, options_data, step, exchange='N
             continue
     
     print(f"Selected Best ATM: {best_strike}", flush=True)
-    return best_strike
+    return best_strike, ltp_data
 
 def find_otm_buy_strikes(kite, atm_strike, options_list, exchange='NFO', target_premium=15):
     """Finds deep OTM strikes close to target premium for hedging."""
@@ -957,6 +984,10 @@ def run_trading_process():
         # 5. WebSocket (RedisTickClient)
         tick_client = RedisTickClient(live_market_data, tick_lock)
         tick_client.start()
+        spot_token = config.get('spot_token')
+        if spot_token:
+            tick_client.subscribe([spot_token])
+            print(f"[{get_now_str()}] Pre-subscribed spot index token {spot_token} ({spot_sym_full}) to WebSocket.", flush=True)
         
         # 6. Wait for Start Time
         print(f"\n[{get_now_str()}] Waiting for Start Time: {config['start']}...", flush=True)
@@ -967,7 +998,7 @@ def run_trading_process():
             
         # 7. Levels
         print(f"\n[{get_now_str()}] --- CALCULATING LEVELS ---", flush=True)
-        spot_ltp = get_initial_spot_price(kite, spot_sym_full, config['start'])
+        spot_ltp = get_initial_spot_price(kite, spot_sym_full, config['start'], spot_token=config.get('spot_token'))
         
         if spot_ltp == 0:
             print(f"[{get_now_str()}] Error: Could not fetch Spot Price for {spot_sym_full}", flush=True)
@@ -978,10 +1009,11 @@ def run_trading_process():
         
         # --- ATM FINDER LOGIC ---
         if config.get('find_atm', True):
-            atm_strike = find_best_atm_strike(kite, mathematical_atm, nifty_options, step=STRIKE_STEP, exchange=OPT_EXCHANGE)
+            atm_strike, atm_ltp_data = find_best_atm_strike(kite, mathematical_atm, nifty_options, step=STRIKE_STEP, exchange=OPT_EXCHANGE)
         else:
             print(f"[{get_now_str()}] ATM Finder Disabled. Using Mathematical ATM: {mathematical_atm}", flush=True)
             atm_strike = mathematical_atm
+            atm_ltp_data = {}
         
         strike_gap = config['strike_gap']
         entry_put_strike = atm_strike + (strike_gap * STRIKE_STEP)
@@ -990,9 +1022,23 @@ def run_trading_process():
         token_entry_put, sym_entry_put = get_token_and_symbol(nifty_options, entry_put_strike, 'PE')
         token_entry_call, sym_entry_call = get_token_and_symbol(nifty_options, entry_call_strike, 'CE')
         
-        initial_prices = get_ltp_safe(kite, [f"{OPT_EXCHANGE}:{sym_entry_put}", f"{OPT_EXCHANGE}:{sym_entry_call}"])
-        price_put = initial_prices.get(f"{OPT_EXCHANGE}:{sym_entry_put}", {}).get('last_price', 0)
-        price_call = initial_prices.get(f"{OPT_EXCHANGE}:{sym_entry_call}", {}).get('last_price', 0)
+        sym_put_full = f"{OPT_EXCHANGE}:{sym_entry_put}"
+        sym_call_full = f"{OPT_EXCHANGE}:{sym_entry_call}"
+        price_put = atm_ltp_data.get(sym_put_full, {}).get('last_price', 0)
+        price_call = atm_ltp_data.get(sym_call_full, {}).get('last_price', 0)
+
+        # Cache check: only query Kite if missing from ATM scan cache (0ms on cache hit)
+        missing_entry_syms = []
+        if price_put == 0: missing_entry_syms.append(sym_put_full)
+        if price_call == 0: missing_entry_syms.append(sym_call_full)
+
+        if missing_entry_syms:
+            print(f"[{get_now_str()}] [CACHE MISS] Fetching entry strikes not in ATM scan: {missing_entry_syms}", flush=True)
+            fresh_prices = get_ltp_safe(kite, missing_entry_syms)
+            if price_put == 0: price_put = fresh_prices.get(sym_put_full, {}).get('last_price', 0)
+            if price_call == 0: price_call = fresh_prices.get(sym_call_full, {}).get('last_price', 0)
+        else:
+            print(f"[{get_now_str()}] [CACHE HIT] Entry strikes resolved instantly from ATM scan cache (0ms delay)", flush=True)
         
         print(f"[{get_now_str()}] Skew Balance Check | Before | PE Strike: {entry_put_strike} ({sym_entry_put}) | PE Price: {price_put} | CE Strike: {entry_call_strike} ({sym_entry_call}) | CE Price: {price_call} | Threshold: 1.25x", flush=True)
         if price_put > 1.25 * price_call:
@@ -1036,14 +1082,18 @@ def run_trading_process():
         token_spot_index = None            # Used by WebSocket (Bot 7 only)
 
         if INDEX_BASED_ENTRY:
-            try:
-                spot_quote = kite.quote(spot_sym_full)
-                token_spot_index = spot_quote.get(spot_sym_full, {}).get('instrument_token')
-                print(f"[{get_now_str()}] Index Based Entry | Spot index token: {token_spot_index} ({spot_sym_full})", flush=True)
-            except Exception as e:
-                print(f"[{get_now_str()}] Index Based Entry | WARNING: Could not fetch spot index token: {e}. Disabling INDEX_BASED_ENTRY.", flush=True)
-                INDEX_BASED_ENTRY = False
-                token_spot_index = None
+            token_spot_index = config.get('spot_token')
+            if token_spot_index:
+                print(f"[{get_now_str()}] Index Based Entry | Spot index token (from config): {token_spot_index} ({spot_sym_full})", flush=True)
+            else:
+                try:
+                    spot_quote = kite.quote(spot_sym_full)
+                    token_spot_index = spot_quote.get(spot_sym_full, {}).get('instrument_token')
+                    print(f"[{get_now_str()}] Index Based Entry | Spot index token: {token_spot_index} ({spot_sym_full})", flush=True)
+                except Exception as e:
+                    print(f"[{get_now_str()}] Index Based Entry | WARNING: Could not fetch spot index token: {e}. Disabling INDEX_BASED_ENTRY.", flush=True)
+                    INDEX_BASED_ENTRY = False
+                    token_spot_index = None
 
         # --- WebSocket subscriptions (Bot 7) ---
         sub_tokens = [t for t in [token_entry_put, token_entry_call, token_hedge_put, token_hedge_call, token_buy_ce, token_buy_pe] if t]
