@@ -3,7 +3,7 @@ TriggerEngine — stop/target/pnl_target exits + price and candle-close alerts.
 
 Alert periods:
   current — checked every tick against LTP
-  1m / 5m — checked against the CLOSE price of completed 1m/5m candles
+  1m / 5m / 15m / 30m / 1h — checked against the CLOSE price of the just-completed candle
 """
 from __future__ import annotations
 import asyncio
@@ -16,6 +16,10 @@ import redis.asyncio as aioredis
 
 from common.models import Alert
 from common import redis_keys, settings
+from common.periods import (
+    CANDLE_PERIODS, LEGACY_PERIODS, closed_candle_open_ms,
+    is_boundary, select_closed_candle,
+)
 
 if TYPE_CHECKING:
     from trading_engine.trade_slot   import SlotManager
@@ -120,8 +124,8 @@ class TriggerEngine:
             if alert.triggered:
                 continue
             period = getattr(alert, 'period', 'current')
-            if period in ('1m', '5m'):
-                continue   # handled by _candle_clock_task
+            if period != 'current':
+                continue   # candle-close periods are handled by _candle_clock_task
             ltp = await self._ltp(alert.exchange, alert.symbol)
             if ltp <= 0:
                 continue
@@ -143,8 +147,9 @@ class TriggerEngine:
         (the extra second lets the exchange REST endpoint reflect the
         just-closed candle before we query it).
 
-        At each 1 m boundary  → evaluates all 1 m candle-close alerts.
-        At each 5 m boundary  → also evaluates all 5 m candle-close alerts.
+        At each 1 m boundary  → evaluates all 1 m candle-close alerts / fire-on slots.
+        At each 5/15/30/60 m boundary (UTC-epoch aligned) → also evaluates the
+        alerts and fire-on slots set for that period (common/periods.py).
 
         Fetches official OHLC via the exchange REST API (fetch_ohlcv) so the
         close price is the exchange-confirmed final value — not a live tick.
@@ -152,14 +157,16 @@ class TriggerEngine:
         """
         while True:
             try:
-                # Sleep until next 1 m boundary + 1 s
+                # Sleep until the next 1 m boundary + 1 s (the extra second lets
+                # the exchange REST endpoint reflect the just-closed candle)
                 now      = datetime.now(timezone.utc)
-                next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-                sleep_s  = (next_min - now).total_seconds() + 1.0
-                await asyncio.sleep(max(sleep_s, 0.1))
+                boundary = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                await asyncio.sleep(max((boundary - now).total_seconds() + 1.0, 0.1))
 
-                now   = datetime.now(timezone.utc)
-                is_5m = (now.minute % 5 == 0)
+                # Periods whose candle closed at this boundary: 1m always, the
+                # rest by UTC-epoch alignment (see common/periods.py)
+                due = [iv for iv in CANDLE_PERIODS if is_boundary(boundary, iv)]
+                cache: dict[tuple, float] = {}   # one REST fetch per (exch, symbol, period) per wake
 
                 # Build {(exchange, symbol, interval): [alerts]} mapping
                 needed: dict[tuple, list] = {}
@@ -167,16 +174,13 @@ class TriggerEngine:
                     if alert.triggered:
                         continue
                     period = getattr(alert, 'period', 'current')
-                    if period == '1m':
-                        k = (alert.exchange, alert.symbol, '1m')
-                        needed.setdefault(k, []).append(alert)
-                    elif period == '5m' and is_5m:
-                        k = (alert.exchange, alert.symbol, '5m')
+                    if period in due:
+                        k = (alert.exchange, alert.symbol, period)
                         needed.setdefault(k, []).append(alert)
 
                 for (exchange, symbol, interval), alerts in needed.items():
-                    close = await self._fetch_closed_candle_close(
-                        exchange, symbol, interval
+                    close = await self._closed_close(
+                        cache, exchange, symbol, interval, boundary
                     )
                     if not close or close <= 0:
                         logger.debug(
@@ -207,8 +211,8 @@ class TriggerEngine:
                     fire_on = getattr(slot, 'fire_on', None)
                     if not fire_on:
                         continue
-                    if fire_on == '5m' and not is_5m:
-                        continue   # 5m slot only fires at 5m boundaries
+                    if fire_on not in due:
+                        continue   # slot only fires when its own candle closes
 
                     entry = slot.entries[0] if slot.entries else None
                     if not entry:
@@ -216,8 +220,8 @@ class TriggerEngine:
                     ep         = entry.price or 0.0
                     order_type = entry.order_type or 'limit'
 
-                    close_c = await self._fetch_closed_candle_close(
-                        slot.exchange, slot.symbol, fire_on
+                    close_c = await self._closed_close(
+                        cache, slot.exchange, slot.symbol, fire_on, boundary
                     )
                     if close_c <= 0:
                         continue
@@ -244,30 +248,65 @@ class TriggerEngine:
             except Exception as exc:
                 logger.error("Candle clock task error: %s", exc)
 
+    async def _closed_close(
+        self, cache: dict, exchange: str, symbol: str, interval: str,
+        boundary: datetime,
+    ) -> float:
+        """One fetch per (exchange, symbol, interval) per clock wake — alerts and
+        conditional slots waiting on the same candle share the result."""
+        key = (exchange, symbol, interval)
+        if key not in cache:
+            cache[key] = await self._fetch_closed_candle_close(
+                exchange, symbol, interval, boundary
+            )
+        return cache[key]
+
     async def _fetch_closed_candle_close(
-        self, exchange: str, symbol: str, interval: str
+        self, exchange: str, symbol: str, interval: str, boundary: datetime
     ) -> float:
         """
-        Returns the close price of the most recently COMPLETED candle.
+        Returns the close of the candle that closed at `boundary`, or 0.0 if it
+        cannot be determined (the caller then skips that check).
 
-        1. Tries the exchange REST API (fetch_ohlcv limit=3).
-           ccxt returns rows sorted oldest-first; the last row may be the
-           current open (unclosed) candle, so we take [-2].
-        2. Falls back to the latest_candle Redis key if the adapter is
-           unavailable or the call fails.
+        1. Exchange REST (fetch_ohlcv limit=3). The row is picked by OPEN TIME
+           == boundary - interval, never by list position, so an empty interval
+           (no trades) or a REST response that lags the boundary cannot yield
+           the wrong candle. One retry after 2 s.
+        2. Legacy 1m/5m only, when REST returned nothing at all (adapter without
+           fetch_ohlcv, or a failed call): the latest_candle Redis key.
         """
         adapter = self._adapters.get(exchange)
         if adapter:
-            try:
-                ohlcvs = await adapter.fetch_ohlcv(symbol, interval, limit=3)
-                if len(ohlcvs) >= 2:
-                    _ts, _o, _h, _l, close, _v = ohlcvs[-2]
-                    return float(close)
-            except Exception as exc:
+            got_rows = False
+            for attempt in (0, 1):
+                ohlcvs: list = []
+                try:
+                    ohlcvs = await adapter.fetch_ohlcv(symbol, interval, limit=3) or []
+                except Exception as exc:
+                    logger.warning(
+                        "fetch_ohlcv REST [%s %s %s]: %s",
+                        exchange, symbol, interval, exc,
+                    )
+                if ohlcvs:
+                    got_rows = True
+                    row = select_closed_candle(ohlcvs, boundary, interval)
+                    if row is not None:
+                        return float(row[4])
+                elif interval in LEGACY_PERIODS:
+                    break   # no REST data (unsupported/failed) -> Redis fallback below
+                if attempt == 0:
+                    await asyncio.sleep(2.0)
+            if got_rows:
                 logger.warning(
-                    "fetch_ohlcv REST [%s %s %s]: %s",
-                    exchange, symbol, interval, exc,
+                    "Closed %s candle (open ts %s) not in REST response for %s %s - check skipped",
+                    interval, closed_candle_open_ms(boundary, interval), exchange, symbol,
                 )
+                return 0.0
+
+        # Longer periods have no safe fallback: the Redis candle is the still-forming
+        # candle, so using it would evaluate the wrong close. Skip instead.
+        if interval not in LEGACY_PERIODS:
+            return 0.0
 
         # Fallback — read from Redis (populated by market-data service)
         try:

@@ -82,7 +82,7 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                     ui.label(side.upper()).classes(f'w-12 {side_color}')
                     type_label = ('STOP'   if is_vstop else
                                   'TARGET' if is_vtgt  else
-                                  f"COND {_ot_label(o.get('order_type',''))}" if is_vcond else
+                                  f"COND {(slot_data or {}).get('fire_on') or ''} {_ot_label(o.get('order_type',''))}".replace('  ', ' ') if is_vcond else
                                   _ot_label(o.get('order_type', '')))
                     type_color = ('text-orange-400' if is_vstop else
                                   'text-blue-400'   if is_vtgt  else

@@ -132,7 +132,7 @@ class TradeSlot(BaseModel):
     closed_at:        Optional[datetime] = None
     realized_pnl:     float           = 0.0
     pnl_target:       Optional[float] = None   # close when unrealized PnL reaches this value
-    fire_on:          Optional[Literal['1m', '5m']] = None   # candle-close conditional entry
+    fire_on:          Optional[Literal['1m', '5m', '15m', '30m', '1h']] = None   # candle-close conditional entry
 
 # ── Alerts ─────────────────────────────────────────────────────────────────────
 
@@ -143,7 +143,7 @@ class Alert(BaseModel):
     symbol:     str
     upper:      Optional[float] = None
     lower:      Optional[float] = None
-    period:     Literal['current', '1m', '5m'] = 'current'
+    period:     Literal['current', '1m', '5m', '15m', '30m', '1h'] = 'current'
     triggered:  bool            = False
     created_at: datetime        = Field(default_factory=datetime.utcnow)
     # Optional: when set, this alert also places an entry order when triggered

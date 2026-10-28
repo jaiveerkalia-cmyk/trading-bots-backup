@@ -11,6 +11,7 @@ from nicegui import ui
 import redis.asyncio as aioredis
 from ui import commands
 from common import settings
+from common.periods import CANDLE_PERIODS, periods_for_exchange
 
 if TYPE_CHECKING:
     from ui.state import UIState
@@ -19,6 +20,14 @@ if TYPE_CHECKING:
 def _fees(exchange: str) -> tuple[float, float]:
     f = settings.EXCHANGE_FEES.get(exchange, {'maker': 0.001, 'taker': 0.001})
     return f['maker'], f['taker']
+
+
+def _fire_on_options(exchange: str) -> dict[str, str]:
+    """'Fire on' choices for `exchange` (periods come from common/periods.py)."""
+    opts = {'current': 'Live'}
+    for p in periods_for_exchange(exchange):
+        opts[p] = f'{p} Close' + (' (UTC bar)' if p == '1h' else '')
+    return opts
 
 
 def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
@@ -43,6 +52,7 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
     refs     = {}
     # Initialise had_pos with sym key to prevent false clears on context changes
     had_pos  = {'v': None, 'sym': None}
+    last_exch = {'v': shared.get('exchange', 'binance_futures')}   # detects exchange switch
 
     with ui.card().classes(
         f'w-full p-3 bg-gray-900 border border-{accent}-900 rounded-lg'
@@ -168,7 +178,7 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         with ui.row().classes('w-full items-center gap-2 mb-2'):
             ui.label('Fire on:').classes('text-xs text-gray-500 shrink-0')
             fire_on_sel = ui.select(
-                {'current': 'Live', '1m': '1m Close', '5m': '5m Close'},
+                _fire_on_options(shared.get('exchange', 'binance_futures')),
                 value='current',
                 on_change=lambda e: f.update({'fire_on': e.value}),
             ).props('dense dark outlined').classes('flex-1')
@@ -191,6 +201,18 @@ def build(side: str, state: 'UIState', redis: aioredis.Redis, shared: dict) -> d
         _recalc(f, shared, refs, state)
 
     def update() -> None:
+        # Exchange switched -> refresh the 'Fire on' choices (e.g. Delta: 1m/5m only)
+        exch = shared.get('exchange', 'binance_futures')
+        if exch != last_exch['v']:
+            last_exch['v'] = exch
+            opts = _fire_on_options(exch)
+            try:
+                if f.get('fire_on', 'current') not in opts:
+                    fire_on_sel.set_value('current')
+                fire_on_sel.set_options(opts)
+            except Exception:
+                pass
+
         ctx_lbl.set_text(
             f"{shared.get('exchange','').upper().replace('_FUTURES','-F').replace('BINANCE','BNF')}"
             f"  ·  {shared.get('symbol','')}"
@@ -494,15 +516,19 @@ async def _place(side: str, f: dict, shared: dict,
 
     # ── Conditional order (1m / 5m candle close) ───────────────────────
     fire_on = f.get('fire_on', 'current')
-    if fire_on in ('1m', '5m') and order_type == 'market':
+    exchange = shared.get('exchange', 'binance_futures')
+    is_cond = fire_on in CANDLE_PERIODS
+    if is_cond and fire_on not in periods_for_exchange(exchange):
+        ui.notify(f'{fire_on} candle-close orders are not supported on this exchange',
+                  type='warning')
+        return
+    if is_cond and order_type == 'market':
         ui.notify('Candle-close orders require Limit or Stop Market order type',
                   type='warning')
         return
-    if fire_on in ('1m', '5m') and entry <= 0:
+    if is_cond and entry <= 0:
         ui.notify('Set entry price for candle-close order', type='negative')
         return
-
-    exchange = shared.get('exchange', 'binance_futures')
     balance  = max(shared.get('balance', 0), 1)
     pos_usd  = (entry or ref_price or 1) * qty
     eff_lev  = max(1, min(int(pos_usd / balance) + 1, 125))
@@ -527,10 +553,10 @@ async def _place(side: str, f: dict, shared: dict,
         'qty_mode':     'base',
         'risk_pct':     shared.get('risk_pct', settings.DEFAULT_RISK_PCT),
         'is_paper':     not state.live_mode,
-        'fire_on':      fire_on if fire_on in ('1m', '5m') else None,
+        'fire_on':      fire_on if is_cond else None,
     })
 
-    cond_label = (f'{fire_on.upper()} candle-close' if fire_on in ('1m', '5m') else
+    cond_label = (f'{fire_on.upper()} candle-close' if is_cond else
                   'Stop Market' if order_type == 'stop_limit' else order_type)
     ui.notify(
         f'{"Long" if side == "long" else "Short"} {cond_label} queued',

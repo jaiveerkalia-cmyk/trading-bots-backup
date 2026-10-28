@@ -23,6 +23,7 @@ import redis.asyncio as aioredis
 from common import redis_keys, settings
 from common.key_manager import load_keys
 from common.models import Order, TradeSlot, Alert
+from common.periods import LEGACY_PERIODS, periods_for_exchange
 from exchanges.base     import BaseExchangeAdapter
 from exchanges.registry import get_adapter
 from trading_engine.csv_writer      import CSVWriter
@@ -334,6 +335,14 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
             return
 
         if getattr(new_slot, 'fire_on', None):
+            if new_slot.fire_on not in periods_for_exchange(new_slot.exchange):
+                sp.log(
+                    f"Conditional order rejected: {new_slot.fire_on} candle-close "
+                    f"not supported on {new_slot.exchange}",
+                    level='warning',
+                    exchange=new_slot.exchange, symbol=new_slot.symbol,
+                )
+                return
             new_slot.status = 'conditional'
             slot  = await sm.create_slot(new_slot)
             entry = slot.entries[0] if slot.entries else None
@@ -543,11 +552,18 @@ async def _handle(cmd, sm, om, sp, pe, redis, cw) -> None:
         raw_alert = cmd.get('alert', {})
         try:
             alert = Alert.model_validate(raw_alert) if isinstance(raw_alert, dict) else raw_alert
+            period = getattr(alert, 'period', 'current')
+            if period != 'current' and period not in periods_for_exchange(alert.exchange):
+                sp.log(
+                    f"Alert rejected: {period} candle-close not supported on {alert.exchange}",
+                    level='warning', exchange=alert.exchange, symbol=alert.symbol,
+                )
+                return
             await sm.add_alert(alert)
             await _sub_md(redis, alert.exchange, alert.symbol)
-            # Subscribe to candle data for 1m/5m candle-close alerts
-            period = getattr(alert, 'period', 'current')
-            if period in ('1m', '5m'):
+            # Legacy 1m/5m only: also stream candles (Redis fallback for exchanges
+            # without REST fetch_ohlcv). Longer periods are evaluated from REST.
+            if period in LEGACY_PERIODS:
                 await _sub_md(redis, alert.exchange, alert.symbol,
                               streams=['ticker', f'candles:{period}'])
             sp.log(f"Alert set {alert.exchange} {alert.symbol} ({period})",

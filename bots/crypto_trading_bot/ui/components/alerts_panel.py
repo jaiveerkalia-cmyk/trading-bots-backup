@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from nicegui import ui
 import redis.asyncio as aioredis
 from ui import commands
+from common.periods import periods_for_exchange
 
 if TYPE_CHECKING:
     from ui.state import UIState
@@ -74,6 +75,14 @@ def _play(name: str, dur: float) -> None:
     ui.run_javascript(_WRAPPER.format(body=body, dur=max(0.1, dur)))
 
 
+def _period_options(exchange: str) -> dict[str, str]:
+    """'Fire on' choices for `exchange` (periods come from common/periods.py)."""
+    opts = {'current': 'Live Price'}
+    for p in periods_for_exchange(exchange):
+        opts[p] = f'{p} Candle Close' + (' (UTC bar)' if p == '1h' else '')
+    return opts
+
+
 def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
     sound_cfg = {
         'enabled':  state.ui_prefs.get('alert_enabled', True),
@@ -82,6 +91,7 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
     }
     prev_triggered: set[str] = set()
     period_ref  = {'v': 'current'}   # shared between upper and lower set functions
+    last_exch   = {'v': shared.get('exchange', 'binance_futures')}   # detects exchange switch
     co_period   = {'v': '1m'}        # conditional order period
     editing: dict[str, dict] = {}    # alert_id -> {upper, lower, period} being edited
 
@@ -97,8 +107,8 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
 
         # Period selector (shared for both upper and lower)
         with ui.row().classes('w-full mb-2'):
-            ui.select(
-                {'current': 'Live Price', '1m': '1m Candle Close', '5m': '5m Candle Close'},
+            period_sel = ui.select(
+                _period_options(shared.get('exchange', 'binance_futures')),
                 value='current', label='Fire on',
                 on_change=lambda e: period_ref.update({'v': e.value}),
             ).props('dense dark outlined').classes('w-full')
@@ -112,6 +122,11 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                 v = float(upper_inp.value) if upper_inp.value else None
                 if not v:
                     ui.notify('Enter upper price', type='warning', position='bottom-right')
+                    return
+                if (period_ref['v'] != 'current' and period_ref['v']
+                        not in periods_for_exchange(shared.get('exchange', 'binance_futures'))):
+                    ui.notify(f"{period_ref['v']} candle close is not supported on this exchange",
+                              type='warning', position='bottom-right')
                     return
                 await commands.set_alert(redis, {
                     'exchange': shared.get('exchange', 'binance_futures'),
@@ -136,6 +151,11 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                 v = float(lower_inp.value) if lower_inp.value else None
                 if not v:
                     ui.notify('Enter lower price', type='warning', position='bottom-right')
+                    return
+                if (period_ref['v'] != 'current' and period_ref['v']
+                        not in periods_for_exchange(shared.get('exchange', 'binance_futures'))):
+                    ui.notify(f"{period_ref['v']} candle close is not supported on this exchange",
+                              type='warning', position='bottom-right')
                     return
                 await commands.set_alert(redis, {
                     'exchange': shared.get('exchange', 'binance_futures'),
@@ -250,7 +270,8 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
                                             ef.update({'lower': float(e.value or 0) or None}),
                                     ).props('dense dark outlined').classes('w-28')
                                 ui.select(
-                                    {'current': 'Live', '1m': '1m', '5m': '5m'},
+                                    {'current': 'Live',
+                                     **{p: p for p in periods_for_exchange(alert.get('exchange', ''))}},
                                     value=ef.get('period', 'current'),
                                     on_change=lambda e, ef=ef:
                                         ef.update({'period': e.value}),
@@ -309,6 +330,18 @@ def build(state: 'UIState', redis: aioredis.Redis, shared: dict) -> dict:
     prev_alert_hash = {'v': ''}
 
     def update() -> None:
+        # Exchange switched -> refresh the 'Fire on' choices (e.g. Delta: 1m/5m only)
+        exch = shared.get('exchange', 'binance_futures')
+        if exch != last_exch['v']:
+            last_exch['v'] = exch
+            opts = _period_options(exch)
+            try:
+                if period_ref['v'] not in opts:
+                    period_sel.set_value('current')
+                period_sel.set_options(opts)
+            except Exception:
+                pass
+
         # Keep prev_triggered in sync
         current_ids = {a.get('id', '') for a in state.alerts}
         prev_triggered.intersection_update(current_ids)
