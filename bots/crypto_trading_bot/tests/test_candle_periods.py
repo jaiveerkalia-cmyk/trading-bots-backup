@@ -144,6 +144,66 @@ def test_models_reject_unknown_period():
             raise AssertionError(f'Alert accepted bad period {bad}')
 
 
+# ── Public kline REST (engine adapters are not connected in paper mode) ───────────────
+
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status, self._payload = status, payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, status, payload):
+        self.status, self.payload, self.calls = status, payload, []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params))
+        return _FakeResp(self.status, self.payload)
+
+
+def test_native_symbol():
+    from common import klines
+    assert klines.native_symbol('BTC/USDT') == 'BTCUSDT'
+    assert klines.native_symbol('BTC/USDT:USDT') == 'BTCUSDT'
+    assert klines.native_symbol('xau/usdt') == 'XAUUSDT'
+
+
+def test_fetch_klines_parses_rows_and_builds_request():
+    import asyncio
+    from common import klines
+    payload = [
+        [1000, '1.0', '2.0', '0.5', '1.5', '10', 1999, '0', 5, '1', '1', '0'],
+        [2000, '1.5', '3.0', '1.0', '2.5', '20', 2999, '0', 6, '1', '1', '0'],
+        ['bad'],
+    ]
+    s = _FakeSession(200, payload)
+    rows = asyncio.run(klines.fetch_klines(s, 'binance_futures', 'BTC/USDT', '15m', limit=3))
+    assert rows == [[1000, 1.0, 2.0, 0.5, 1.5, 10.0], [2000, 1.5, 3.0, 1.0, 2.5, 20.0]]
+    url, params = s.calls[0]
+    assert url == 'https://fapi.binance.com/fapi/v1/klines'
+    assert params == {'symbol': 'BTCUSDT', 'interval': '15m', 'limit': 3}
+    s2 = _FakeSession(200, payload)
+    asyncio.run(klines.fetch_klines(s2, 'binance', 'ETH/USDT', '1h'))
+    assert s2.calls[0][0] == 'https://api.binance.com/api/v3/klines'
+
+
+def test_fetch_klines_failures_return_empty():
+    import asyncio
+    from common import klines
+    assert asyncio.run(klines.fetch_klines(_FakeSession(429, []), 'binance_futures', 'BTC/USDT', '15m')) == []
+    assert asyncio.run(klines.fetch_klines(_FakeSession(200, {'code': -1121}), 'binance_futures', 'X/USDT', '15m')) == []
+    assert asyncio.run(klines.fetch_klines(_FakeSession(200, []), 'delta', 'BTC/USDT', '15m')) == []
+    assert klines.supports('binance_futures') and klines.supports('binance') and not klines.supports('delta')
+
+
 if __name__ == '__main__':
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith('test_') and callable(f)]
     failed = 0

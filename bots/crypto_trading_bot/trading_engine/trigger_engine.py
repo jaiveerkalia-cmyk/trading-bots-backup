@@ -12,10 +12,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 
+import aiohttp
 import redis.asyncio as aioredis
 
 from common.models import Alert
-from common import redis_keys, settings
+from common import klines, redis_keys, settings
 from common.periods import (
     CANDLE_PERIODS, LEGACY_PERIODS, closed_candle_open_ms,
     is_boundary, select_closed_candle,
@@ -30,7 +31,7 @@ logger = logging.getLogger('trigger_engine')
 
 class TriggerEngine:
     __slots__ = ('_redis', '_slots', '_paper', '_on_exit', '_on_alert',
-                 '_task', '_clock_task', '_adapters', '_on_conditional')
+                 '_task', '_clock_task', '_adapters', '_on_conditional', '_http')
 
     def __init__(
         self,
@@ -51,6 +52,7 @@ class TriggerEngine:
         self._on_conditional = on_conditional
         self._task:        asyncio.Task | None = None
         self._clock_task:  asyncio.Task | None = None
+        self._http:        Optional[aiohttp.ClientSession] = None   # public kline REST
 
     async def start(self) -> None:
         self._task       = asyncio.create_task(self._loop())
@@ -62,6 +64,8 @@ class TriggerEngine:
             self._task.cancel()
         if self._clock_task:
             self._clock_task.cancel()
+        if self._http and not self._http.closed:
+            await self._http.close()
 
     async def _loop(self) -> None:
         while True:
@@ -261,6 +265,30 @@ class TriggerEngine:
             )
         return cache[key]
 
+    async def _fetch_rows(self, exchange: str, symbol: str, interval: str) -> list:
+        """
+        OHLCV rows [[ts_ms, o, h, l, c, v], ...] oldest-first, or [].
+
+        Public Binance REST first (no ccxt, no keys). The engine's adapters are
+        NOT connected in paper mode, so adapter.fetch_ohlcv() alone returns [].
+        The adapter is kept as a second source (it works once connected).
+        """
+        if klines.supports(exchange):
+            if self._http is None or self._http.closed:
+                self._http = aiohttp.ClientSession()
+            rows = await klines.fetch_klines(self._http, exchange, symbol, interval, limit=3)
+            if rows:
+                return rows
+        adapter = self._adapters.get(exchange)
+        if adapter:
+            try:
+                return await adapter.fetch_ohlcv(symbol, interval, limit=3) or []
+            except Exception as exc:
+                logger.warning(
+                    "fetch_ohlcv [%s %s %s]: %s", exchange, symbol, interval, exc,
+                )
+        return []
+
     async def _fetch_closed_candle_close(
         self, exchange: str, symbol: str, interval: str, boundary: datetime
     ) -> float:
@@ -268,44 +296,37 @@ class TriggerEngine:
         Returns the close of the candle that closed at `boundary`, or 0.0 if it
         cannot be determined (the caller then skips that check).
 
-        1. Exchange REST (fetch_ohlcv limit=3). The row is picked by OPEN TIME
+        1. Public Binance REST klines (limit=3), then the adapter. The row is picked by OPEN TIME
            == boundary - interval, never by list position, so an empty interval
            (no trades) or a REST response that lags the boundary cannot yield
            the wrong candle. One retry after 2 s.
         2. Legacy 1m/5m only, when REST returned nothing at all (adapter without
            fetch_ohlcv, or a failed call): the latest_candle Redis key.
         """
-        adapter = self._adapters.get(exchange)
-        if adapter:
-            got_rows = False
-            for attempt in (0, 1):
-                ohlcvs: list = []
-                try:
-                    ohlcvs = await adapter.fetch_ohlcv(symbol, interval, limit=3) or []
-                except Exception as exc:
-                    logger.warning(
-                        "fetch_ohlcv REST [%s %s %s]: %s",
-                        exchange, symbol, interval, exc,
-                    )
-                if ohlcvs:
-                    got_rows = True
-                    row = select_closed_candle(ohlcvs, boundary, interval)
-                    if row is not None:
-                        return float(row[4])
-                elif interval in LEGACY_PERIODS:
-                    break   # no REST data (unsupported/failed) -> Redis fallback below
-                if attempt == 0:
-                    await asyncio.sleep(2.0)
-            if got_rows:
-                logger.warning(
-                    "Closed %s candle (open ts %s) not in REST response for %s %s - check skipped",
-                    interval, closed_candle_open_ms(boundary, interval), exchange, symbol,
-                )
-                return 0.0
+        got_rows = False
+        for attempt in (0, 1):
+            ohlcvs = await self._fetch_rows(exchange, symbol, interval)
+            if ohlcvs:
+                got_rows = True
+                row = select_closed_candle(ohlcvs, boundary, interval)
+                if row is not None:
+                    return float(row[4])
+            elif interval in LEGACY_PERIODS:
+                break   # no REST data (unsupported/failed) -> Redis fallback below
+            if attempt == 0:
+                await asyncio.sleep(2.0)
+        if got_rows:
+            logger.warning(
+                "Closed %s candle (open ts %s) not in REST response for %s %s - check skipped",
+                interval, closed_candle_open_ms(boundary, interval), exchange, symbol,
+            )
+            return 0.0
 
         # Longer periods have no safe fallback: the Redis candle is the still-forming
         # candle, so using it would evaluate the wrong close. Skip instead.
         if interval not in LEGACY_PERIODS:
+            logger.warning("No kline data for %s %s %s - check skipped",
+                           exchange, symbol, interval)
             return 0.0
 
         # Fallback — read from Redis (populated by market-data service)
