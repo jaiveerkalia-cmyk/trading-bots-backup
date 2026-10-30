@@ -64,6 +64,12 @@ async def shutdown() -> None:
         await _redis.aclose()
 
 
+@app.get('/healthz')
+async def healthz() -> JSONResponse:
+    """Tiny liveness probe for the page's auto-reload watchdog (builds no page)."""
+    return JSONResponse({'ok': True}, headers={'Cache-Control': 'no-store'})
+
+
 # ── TradingView chart storage API ─────────────────────────────────────────────
 # Allows the TradingView widget to save/load drawings, indicators, and layouts.
 # Requests come from TradingView's iframe (origin: tradingview.com).
@@ -208,6 +214,35 @@ async def index() -> None:
           .q-table tbody tr td { font-size:11px;color:#d1d5db; }
           .q-table tbody tr:hover td { background:#1f2937 !important; }
         </style>
+    """)
+    ui.add_head_html("""
+        <script>
+        // Auto-reload after the SSH tunnel / server connection drops and comes back.
+        // Reloads only once the server answers again (reloading during the outage
+        // would land on the browser's error page). Short blips (< MIN_DOWN_MS) are
+        // left to NiceGUI's own reconnect.
+        (function () {
+          const PROBE_MS = 2000, TIMEOUT_MS = 2500, MIN_DOWN_MS = 3500;
+          let downSince = null;
+          async function probe() {
+            try {
+              const ctl = new AbortController();
+              const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+              const r = await fetch('/healthz', {cache: 'no-store', signal: ctl.signal});
+              clearTimeout(timer);
+              if (!r.ok) throw new Error('bad status ' + r.status);
+              if (downSince !== null) {
+                const down = Date.now() - downSince;
+                downSince = null;
+                if (down >= MIN_DOWN_MS) { location.reload(); }
+              }
+            } catch (e) {
+              if (downSince === null) { downSince = Date.now(); }
+            }
+          }
+          setInterval(probe, PROBE_MS);
+        })();
+        </script>
     """)
     ui.dark_mode(True)
 
