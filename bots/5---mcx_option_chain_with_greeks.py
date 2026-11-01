@@ -1,9 +1,11 @@
 import csv
+import gc
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from kiteconnect import KiteConnect
 
@@ -35,8 +37,15 @@ COLLECTION_GRACE_SECONDS = 5
 AUTH_PATH = '/app/config/auth.txt'
 DATA_ROOT = '/app/data/MCX_options_data'
 
+# Compact quote tuple indices: (oi, volume, sell_depth_price, buy_depth_price, last_price)
+Q_OI = 0
+Q_VOLUME = 1
+Q_SELL = 2
+Q_BUY = 3
+Q_LTP = 4
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class StrikePair:
     # A single strike is only usable when we have both CE and PE symbols.
     strike: float
@@ -44,7 +53,7 @@ class StrikePair:
     put_symbol: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OptionBook:
     # One output CSV corresponds to one commodity symbol + one option expiry.
     symbol: str
@@ -55,7 +64,7 @@ class OptionBook:
     pairs: Tuple[StrikePair, ...]
 
 
-@dataclass
+@dataclass(slots=True)
 class MarketState:
     # Daily cache of instrument metadata so the hot path only does quote fetch + CSV append.
     kite: KiteConnect
@@ -122,13 +131,75 @@ def choose_nearest_future_symbol(
     )[1]
 
 
+def extract_compact_quote(quote: Optional[dict]) -> Tuple[float, float, float, float, float]:
+    """Extract only the required 5 values into a compact tuple:
+    (oi, volume, sell_depth_price, buy_depth_price, last_price).
+    This immediately discards heavy nested depth/ohlc dictionaries to save RAM.
+    """
+    if not isinstance(quote, dict):
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    try:
+        oi = float(quote.get('oi') or 0)
+    except (TypeError, ValueError):
+        oi = 0.0
+    try:
+        volume = float(quote.get('volume') or 0)
+    except (TypeError, ValueError):
+        volume = 0.0
+    try:
+        last_price = float(quote.get('last_price') or 0)
+    except (TypeError, ValueError):
+        last_price = 0.0
+
+    sell_price = 0.0
+    buy_price = 0.0
+    depth = quote.get('depth')
+    if isinstance(depth, dict):
+        sell_list = depth.get('sell')
+        if sell_list and isinstance(sell_list, list):
+            first_sell = sell_list[0]
+            if isinstance(first_sell, dict):
+                try:
+                    sell_price = float(first_sell.get('price') or 0)
+                except (TypeError, ValueError):
+                    sell_price = 0.0
+        buy_list = depth.get('buy')
+        if buy_list and isinstance(buy_list, list):
+            first_buy = buy_list[0]
+            if isinstance(first_buy, dict):
+                try:
+                    buy_price = float(first_buy.get('price') or 0)
+                except (TypeError, ValueError):
+                    buy_price = 0.0
+
+    return (oi, volume, sell_price, buy_price, last_price)
+
+
+def get_depth_price(quote: dict, side: str) -> float:
+    # Kept for backward-compatibility with external callers.
+    try:
+        return float(quote.get('depth', {}).get(side, [{}])[0].get('price') or 0)
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+
+
+def get_number(quote: dict, key: str) -> float:
+    # Kept for backward-compatibility with external callers.
+    try:
+        return float(quote.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def prepare_market_state(base_dir: str) -> MarketState:
     # Build all reusable metadata once so each 15-minute cycle stays fast.
     api_key, access_token = parse_auth_file(get_auth_path(base_dir))
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
 
-    instruments = kite.instruments()
+    # Restrict to exchange='MCX' to avoid downloading 150k+ instruments across other exchanges.
+    instruments = kite.instruments(exchange='MCX')
     futures_by_symbol: Dict[str, List[Tuple[date, str]]] = {}
     option_rows: Dict[Tuple[str, date, float], Dict[str, str]] = {}
 
@@ -141,9 +212,10 @@ def prepare_market_state(base_dir: str) -> MarketState:
         if not symbol or not expiry_date or not tradingsymbol:
             continue
 
-        quote_symbol = f'MCX:{tradingsymbol}'
+        symbol_interned = sys.intern(str(symbol).strip())
+        quote_symbol = sys.intern(f'MCX:{tradingsymbol}')
         if segment == 'MCX-FUT':
-            futures_by_symbol.setdefault(symbol, []).append((expiry_date, quote_symbol))
+            futures_by_symbol.setdefault(symbol_interned, []).append((expiry_date, quote_symbol))
         elif segment == 'MCX-OPT':
             strike = instrument.get('strike')
             instrument_type = instrument.get('instrument_type')
@@ -151,7 +223,9 @@ def prepare_market_state(base_dir: str) -> MarketState:
                 continue
             # Store CE/PE legs under the same (symbol, expiry, strike) key so we
             # can quickly keep only complete pairs.
-            option_rows.setdefault((symbol, expiry_date, float(strike)), {})[instrument_type] = quote_symbol
+            option_rows.setdefault((symbol_interned, expiry_date, float(strike)), {})[instrument_type] = quote_symbol
+
+    del instruments
 
     for future_list in futures_by_symbol.values():
         future_list.sort(key=lambda item: item[0])
@@ -180,7 +254,7 @@ def prepare_market_state(base_dir: str) -> MarketState:
             continue
 
         pairs.sort(key=lambda item: item.strike)
-        expiry_text = expiry_date.strftime('%Y-%m-%d')
+        expiry_text = sys.intern(expiry_date.strftime('%Y-%m-%d'))
         output_path = os.path.join(output_root, symbol, f'{symbol}-{expiry_text}.csv')
 
         books.append(
@@ -199,6 +273,9 @@ def prepare_market_state(base_dir: str) -> MarketState:
             quote_symbol_set.add(pair.call_symbol)
             quote_symbol_set.add(pair.put_symbol)
 
+    del option_rows, futures_by_symbol, books_map
+    gc.collect()
+
     books.sort(key=lambda item: (item.symbol, item.expiry_date))
     if not books:
         raise ValueError('No MCX option books found from the instrument master')
@@ -212,7 +289,7 @@ def prepare_market_state(base_dir: str) -> MarketState:
     )
 
 
-def ensure_output_files(books: List[OptionBook]) -> None:
+def ensure_output_files(books: Sequence[OptionBook]) -> None:
     # Create folders and write the header only once per file.
     seen_paths = set()
     for book in books:
@@ -225,12 +302,14 @@ def ensure_output_files(books: List[OptionBook]) -> None:
                 csv.writer(handle).writerow(HEADER)
 
 
-def fetch_quotes(kite: KiteConnect, symbols: Tuple[str, ...]) -> Dict[str, dict]:
-    # Pull all futures and options in as few quote calls as possible.
-    # If Kite rejects a large request, back off the chunk size and retry.
+def fetch_quotes(
+    kite: KiteConnect,
+    symbols: Tuple[str, ...],
+) -> Dict[str, Tuple[float, float, float, float, float]]:
+    # Pull all futures and options in compact form with minimal memory overhead.
     # Zerodha's docs specify a 1 request/second rate limit for Quote APIs, so
     # we pace chunked /quote calls accordingly.
-    quotes: Dict[str, dict] = {}
+    quotes: Dict[str, Tuple[float, float, float, float, float]] = {}
     start_index = 0
     chunk_size = min(INITIAL_QUOTE_CHUNK_SIZE, len(symbols))
     last_request_at: Optional[float] = None
@@ -243,8 +322,11 @@ def fetch_quotes(kite: KiteConnect, symbols: Tuple[str, ...]) -> Dict[str, dict]
                 elapsed = time.monotonic() - last_request_at
                 if elapsed < QUOTE_REQUEST_INTERVAL_SECONDS:
                     time.sleep(QUOTE_REQUEST_INTERVAL_SECONDS - elapsed)
-            quotes.update(kite.quote(chunk))
+            raw_quotes = kite.quote(chunk)
             last_request_at = time.monotonic()
+            for sym, raw_quote in raw_quotes.items():
+                quotes[sys.intern(sym)] = extract_compact_quote(raw_quote)
+            del raw_quotes
             start_index = end_index
         except Exception as exc:
             last_request_at = time.monotonic()
@@ -258,32 +340,22 @@ def fetch_quotes(kite: KiteConnect, symbols: Tuple[str, ...]) -> Dict[str, dict]
     return quotes
 
 
-def get_depth_price(quote: dict, side: str) -> float:
-    # Missing depth is common for illiquid contracts, so fall back to 0 cleanly.
-    try:
-        return float(quote.get('depth', {}).get(side, [{}])[0].get('price') or 0)
-    except (IndexError, TypeError, ValueError):
-        return 0.0
-
-
-def get_number(quote: dict, key: str) -> float:
-    try:
-        return float(quote.get(key) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def build_rows_for_book(book: OptionBook, quotes: Dict[str, dict], timestamp_text: str) -> List[List[float]]:
+def build_rows_for_book(
+    book: OptionBook,
+    quotes: Dict[str, Tuple[float, float, float, float, float]],
+    timestamp_text: str,
+) -> List[list]:
     # Convert the quote payload for one expiry file into raw CSV rows.
     future_quote = quotes.get(book.future_symbol)
     if not future_quote:
         return []
 
-    future_price = get_number(future_quote, 'last_price')
+    future_price = future_quote[Q_LTP]
     if future_price == 0:
         return []
 
-    rows: List[List[float]] = []
+    rows: List[list] = []
+    expiry_text = book.expiry_text
     for pair in book.pairs:
         call_quote = quotes.get(pair.call_symbol)
         put_quote = quotes.get(pair.put_symbol)
@@ -292,18 +364,18 @@ def build_rows_for_book(book: OptionBook, quotes: Dict[str, dict], timestamp_tex
 
         rows.append(
             [
-                book.expiry_text,
+                expiry_text,
                 timestamp_text,
-                get_number(call_quote, 'oi'),
-                get_number(call_quote, 'volume'),
+                call_quote[Q_OI],
+                call_quote[Q_VOLUME],
                 # Use executable prices: ask in Buy columns, bid in Sell columns.
-                get_depth_price(call_quote, 'sell'),
-                get_depth_price(call_quote, 'buy'),
+                call_quote[Q_SELL],
+                call_quote[Q_BUY],
                 pair.strike,
-                get_depth_price(put_quote, 'sell'),
-                get_depth_price(put_quote, 'buy'),
-                get_number(put_quote, 'volume'),
-                get_number(put_quote, 'oi'),
+                put_quote[Q_SELL],
+                put_quote[Q_BUY],
+                put_quote[Q_VOLUME],
+                put_quote[Q_OI],
                 future_price,
             ]
         )
@@ -311,7 +383,7 @@ def build_rows_for_book(book: OptionBook, quotes: Dict[str, dict], timestamp_tex
     return rows
 
 
-def append_rows(output_path: str, rows: List[List[float]]) -> None:
+def append_rows(output_path: str, rows: Sequence[Sequence[object]]) -> None:
     if not rows:
         return
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -321,25 +393,35 @@ def append_rows(output_path: str, rows: List[List[float]]) -> None:
 
 def collect_option_chain(state: MarketState, timestamp_text: str) -> None:
     started_at = time.time()
-    quotes = fetch_quotes(state.kite, state.quote_symbols)
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        quotes = fetch_quotes(state.kite, state.quote_symbols)
 
-    written_files = 0
-    written_rows = 0
-    symbol_stats: Dict[str, Dict[str, int]] = {}
-    for book in state.books:
-        rows = build_rows_for_book(book, quotes, timestamp_text)
-        if not rows:
-            continue
-        append_rows(book.output_path, rows)
-        written_files += 1
-        written_rows += len(rows)
-        stats = symbol_stats.setdefault(book.symbol, {'files': 0, 'rows': 0})
-        stats['files'] += 1
-        stats['rows'] += len(rows)
-        log(
-            f'Done {book.symbol} {book.expiry_text} using {book.future_symbol}: '
-            f'{len(rows)} rows'
-        )
+        written_files = 0
+        written_rows = 0
+        symbol_stats: Dict[str, Dict[str, int]] = {}
+        for book in state.books:
+            rows = build_rows_for_book(book, quotes, timestamp_text)
+            if not rows:
+                continue
+            append_rows(book.output_path, rows)
+            written_files += 1
+            written_rows += len(rows)
+            stats = symbol_stats.setdefault(book.symbol, {'files': 0, 'rows': 0})
+            stats['files'] += 1
+            stats['rows'] += len(rows)
+            log(
+                f'Done {book.symbol} {book.expiry_text} using {book.future_symbol}: '
+                f'{len(rows)} rows'
+            )
+
+        del quotes
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect()
 
     elapsed = time.time() - started_at
     if symbol_stats:
