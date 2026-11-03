@@ -1,5 +1,6 @@
 import json
 import sys
+import os
 import time
 import subprocess
 import logging
@@ -8,14 +9,17 @@ from datetime import datetime
 from kiteconnect import KiteTicker
 
 # ── Config ────────────────────────────────────────────────────────────────────
-AUTH_PATH           = '/app/config/auth.txt'
-REDIS_HOST          = 'redis'
-REDIS_PORT          = 6379
-ACTIVE_TOKENS_KEY   = 'active_tokens'
-WORKER_START_TIME   = (7, 45)  # HH, MM — spawn worker
-WORKER_STOP_TIME    = (16, 0)  # HH, MM — kill worker + EOD cleanup
-POLL_INTERVAL       = 10       # Seconds between supervisor checks
-TOKEN_SYNC_INTERVAL = 2        # Seconds between token sync in worker
+AUTH_PATH            = '/app/config/auth.txt'
+REDIS_HOST           = 'redis'
+REDIS_PORT           = 6379
+ACTIVE_TOKENS_KEY    = 'active_tokens'
+WORKER_START_TIME    = (7, 45)  # HH, MM — spawn worker
+WORKER_STOP_TIME     = (16, 0)  # HH, MM — kill worker + EOD cleanup
+MARKET_HOURS_START   = (9, 16)  # HH, MM — start tick watchdog after market open
+MARKET_HOURS_STOP    = (15, 30) # HH, MM — stop tick watchdog at market close
+TICK_TIMEOUT_SECONDS = 60       # Max seconds without ticks before watchdog restarts worker
+POLL_INTERVAL        = 10       # Seconds between supervisor checks
+TOKEN_SYNC_INTERVAL  = 2        # Seconds between token sync in worker
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -52,20 +56,31 @@ def time_in_range(start, end):
 # WORKER — runs as a child process, owns KiteTicker for one trading day
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_worker():
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    r = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        health_check_interval=30,
+        socket_timeout=5,
+        socket_connect_timeout=5
+    )
     try:
         r.ping()
         log.info("[worker] Connected to Redis")
     except Exception as e:
         log.error(f"[worker] Redis connection failed: {e}")
-        sys.exit(1)
+        os._exit(1)
 
     api_key, access_token = load_auth()
     log.info("[worker] Auth loaded successfully")
 
     subscribed_tokens = set()
+    last_tick_time = time.time()
+    connect_time = time.time()
 
     def on_ticks(ws, ticks):
+        nonlocal last_tick_time
+        last_tick_time = time.time()
         for tick in ticks:
             token = tick['instrument_token']
             payload = json.dumps({
@@ -76,6 +91,9 @@ def run_worker():
             r.publish(f'tick:{token}', payload)
 
     def on_connect(ws, response):
+        nonlocal last_tick_time, connect_time
+        connect_time = time.time()
+        last_tick_time = time.time()
         log.info("[worker] KiteTicker connected")
         tokens = get_active_tokens(r)
         if tokens:
@@ -88,14 +106,15 @@ def run_worker():
         log.error(f"[worker] KiteTicker error {code}: {reason}")
 
     def on_close(ws, code, reason):
+        subscribed_tokens.clear()
         log.warning(f"[worker] KiteTicker closed {code}: {reason}")
 
     def on_reconnect(ws, attempts):
         log.info(f"[worker] KiteTicker reconnecting, attempt {attempts}")
 
     def on_noreconnect(ws):
-        log.error("[worker] KiteTicker gave up reconnecting — exiting so supervisor restarts")
-        sys.exit(1)
+        log.error("[worker] KiteTicker gave up reconnecting — exiting worker for supervisor restart")
+        os._exit(1)
 
     ticker = KiteTicker(api_key, access_token, reconnect_max_tries=10, reconnect_max_delay=30)
     ticker.on_ticks       = on_ticks
@@ -130,6 +149,22 @@ def run_worker():
                 except Exception as e:
                     log.warning(f"[worker] Unsubscribe failed, will retry: {e}")
 
+            # ── Watchdog for silent TCP drops ─────────────────────────────
+            now_t = now_time()
+            if (
+                not is_weekend()
+                and MARKET_HOURS_START <= now_t <= MARKET_HOURS_STOP
+                and len(current_tokens) > 0
+                and (time.time() - connect_time) > 30  # Allow 30s warm-up after connect
+            ):
+                idle_sec = time.time() - last_tick_time
+                if idle_sec > TICK_TIMEOUT_SECONDS:
+                    log.error(
+                        f"[worker] WATCHDOG: No ticks received for {int(idle_sec)}s during market hours "
+                        f"with {len(current_tokens)} tokens subscribed — forcing clean worker restart"
+                    )
+                    os._exit(1)
+
         except Exception as e:
             log.error(f"[worker] Token sync error: {e}")
 
@@ -140,7 +175,14 @@ def run_worker():
 # SUPERVISOR — runs 24/7, spawns/kills worker process daily
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_supervisor():
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    r = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        health_check_interval=30,
+        socket_timeout=5,
+        socket_connect_timeout=5
+    )
     try:
         r.ping()
         log.info("[supervisor] Connected to Redis")
