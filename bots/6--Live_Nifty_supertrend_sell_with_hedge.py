@@ -39,11 +39,11 @@ results_folder = 'Nifty_sell_supertrend_results'
 # live_mode: 1 = live trading (real orders placed), 0 = paper trading
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
-    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 20000},  # Friday
+    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
+    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
+    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
+    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
+    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 20000},  # Friday
 }
 
 def get_day_config():
@@ -526,7 +526,7 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
 
     df_ohlc = df_ohlc[df_ohlc['date'] <= target_candle_time]
     df_ohlc.reset_index(drop=True, inplace=True)
-    print(df_ohlc.tail())
+#    print(df_ohlc.tail())
 
 ##    df_ohlc['atr'] =  talib.ATR(df_ohlc.high, df_ohlc.low, df_ohlc.close, timeperiod= 10)
 
@@ -536,12 +536,13 @@ def sell_fn(kite, zerodha_instruments_list, expiry):
     df_ohlc['tr3'] = abs(df_ohlc['low'] - df_ohlc['prev_close'])
     df_ohlc['tr'] = df_ohlc[['tr1', 'tr2', 'tr3']].max(axis=1)
 
-    atr_period = supertrend_period
+    atr_period = 10
     df_ohlc['atr'] = df_ohlc['tr'].rolling(atr_period).mean()
     df_ohlc.drop(['prev_close', 'tr1', 'tr2', 'tr3', 'tr'], axis=1, inplace=True)
     df_ohlc = calculate_supertrend_numba(df_ohlc, 10, supertrend_period)
 
-    print(df_ohlc)
+    with pd.option_context('display.max_columns', None, 'display.width', 1000):
+        print(df_ohlc.tail(10))
     try:
         df_ohlc.to_csv('NIFTYST.csv', index=False)
     except Exception as e:

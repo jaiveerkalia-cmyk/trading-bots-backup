@@ -46,6 +46,19 @@ CONTROL_CHANNEL = 'market_data:control'
 ACTIVE_SUBS_KEY = 'market_data:active_subs'
 DEFAULT_STREAMS  = ['ticker']
 
+# Streams already running, as (exchange, symbol, stream). A repeat `subscribe` for a
+# stream in here is skipped. Without this, every command (page load, symbol-box blur,
+# watchlist click, restore ...) started ANOTHER full set of ticker / order-book / candle
+# loops that nothing ever cancelled, and CPU grew with every duplicate.
+_live_streams: set[tuple[str, str, str]] = set()
+
+
+def _forget_streams(exchange: str, symbol: str) -> None:
+    """Drop the running-stream records for a symbol (after adapter.unsubscribe)."""
+    _live_streams.difference_update(
+        {k for k in _live_streams if k[0] == exchange and k[1] == symbol}
+    )
+
 
 async def main() -> None:
     redis = aioredis.from_url(
@@ -180,6 +193,7 @@ async def _control_loop(
                         adapter = adapters.get(exchange)
                         if adapter:
                             await adapter.unsubscribe(symbol)
+                        _forget_streams(exchange, symbol)
                         for raw in await redis.smembers(ACTIVE_SUBS_KEY):
                             s = json.loads(raw)
                             if (s.get('exchange') == exchange
@@ -219,28 +233,43 @@ async def _do_subscribe(
         logger.warning("No adapter available for: %s", exchange)
         return
 
+    started: list[str] = []
     for stream in streams:
         try:
             if stream == 'ticker':
-                await adapter.subscribe_ticker(symbol, publisher.publish)
+                if (exchange, symbol, 'ticker') not in _live_streams:
+                    await adapter.subscribe_ticker(symbol, publisher.publish)
+                    _live_streams.add((exchange, symbol, 'ticker'))
+                    started.append('ticker')
                 # Co-subscribe order book depth so the paper engine can compute
                 # realistic fill prices (VWAP-through-book / slippage simulation)
-                try:
-                    await adapter.subscribe_orderbook(symbol, publisher.publish)
-                except Exception as e:
-                    logger.debug(
-                        "Orderbook not available [%s %s]: %s (skipping)",
-                        exchange, symbol, e,
-                    )
+                if (exchange, symbol, 'orderbook') not in _live_streams:
+                    try:
+                        await adapter.subscribe_orderbook(symbol, publisher.publish)
+                        _live_streams.add((exchange, symbol, 'orderbook'))
+                    except Exception as e:
+                        logger.debug(
+                            "Orderbook not available [%s %s]: %s (skipping)",
+                            exchange, symbol, e,
+                        )
             elif stream == 'orderbook':
-                await adapter.subscribe_orderbook(symbol, publisher.publish)
+                if (exchange, symbol, 'orderbook') not in _live_streams:
+                    await adapter.subscribe_orderbook(symbol, publisher.publish)
+                    _live_streams.add((exchange, symbol, 'orderbook'))
+                    started.append('orderbook')
             elif stream.startswith('candles:'):
-                interval = stream.split(':', 1)[1]
-                await adapter.subscribe_candles(symbol, interval, publisher.publish)
+                if (exchange, symbol, stream) not in _live_streams:
+                    interval = stream.split(':', 1)[1]
+                    await adapter.subscribe_candles(symbol, interval, publisher.publish)
+                    _live_streams.add((exchange, symbol, stream))
+                    started.append(stream)
         except Exception as e:
             logger.error("Subscribe error [%s %s %s]: %s", exchange, symbol, stream, e)
 
-    logger.info("Subscribed: %s %s %s", exchange, symbol, streams)
+    if started:
+        logger.info("Subscribed: %s %s %s", exchange, symbol, started)
+    else:
+        logger.debug("Already subscribed (skipped): %s %s %s", exchange, symbol, streams)
 
 
 async def _funding_poller(

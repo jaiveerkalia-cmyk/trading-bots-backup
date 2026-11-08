@@ -59,11 +59,11 @@ results_folder              = 'Nifty_sell_supertrend_results_websockets'
 # live_mode: 1 = live trading (real orders placed), 0 = paper trading
 # ─────────────────────────────────────────────────────────────────────────────
 DAY_CONFIG = {
-    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
-    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
-    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
-    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
-    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:35', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 20000},  # Friday
+    0: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Monday
+    1: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.3, 'global_stop_per_lot': 40000, 'hedgeless_mode': 1, 'risk_mode_on': 1, 'max_risk_amount': 10000},  # Tuesday
+    2: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Wednesday
+    3: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 25000},  # Thursday
+    4: {'lots_num': 10, 'live_mode': 0, 'start_time': '09:30', 'supertrend_period': 4, 'stop_percent': 0.5, 'reverse_threshold_percentage': 0.1, 'global_stop_per_lot': 40000, 'hedgeless_mode': 0, 'risk_mode_on': 1, 'max_risk_amount': 20000},  # Friday
 }
 
 def get_day_config():
@@ -199,11 +199,12 @@ def calculate_supertrend_pure_python(candles, supertrend_period):
         lpc = abs(lows[i] - closes[i - 1])
         tr[i] = max(hl, hpc, lpc)
 
-    # 2. Simple Moving Average ATR (window = supertrend_period)
+    # 2. Simple Moving Average ATR (window = 10)
     atr = [0.0] * n
-    for i in range(supertrend_period - 1, n):
-        window_tr = tr[i - supertrend_period + 1 : i + 1]
-        atr[i] = sum(window_tr) / supertrend_period
+    atr_period = 10
+    for i in range(atr_period - 1, n):
+        window_tr = tr[i - atr_period + 1 : i + 1]
+        atr[i] = sum(window_tr) / atr_period
 
     # 3. Supertrend Bands (Initial index: 10, Multiplier: supertrend_period)
     period = 10
@@ -256,6 +257,11 @@ def calculate_supertrend_pure_python(candles, supertrend_period):
         for i in range(period, n):
             if st[i] > 0.0:
                 direction[i] = 1 if closes[i] > st[i] else -1
+
+    for i in range(n):
+        candles[i]['atr'] = atr[i]
+        candles[i]['supertrend'] = st[i]
+        candles[i]['direction'] = direction[i]
 
     return direction[-1]
 
@@ -569,6 +575,12 @@ def sell_fn(kite, options_map, expiry):
 
     # Compute Supertrend direction using pure Python
     st_direction = calculate_supertrend_pure_python(candles, supertrend_period)
+
+    import pandas as pd
+    df_ohlc = pd.DataFrame(candles)
+    with pd.option_context('display.max_columns', None, 'display.width', 1000):
+        print(df_ohlc.tail(10))
+    del df_ohlc
     del candles
     trim_memory()
 
