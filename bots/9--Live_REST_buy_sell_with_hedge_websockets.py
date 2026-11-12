@@ -1,13 +1,33 @@
+import os
 import sys
 import subprocess
+import threading
 import time
 import math
 import csv
-import pandas as pd
-from datetime import datetime
-import pytz
-import talib
-from kiteconnect import KiteConnect
+import gc
+from datetime import datetime, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
+
+# ==============================================================================
+# OS-LEVEL MEMORY MANAGEMENT (< 30 MB RAM CEILING)
+# ==============================================================================
+try:
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6")
+    # M_ARENA_MAX = -8 in glibc; restricts thread memory pools
+    libc.mallopt(-8, 2)
+    def trim_memory():
+        gc.collect()
+        libc.malloc_trim(0)
+except Exception:
+    def trim_memory():
+        gc.collect()
+
+try:
+    threading.stack_size(128 * 1024)
+except Exception:
+    pass
 
 # ==============================================================================
 # 1. GLOBAL PATHS & CONFIGURATION
@@ -35,7 +55,7 @@ STANDARD_LOT_SIZE = 65        # Nifty Lot Size (Jan 2026 Standard)
 ATR_PERIOD = 10
 INDEX_ENTRY_ATR_PERIOD = 14
 VIX_SYMBOL = 'NSE:INDIA VIX'
-TRADING_LOOP_CHECK_INTERVAL_MINUTES = 1
+MONITORING_INTERVAL_SECONDS = 60  # Cadence for position monitoring (1=every sec, 10=every 10s, 60=every min)
 
 # TARGETS (Per Lot)
 TARGET_PROFIT_PER_LOT = 45000 
@@ -58,7 +78,8 @@ INDEX_DETAILS = {
         'opt_exchange': 'NFO', 
         'strike_step': 50, 
         'std_lot_size': 65, 
-        'index_filter': 'NIFTY'
+        'index_filter': 'NIFTY',
+        'spot_token': 256265
     },
     'SENSEX': {
         'index_name': 'SENSEX', 
@@ -66,7 +87,8 @@ INDEX_DETAILS = {
         'opt_exchange': 'BFO', 
         'strike_step': 100, 
         'std_lot_size': 20, 
-        'index_filter': 'SENSEX'
+        'index_filter': 'SENSEX',
+        'spot_token': 265
     }
 }
 
@@ -87,13 +109,12 @@ DAY_CONFIGURATION = {
     #     'index_based_entry': False, 'atr_entry_multiplier': 2},
 
     # Monday (NIFTY)
-    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
+    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
         'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': True, 'hedgeless_mode': True,
         'index_based_entry': True, 'atr_entry_multiplier': 2},
     
-
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 1, 'percent_mode': 1, 'find_atm': True,
         'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
@@ -113,9 +134,9 @@ DAY_CONFIGURATION = {
         'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': True, 'atr_ema_window': 20,
         'atr_stop_per_lot': 10, 'atr_entry_gap': 20, 'skip_till_hour': 10, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
         'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': False, 'hedgeless_mode': True,
-        'index_based_entry': False, 'atr_entry_multiplier': 1},
+        'index_based_entry': True, 'atr_entry_multiplier': 1.5},
 
-   # Friday (NIFTY)
+    # Friday (NIFTY)
    4: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 0, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
             'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
             'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
@@ -141,11 +162,13 @@ DEFAULT_CONFIGURATION = DAY_CONFIGURATION[0]
 # 2. SHARED DATA & HELPER FUNCTIONS
 # ==============================================================================
 
-IST = pytz.timezone('Asia/Kolkata')
+live_market_data = {}
+tick_lock = threading.Lock()
+IST = ZoneInfo('Asia/Kolkata')
 
 
 def append_csv_row(csv_path, row):
-    with open(csv_path, 'a', newline='') as f:
+    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
         csv.writer(f).writerow(row)
 
 
@@ -160,9 +183,9 @@ def get_day_config_for_day_index(day_index):
 
 def get_next_trading_day_info():
     """Returns the next trading date and its day configuration, skipping weekends."""
-    next_dt = datetime.now() + pd.Timedelta(days=1)
+    next_dt = datetime.now() + timedelta(days=1)
     while next_dt.weekday() in [5, 6]:
-        next_dt += pd.Timedelta(days=1)
+        next_dt += timedelta(days=1)
     return next_dt, get_day_config_for_day_index(next_dt.weekday())
 
 def get_now_str():
@@ -339,15 +362,41 @@ def place_order_with_retry(kite, symbol, qty, side, live_mode, exchange='NFO'):
     return False
 
 def get_ltp_safe(kite, symbol_list):
-    """Fetches LTP with retries."""
-    for _ in range(5):
+    """Fetches LTP with retries, adaptive fast backoff, and latency/error diagnostics."""
+    if not symbol_list:
+        return {}
+
+    delays = [0.2, 0.4, 0.8, 1.0, 1.0]
+    total_start = time.time()
+    last_error = None
+
+    for attempt in range(len(delays)):
+        t_req = time.time()
         try:
-            return kite.ltp(symbol_list)
-        except: time.sleep(1)
+            res = kite.ltp(symbol_list)
+            dur = time.time() - t_req
+            if dur > 1.0:
+                print(f"[{get_now_str()}] [API LATENCY] kite.ltp took {dur:.2f}s for {len(symbol_list)} symbols (Zerodha server/network load)", flush=True)
+            return res
+        except Exception as e:
+            last_error = e
+            dur = time.time() - t_req
+            delay = delays[attempt]
+            print(f"[{get_now_str()}] [API RETRY {attempt + 1}/{len(delays)}] kite.ltp failed after {dur:.2f}s for {len(symbol_list)} symbols: {e} | Retrying in {delay}s...", flush=True)
+            time.sleep(delay)
+
+    total_dur = time.time() - total_start
+    print(f"[{get_now_str()}] [API CRITICAL ERROR] All {len(delays)} attempts failed after {total_dur:.2f}s for {symbol_list[:3]}...: {last_error}", flush=True)
     return {}
 
-def get_initial_spot_price(kite, spot_symbol, start_time_str):
-    """Fetches the start spot price with live retries, then falls back to the start-minute candle open."""
+def get_initial_spot_price(kite, spot_symbol, start_time_str, spot_token=None):
+    """Fetches the start spot price from WebSocket if available, else live quote, then falls back to candle open."""
+    if spot_token:
+        with tick_lock:
+            ws_spot = live_market_data.get(spot_token, 0)
+        if ws_spot > 0:
+            print(f"[{get_now_str()}] Initial spot LTP fetched instantly from WebSocket: {ws_spot}", flush=True)
+            return float(ws_spot)
     live_retry_started_at = time.time()
     live_retry_limit_seconds = 60
     live_retry_delays = [1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -375,9 +424,9 @@ def get_initial_spot_price(kite, spot_symbol, start_time_str):
     try:
         start_hour, start_minute = map(int, start_time_str.split(':'))
         today = datetime.now(IST).date()
-        candle_start = IST.localize(datetime.combine(today, datetime.min.time()).replace(hour=start_hour, minute=start_minute, second=0, microsecond=0))
-        candle_end = candle_start + pd.Timedelta(minutes=1)
-        candle_ready_at = candle_start + pd.Timedelta(minutes=1, seconds=10)
+        candle_start = datetime.combine(today, datetime.min.time(), tzinfo=IST).replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+        candle_end = candle_start + timedelta(minutes=1)
+        candle_ready_at = candle_start + timedelta(minutes=1, seconds=10)
 
         while datetime.now(IST) < candle_ready_at:
             wait_seconds = min(1, max(0, (candle_ready_at - datetime.now(IST)).total_seconds()))
@@ -408,23 +457,57 @@ def get_initial_spot_price(kite, spot_symbol, start_time_str):
         print(f"[{get_now_str()}] Historical spot fallback setup failed for {spot_symbol}: {e}", flush=True)
 
     return 0
-def wait_for_next_check_interval(interval_minutes):
-    """Sleeps until the next interval boundary, aligned to minute starts."""
-    interval_minutes = max(1, int(interval_minutes))
 
-    while True:
-        now = datetime.now()
-        secs_since_hour = (now.minute * 60) + now.second
-        interval_seconds = interval_minutes * 60
-        sleep_seconds = interval_seconds - (secs_since_hour % interval_seconds)
+# ─────────────────────────────────────────────────────────────────────────────
+# PURE PYTHON INDICATOR ENGINE (ZERO-PANDAS, ZERO-NUMPY, MATCHES TA-LIB & PANDAS VERBATIM)
+# ─────────────────────────────────────────────────────────────────────────────
 
-        if sleep_seconds <= 0:
-            sleep_seconds = interval_seconds
+def calculate_atr_talib_equivalent(highs, lows, closes, period=14):
+    """Calculates Wilder's ATR matching TA-Lib ATR verbatim without numpy/pandas."""
+    n = len(highs)
+    if n < period + 1:
+        return [None] * n
 
-        time.sleep(sleep_seconds)
-        check_dt = datetime.now()
-        if check_dt.second == 0 and (check_dt.minute % interval_minutes) == 0:
-            return check_dt
+    tr = [0.0] * n
+    for i in range(1, n):
+        hl = highs[i] - lows[i]
+        hpc = abs(highs[i] - closes[i - 1])
+        lpc = abs(lows[i] - closes[i - 1])
+        tr[i] = max(hl, hpc, lpc)
+
+    atr = [None] * n
+    atr[period] = sum(tr[1:period + 1]) / period
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
+
+def calculate_ewm_pandas_equivalent(data, span=20, min_periods=20):
+    """Calculates EWM mean matching Pandas .ewm(span=span, adjust=False, min_periods=min_periods).mean() verbatim."""
+    n = len(data)
+    result = [None] * n
+    alpha = 2.0 / (span + 1.0)
+
+    valid_indices = [i for i, v in enumerate(data) if v is not None and not math.isnan(v)]
+    if len(valid_indices) < min_periods:
+        return result
+
+    start_idx = valid_indices[0]
+    ewm_val = float(data[start_idx])
+    count = 1
+
+    if count >= min_periods:
+        result[start_idx] = ewm_val
+
+    for i in range(start_idx + 1, n):
+        val = data[i]
+        if val is None or math.isnan(val):
+            continue
+        count += 1
+        ewm_val = ewm_val * (1.0 - alpha) + float(val) * alpha
+        if count >= min_periods:
+            result[i] = ewm_val
+
+    return result
 
 def get_latest_atr_ema(kite, spot_symbol, current_dt, atr_ema_window=20, lookback_days=60):
     """Fetches 1h candles, calculates ATR and ATR EMA, and returns the latest completed ATR EMA."""
@@ -435,40 +518,37 @@ def get_latest_atr_ema(kite, spot_symbol, current_dt, atr_ema_window=20, lookbac
             print(f"ATR fetch failed: instrument token missing for {spot_symbol}", flush=True)
             return None, None
 
-        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        from_dt = current_dt - timedelta(days=lookback_days)
         candles = kite.historical_data(instrument_token, from_dt, current_dt, '60minute')
         if not candles:
             print(f"ATR fetch failed: no historical candles returned for {spot_symbol}", flush=True)
             return None, None
 
-        df_m = pd.DataFrame(candles)
-        if df_m.empty or 'date' not in df_m.columns:
-            print(f"ATR fetch failed: invalid historical candle data for {spot_symbol}", flush=True)
-            return None, None
+        candles = sorted(candles, key=lambda c: c['date'])
+        highs = [float(c['high']) for c in candles]
+        lows = [float(c['low']) for c in candles]
+        closes = [float(c['close']) for c in candles]
 
-        df_m['date'] = pd.to_datetime(df_m['date'])
-        df_m = df_m.sort_values('date').reset_index(drop=True)
-        high = df_m['high'].astype(float)
-        low = df_m['low'].astype(float)
-        close = df_m['close'].astype(float)
-        atr_series = talib.ATR(high, low, close, timeperiod=ATR_PERIOD)
-        df_m['atr'] = atr_series
-        df_m['atr_ema'] = df_m['atr'].ewm(span=atr_ema_window, adjust=False, min_periods=atr_ema_window).mean()
+        atr_series = calculate_atr_talib_equivalent(highs, lows, closes, period=ATR_PERIOD)
+        atr_ema_series = calculate_ewm_pandas_equivalent(atr_series, span=atr_ema_window, min_periods=atr_ema_window)
 
-        candle_tz = df_m['date'].dt.tz
-        current_date = pd.Timestamp(current_dt.date())
-        if candle_tz is not None:
-            current_date = current_date.tz_localize(candle_tz)
+        current_date = current_dt.date()
+        eligible_indices = []
+        for idx, c in enumerate(candles):
+            c_date = c['date'].date() if hasattr(c['date'], 'date') else c['date']
+            if c_date < current_date and atr_ema_series[idx] is not None:
+                eligible_indices.append(idx)
 
-        eligible_rows = df_m[(df_m['date'] < current_date) & df_m['atr_ema'].notna()]
-        if eligible_rows.empty:
+        if not eligible_indices:
             print(f"ATR fetch failed: no completed ATR EMA value available for {spot_symbol}", flush=True)
             return None, None
 
-        selected_row = eligible_rows.iloc[-1]
-        print(f"Using ATR candle: {selected_row['date']}", flush=True)
+        selected_idx = eligible_indices[-1]
+        selected_candle = candles[selected_idx]
+        print(f"Using ATR candle: {selected_candle['date']}", flush=True)
 
-        latest_atr = float(selected_row['atr_ema'])
+        latest_atr = float(atr_ema_series[selected_idx])
+        trim_memory()
         return latest_atr, None
 
     except Exception as e:
@@ -484,37 +564,32 @@ def get_vix_stop_per_lot(kite, current_dt, lookback_days=400):
             print(f"VIX fetch failed: instrument token missing for {VIX_SYMBOL}", flush=True)
             return None, None
 
-        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        from_dt = current_dt - timedelta(days=lookback_days)
         candles = kite.historical_data(instrument_token, from_dt, current_dt, 'day')
         if not candles:
             print(f"VIX fetch failed: no historical candles returned for {VIX_SYMBOL}", flush=True)
             return None, None
 
-        df_vix = pd.DataFrame(candles)
-        if df_vix.empty or 'date' not in df_vix.columns:
-            print(f"VIX fetch failed: invalid historical candle data for {VIX_SYMBOL}", flush=True)
+        candles = sorted(candles, key=lambda c: c['date'])
+        current_date = current_dt.date()
+        eligible_candles = [c for c in candles if (c['date'].date() if hasattr(c['date'], 'date') else c['date']) < current_date]
+
+        if len(eligible_candles) < 252:
+            print(f"VIX fetch failed: need at least 252 prior daily candles, found {len(eligible_candles)}", flush=True)
             return None, None
 
-        df_vix['date'] = pd.to_datetime(df_vix['date'])
-        df_vix = df_vix.sort_values('date').reset_index(drop=True)
-
-        candle_tz = df_vix['date'].dt.tz
-        current_date = pd.Timestamp(current_dt.date())
-        if candle_tz is not None:
-            current_date = current_date.tz_localize(candle_tz)
-
-        eligible_rows = df_vix[df_vix['date'] < current_date].copy()
-        if len(eligible_rows) < 252:
-            print(f"VIX fetch failed: need at least 252 prior daily candles, found {len(eligible_rows)}", flush=True)
-            return None, None
-
-        trailing_window = eligible_rows['close'].astype(float).tail(252)
-        vix_rank_pct = trailing_window.rank(pct=True).iloc[-1]
+        trailing_window = [float(c['close']) for c in eligible_candles[-252:]]
+        last_close = trailing_window[-1]
+        count_less = sum(1 for x in trailing_window if x < last_close)
+        count_equal = sum(1 for x in trailing_window if x == last_close)
+        rank_avg = count_less + (count_equal + 1) / 2.0
+        vix_rank_pct = rank_avg / len(trailing_window)
         stop_per_lot = 4000 if vix_rank_pct > 0.5 else 3000
 
-        selected_row = eligible_rows.iloc[-1]
-        print(f"Using VIX candle: {selected_row['date']} | Rank pct over trailing 252: {vix_rank_pct:.4f} | Stop/Lot: {stop_per_lot}", flush=True)
+        selected_candle = eligible_candles[-1]
+        print(f"Using VIX candle: {selected_candle['date']} | Rank pct over trailing 252: {vix_rank_pct:.4f} | Stop/Lot: {stop_per_lot}", flush=True)
 
+        trim_memory()
         return stop_per_lot, None
 
     except Exception as e:
@@ -535,69 +610,54 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
             print(f"[INDEX_ENTRY_ATR] FAILED: instrument token missing for {spot_symbol}", flush=True)
             return None
 
-        from_dt = current_dt - pd.Timedelta(days=lookback_days)
+        from_dt = current_dt - timedelta(days=lookback_days)
         print(f"[INDEX_ENTRY_ATR] Fetching 1m candles for {spot_symbol} from {from_dt} to {current_dt}...", flush=True)
         candles = kite.historical_data(instrument_token, from_dt, current_dt, 'minute')
         if not candles:
             print(f"[INDEX_ENTRY_ATR] FAILED: no 1m candles returned for {spot_symbol}", flush=True)
             return None
 
-        df = pd.DataFrame(candles)
-        if df.empty or 'date' not in df.columns:
-            print(f"[INDEX_ENTRY_ATR] FAILED: invalid candle data for {spot_symbol}", flush=True)
-            return None
+        candles = sorted(candles, key=lambda c: c['date'])
+        cutoff_time = dt_time(15, 14)
+        candles = [c for c in candles if (c['date'].time() if hasattr(c['date'], 'time') else c['date']) <= cutoff_time]
+        print(f"[INDEX_ENTRY_ATR] Total 1m candles fetched: {len(candles)}", flush=True)
 
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        df = df[df['date'].dt.time <= datetime.strptime('15:14', '%H:%M').time()].reset_index(drop=True)
-        print(f"[INDEX_ENTRY_ATR] Total 1m candles fetched: {len(df)}", flush=True)
-
-        # Determine today's date, timezone-aware if needed
-        candle_tz = df['date'].dt.tz
-        current_date = pd.Timestamp(current_dt.date())
-        if candle_tz is not None:
-            current_date = current_date.tz_localize(candle_tz)
-
-        # Keep only candles strictly before today (previous trading day and earlier)
-        prev_day_candles = df[df['date'] < current_date].copy()
-        if prev_day_candles.empty:
+        current_date = current_dt.date()
+        prev_day_candles = [c for c in candles if (c['date'].date() if hasattr(c['date'], 'date') else c['date']) < current_date]
+        if not prev_day_candles:
             print(f"[INDEX_ENTRY_ATR] FAILED: no candles found before today ({current_date})", flush=True)
             return None
 
-        # Identify the last trading day date
-        last_trading_date = prev_day_candles['date'].dt.date.max()
-        prev_day_only = prev_day_candles[prev_day_candles['date'].dt.date == last_trading_date].copy()
+        last_trading_date = max(c['date'].date() if hasattr(c['date'], 'date') else c['date'] for c in prev_day_candles)
+        prev_day_only = [c for c in prev_day_candles if (c['date'].date() if hasattr(c['date'], 'date') else c['date']) == last_trading_date]
         print(f"[INDEX_ENTRY_ATR] Previous trading day identified: {last_trading_date} | Candles in that day: {len(prev_day_only)}", flush=True)
-
-        # Calculate ATR and its 200-period EMA on all eligible prior candles.
-        high = prev_day_candles['high'].astype(float)
-        low  = prev_day_candles['low'].astype(float)
-        close = prev_day_candles['close'].astype(float)
 
         if len(prev_day_candles) < INDEX_ENTRY_ATR_PERIOD + 1:
             print(f"[INDEX_ENTRY_ATR] FAILED: not enough candles ({len(prev_day_candles)}) to compute ATR({INDEX_ENTRY_ATR_PERIOD})", flush=True)
             return None
 
-        atr_series = talib.ATR(high.values, low.values, close.values, timeperiod=INDEX_ENTRY_ATR_PERIOD)
-        prev_day_candles = prev_day_candles.copy()
-        prev_day_candles['atr'] = atr_series
-        prev_day_candles['atr_ema'] = prev_day_candles['atr'].ewm(span=200, adjust=False, min_periods=200).mean()
+        highs = [float(c['high']) for c in prev_day_candles]
+        lows = [float(c['low']) for c in prev_day_candles]
+        closes = [float(c['close']) for c in prev_day_candles]
 
-        # Get candles from the previous trading day that have a valid ATR EMA.
-        prev_day_with_atr = prev_day_candles[
-            (prev_day_candles['date'].dt.date == last_trading_date) &
-            prev_day_candles['atr_ema'].notna()
+        atr_series = calculate_atr_talib_equivalent(highs, lows, closes, period=INDEX_ENTRY_ATR_PERIOD)
+        atr_ema_series = calculate_ewm_pandas_equivalent(atr_series, span=200, min_periods=200)
+
+        prev_day_with_atr_indices = [
+            i for i, c in enumerate(prev_day_candles)
+            if (c['date'].date() if hasattr(c['date'], 'date') else c['date']) == last_trading_date
+            and atr_ema_series[i] is not None
         ]
 
-        if prev_day_with_atr.empty:
+        if not prev_day_with_atr_indices:
             print(f"[INDEX_ENTRY_ATR] FAILED: no valid ATR EMA values on previous trading day {last_trading_date}", flush=True)
             return None
 
-        last_candle = prev_day_with_atr.iloc[-1]
-        atr_value = float(last_candle['atr_ema'])
+        last_idx = prev_day_with_atr_indices[-1]
+        atr_value = float(atr_ema_series[last_idx])
 
         print(f"[INDEX_ENTRY_ATR] ATR({INDEX_ENTRY_ATR_PERIOD}) EMA(200) value from previous day last eligible candle: {atr_value:.4f}", flush=True)
-
+        trim_memory()
         return atr_value
 
     except Exception as e:
@@ -610,91 +670,139 @@ def get_index_entry_atr(kite, spot_symbol, current_dt, lookback_days=10):
 # 3. STRATEGY LOGIC (ATM Finder, Strike Selection)
 # ==============================================================================
 
-def find_best_atm_strike(kite, mathematical_atm, instruments_df, step, exchange='NFO'):
-    """Finds the strike with the lowest difference between CE and PE premiums."""
+def load_instruments_compact(filepath, target_ind, target_segment):
+    """Reads instrument_tokens.csv line-by-line via csv.DictReader with < 2 MB RAM."""
+    options_map = {}
+    expiries = set()
+
+    with open(filepath, mode='r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        filtered_rows = []
+        for row in reader:
+            if row.get('name') == target_ind and row.get('segment') == target_segment:
+                filtered_rows.append(row)
+                expiries.add(row['expiry'])
+
+    if not expiries:
+        raise ValueError(f"No option contracts found for {target_ind} ({target_segment}) in {filepath}")
+
+    current_expiry = sorted(list(expiries))[0]
+
+    for row in filtered_rows:
+        if row['expiry'] == current_expiry:
+            strike_val = int(round(float(row['strike'])))
+            itype = str(row['instrument_type'])
+            options_map[(strike_val, itype)] = {
+                'instrument_token': int(row['instrument_token']),
+                'tradingsymbol': str(row['tradingsymbol']),
+                'strike': strike_val,
+                'instrument_type': itype
+            }
+
+    del filtered_rows
+    trim_memory()
+    return options_map, current_expiry
+
+
+def get_token_and_symbol(options_data, strike, instrument_type):
+    """Fast O(1) hash lookup for strike token and symbol."""
+    if isinstance(options_data, dict):
+        item = options_data.get((int(strike), instrument_type))
+        if item:
+            return int(item['instrument_token']), item['tradingsymbol']
+        return None, None
+    for r in options_data:
+        if int(round(float(r['strike']))) == int(strike) and r['instrument_type'] == instrument_type:
+            return int(r['instrument_token']), r['tradingsymbol']
+    return None, None
+
+def find_best_atm_strike(kite, mathematical_atm, options_data, step, exchange='NFO'):
+    """Finds the strike with the lowest difference between CE and PE premiums and returns cached prices."""
     print(f"Scanning for Best ATM (Step: {step})...", flush=True)
     best_strike = mathematical_atm
     min_premium_diff = 999999.0
     
-    # Use the explicit STEP passed from config
-    candidates = [int(mathematical_atm) + (x * step) for x in range(-3, 4)]
-    
+    # Expanded candidate range from -4 to +4 (9 strikes) to cover all base entry + skew shifts in a single call
+    candidates = [int(mathematical_atm) + (x * step) for x in range(-4, 5)]
     tokens_to_fetch = []
     strike_map = {}
     
     for strike in candidates:
         try:
-            ce_row = instruments_df[(instruments_df['strike'] == strike) & (instruments_df['instrument_type'] == 'CE')]
-            pe_row = instruments_df[(instruments_df['strike'] == strike) & (instruments_df['instrument_type'] == 'PE')]
+            ce_tok, ce_sym = get_token_and_symbol(options_data, strike, 'CE')
+            pe_tok, pe_sym = get_token_and_symbol(options_data, strike, 'PE')
             
-            if ce_row.empty or pe_row.empty: continue
-            
-            ce_sym = ce_row.iloc[0]['tradingsymbol']
-            pe_sym = pe_row.iloc[0]['tradingsymbol']
+            if not ce_sym or not pe_sym:
+                continue
             
             tokens_to_fetch.extend([f"{exchange}:{ce_sym}", f"{exchange}:{pe_sym}"])
             strike_map[strike] = {'CE': f"{exchange}:{ce_sym}", 'PE': f"{exchange}:{pe_sym}"}
-        except: continue
+        except:
+            continue
         
-    if not tokens_to_fetch: return mathematical_atm
+    if not tokens_to_fetch:
+        return mathematical_atm, {}
 
     ltp_data = get_ltp_safe(kite, tokens_to_fetch)
     
     print(f"{'Strike':<10} | {'Diff':<10}", flush=True)
-    for strike, symbols in strike_map.items():
+    # Evaluate best ATM difference across the standard 7 central strikes
+    for strike in [int(mathematical_atm) + (x * step) for x in range(-3, 4)]:
+        symbols = strike_map.get(strike)
+        if not symbols:
+            continue
         try:
             ce_price = ltp_data.get(symbols['CE'], {}).get('last_price', 0)
             pe_price = ltp_data.get(symbols['PE'], {}).get('last_price', 0)
             
             # Skip if data is missing
-            if ce_price == 0 or pe_price == 0: continue
+            if ce_price == 0 or pe_price == 0:
+                continue
             
             diff = abs(ce_price - pe_price)
             print(f"{strike:<10} | {diff:<10.2f}", flush=True)
             if diff < min_premium_diff:
                 min_premium_diff = diff
                 best_strike = strike
-        except: continue
+        except:
+            continue
     
     print(f"Selected Best ATM: {best_strike}", flush=True)
-    return best_strike
+    return best_strike, ltp_data
 
-def find_otm_buy_strikes(kite, atm_strike, instruments_df, exchange='NFO', target_premium=15):
+def find_otm_buy_strikes(kite, atm_strike, options_list, exchange='NFO', target_premium=15):
     """Finds deep OTM strikes close to target premium for hedging."""
     print(f"Finding OTM Buy Strikes (Target Premium: {target_premium})...", flush=True)
     try:
-        upper_strikes = instruments_df[instruments_df["strike"] > atm_strike].sort_values("strike").head(40)
-        lower_strikes = instruments_df[instruments_df["strike"] < atm_strike].sort_values("strike", ascending=False).head(40)
-        all_candidates = pd.concat([upper_strikes, lower_strikes])
-        
-        candidate_symbols = [f"{exchange}:" + s for s in all_candidates["tradingsymbol"].unique()]
+        records = list(options_list.values()) if isinstance(options_list, dict) else options_list
+        upper = sorted([o for o in records if o['strike'] > atm_strike], key=lambda x: x['strike'])[:40]
+        lower = sorted([o for o in records if o['strike'] < atm_strike], key=lambda x: x['strike'], reverse=True)[:40]
+        all_candidates = upper + lower
+
+        candidate_symbols = list(dict.fromkeys(f"{exchange}:{o['tradingsymbol']}" for o in all_candidates))
         ltp_data = get_ltp_safe(kite, candidate_symbols)
-        
-        ce_options = all_candidates[all_candidates['instrument_type'] == 'CE']
-        best_ce_strike = min(ce_options.to_dict('records'), 
-                             key=lambda x: abs(ltp_data.get(f"{exchange}:"+x["tradingsymbol"], {}).get('last_price', 999) - target_premium))['strike']
-        
-        pe_options = all_candidates[all_candidates['instrument_type'] == 'PE']
-        best_pe_strike = min(pe_options.to_dict('records'), 
-                             key=lambda x: abs(ltp_data.get(f"{exchange}:"+x["tradingsymbol"], {}).get('last_price', 999) - target_premium))['strike']
-        
+
+        ce_options = [o for o in all_candidates if o['instrument_type'] == 'CE']
+        best_ce_strike = min(ce_options, key=lambda x: abs(ltp_data.get(f"{exchange}:{x['tradingsymbol']}", {}).get('last_price', 999) - target_premium))['strike']
+
+        pe_options = [o for o in all_candidates if o['instrument_type'] == 'PE']
+        best_pe_strike = min(pe_options, key=lambda x: abs(ltp_data.get(f"{exchange}:{x['tradingsymbol']}", {}).get('last_price', 999) - target_premium))['strike']
+
         return best_ce_strike, best_pe_strike
     except Exception as e:
         print(f"Error finding buy strikes: {e}. Using Fallback.", flush=True)
         return atm_strike + 500, atm_strike - 500
-    
-def get_token_and_symbol(df, strike, instrument_type):
-    try:
-        row = df[(df['strike'] == strike) & (df['instrument_type'] == instrument_type)].iloc[0]
-        return int(row['instrument_token']), row['tradingsymbol']
-    except: return None, None
 
 # ==============================================================================
 # 4. DAILY PROCESS LIFECYCLE (The Worker)
 # ==============================================================================
 
 def run_trading_process():
+    tick_client = None
     try:
+        from kiteconnect import KiteConnect
+        from redis_tick_client import RedisTickClient
+
         print(f"\n{'='*60}", flush=True)
         print(f"[{get_now_str()}] DAILY TRADING PROCESS INITIALIZED", flush=True)
         print(f"{'='*60}", flush=True)
@@ -754,9 +862,9 @@ def run_trading_process():
 
         # 2. Authenticate
         try:
-            with open(AUTH_FILE_PATH, 'r') as f:
+            with open(AUTH_FILE_PATH, 'r', encoding='utf-8') as f:
                 data = f.read().split(',')
-                api_key, access_token = data[0], data[1]
+                api_key, access_token = data[0].strip(), data[1].strip()
             kite = KiteConnect(api_key=api_key)
             kite.set_access_token(access_token)
             print(f"[{get_now_str()}] Kite Session Authenticated.", flush=True)
@@ -764,26 +872,64 @@ def run_trading_process():
             print(f"[{get_now_str()}] CRITICAL ERROR: Auth failed. {e}", flush=True)
             return
 
-        # 3. Instruments
-        print(f"[{get_now_str()}] Fetching Instruments for {OPT_EXCHANGE} from Kite API...", flush=True)
+        # 3. Instruments (Compact Streamed Ingestion - Zero DataFrame bloat)
+        print(f"[{get_now_str()}] Fetching Instruments for {OPT_EXCHANGE}...", flush=True)
         try:
-            instruments_list = kite.instruments(OPT_EXCHANGE)
-            instruments_df = pd.DataFrame(instruments_list)
-            
-            nifty_options = instruments_df[
-                (instruments_df['name'] == INDEX_FILTER) & 
-                (instruments_df['segment'] == f"{OPT_EXCHANGE}-OPT")
-            ]
-            
-            if nifty_options.empty:
-                print(f"[{get_now_str()}] CRITICAL: No instruments found for {INDEX_FILTER} in {OPT_EXCHANGE}. Check filters.", flush=True)
-                return
+            options_by_strike = None
+            current_expiry = None
 
-            current_expiry = nifty_options['expiry'].unique()[0] 
-            nifty_options = nifty_options[nifty_options['expiry'] == current_expiry].copy()
-            del instruments_list
-            del instruments_df
-            is_expiry_day = (datetime.now().date() == pd.to_datetime(current_expiry).date())
+            # Priority A: Stream from local instrument_tokens.csv if available (< 2 MB RAM)
+            if os.path.exists(INSTRUMENT_FILE_PATH):
+                try:
+                    print(f"[{get_now_str()}] Loading instruments from local cache: {INSTRUMENT_FILE_PATH}", flush=True)
+                    options_by_strike, current_expiry = load_instruments_compact(INSTRUMENT_FILE_PATH, INDEX_FILTER, f"{OPT_EXCHANGE}-OPT")
+                except Exception as e:
+                    print(f"[{get_now_str()}] Local instrument cache load failed: {e}. Falling back to Kite API.", flush=True)
+                    options_by_strike = None
+
+            # Priority B: Fallback to Kite API with pure-Python filtering
+            if options_by_strike is None:
+                print(f"[{get_now_str()}] Fetching instruments from Kite API ({OPT_EXCHANGE})...", flush=True)
+                instruments_list = kite.instruments(OPT_EXCHANGE)
+                filtered_instruments = [
+                    row for row in instruments_list
+                    if row.get('name') == INDEX_FILTER and row.get('segment') == f"{OPT_EXCHANGE}-OPT"
+                ]
+                del instruments_list
+                trim_memory()
+
+                if not filtered_instruments:
+                    print(f"[{get_now_str()}] CRITICAL: No instruments found for {INDEX_FILTER} in {OPT_EXCHANGE}. Check filters.", flush=True)
+                    return
+
+                all_expiries = sorted(list(set(row['expiry'] for row in filtered_instruments)))
+                current_expiry = all_expiries[0]
+
+                options_by_strike = {}
+                for row in filtered_instruments:
+                    if row.get('expiry') == current_expiry:
+                        strike_val = int(round(float(row['strike'])))
+                        itype = str(row['instrument_type'])
+                        options_by_strike[(strike_val, itype)] = {
+                            'instrument_token': int(row['instrument_token']),
+                            'tradingsymbol': str(row['tradingsymbol']),
+                            'strike': strike_val,
+                            'instrument_type': itype
+                        }
+
+                del filtered_instruments
+                trim_memory()
+
+            nifty_options = options_by_strike
+
+            if isinstance(current_expiry, str):
+                expiry_date = datetime.strptime(current_expiry, '%Y-%m-%d').date()
+            elif hasattr(current_expiry, 'date'):
+                expiry_date = current_expiry.date()
+            else:
+                expiry_date = current_expiry
+
+            is_expiry_day = (datetime.now(IST).date() == expiry_date)
             print(f"[{get_now_str()}] Expiry Date: {current_expiry} (Is Today Expiry? {is_expiry_day})", flush=True)
             
         except Exception as e:
@@ -798,12 +944,12 @@ def run_trading_process():
             calc_time = "09:00"
             print(f"[{get_now_str()}] Pre-start setup active. Waiting for calculation time: {calc_time}", flush=True)
             while datetime.now().strftime("%H:%M") < calc_time:
-                time.sleep(1)
+                time.sleep(5)
 
             reference_dt = datetime.now(IST)
 
             if ATR_MODE_ON:
-                latest_atr, df_m = get_latest_atr_ema(
+                latest_atr, _ = get_latest_atr_ema(
                     kite,
                     spot_sym_full,
                     reference_dt,
@@ -823,7 +969,7 @@ def run_trading_process():
                     print(f"[{get_now_str()}] ATR Mode fallback: using configured entry gap {effective_entry_gap}.", flush=True)
 
             if VIX_STOP_MODE_ON:
-                vix_stop_per_lot, df_vix = get_vix_stop_per_lot(kite, reference_dt)
+                vix_stop_per_lot, _ = get_vix_stop_per_lot(kite, reference_dt)
                 if vix_stop_per_lot is not None:
                     max_loss_per_lot = vix_stop_per_lot
                     GLOBAL_MAX_LOSS = max_loss_per_lot * LOTS
@@ -840,16 +986,26 @@ def run_trading_process():
                     print(f"[{get_now_str()}] WARNING: Index Based Entry ATR fetch FAILED. index_based_entry will be DISABLED for today. Falling back to normal option-price entry logic.", flush=True)
                     INDEX_BASED_ENTRY = False
 
-        # 5. Wait for Start Time
+            trim_memory()
+
+        # 5. WebSocket (RedisTickClient)
+        tick_client = RedisTickClient(live_market_data, tick_lock)
+        tick_client.start()
+        spot_token = config.get('spot_token')
+        if spot_token:
+            tick_client.subscribe([spot_token])
+            print(f"[{get_now_str()}] Pre-subscribed spot index token {spot_token} ({spot_sym_full}) to WebSocket.", flush=True)
+        
+        # 6. Wait for Start Time
         print(f"\n[{get_now_str()}] Waiting for Start Time: {config['start']}...", flush=True)
         while True:
             now_str = datetime.now().strftime("%H:%M")
             if now_str >= config['start']: break
             time.sleep(1)
             
-        # 6. Levels
+        # 7. Levels
         print(f"\n[{get_now_str()}] --- CALCULATING LEVELS ---", flush=True)
-        spot_ltp = get_initial_spot_price(kite, spot_sym_full, config['start'])
+        spot_ltp = get_initial_spot_price(kite, spot_sym_full, config['start'], spot_token=config.get('spot_token'))
         
         if spot_ltp == 0:
             print(f"[{get_now_str()}] Error: Could not fetch Spot Price for {spot_sym_full}", flush=True)
@@ -860,10 +1016,11 @@ def run_trading_process():
         
         # --- ATM FINDER LOGIC ---
         if config.get('find_atm', True):
-            atm_strike = find_best_atm_strike(kite, mathematical_atm, nifty_options, step=STRIKE_STEP, exchange=OPT_EXCHANGE)
+            atm_strike, atm_ltp_data = find_best_atm_strike(kite, mathematical_atm, nifty_options, step=STRIKE_STEP, exchange=OPT_EXCHANGE)
         else:
             print(f"[{get_now_str()}] ATM Finder Disabled. Using Mathematical ATM: {mathematical_atm}", flush=True)
             atm_strike = mathematical_atm
+            atm_ltp_data = {}
         
         strike_gap = config['strike_gap']
         entry_put_strike = atm_strike + (strike_gap * STRIKE_STEP)
@@ -872,9 +1029,23 @@ def run_trading_process():
         token_entry_put, sym_entry_put = get_token_and_symbol(nifty_options, entry_put_strike, 'PE')
         token_entry_call, sym_entry_call = get_token_and_symbol(nifty_options, entry_call_strike, 'CE')
         
-        initial_prices = get_ltp_safe(kite, [f"{OPT_EXCHANGE}:{sym_entry_put}", f"{OPT_EXCHANGE}:{sym_entry_call}"])
-        price_put = initial_prices.get(f"{OPT_EXCHANGE}:{sym_entry_put}", {}).get('last_price', 0)
-        price_call = initial_prices.get(f"{OPT_EXCHANGE}:{sym_entry_call}", {}).get('last_price', 0)
+        sym_put_full = f"{OPT_EXCHANGE}:{sym_entry_put}"
+        sym_call_full = f"{OPT_EXCHANGE}:{sym_entry_call}"
+        price_put = atm_ltp_data.get(sym_put_full, {}).get('last_price', 0)
+        price_call = atm_ltp_data.get(sym_call_full, {}).get('last_price', 0)
+
+        # Cache check: only query Kite if missing from ATM scan cache (0ms on cache hit)
+        missing_entry_syms = []
+        if price_put == 0: missing_entry_syms.append(sym_put_full)
+        if price_call == 0: missing_entry_syms.append(sym_call_full)
+
+        if missing_entry_syms:
+            print(f"[{get_now_str()}] [CACHE MISS] Fetching entry strikes not in ATM scan: {missing_entry_syms}", flush=True)
+            fresh_prices = get_ltp_safe(kite, missing_entry_syms)
+            if price_put == 0: price_put = fresh_prices.get(sym_put_full, {}).get('last_price', 0)
+            if price_call == 0: price_call = fresh_prices.get(sym_call_full, {}).get('last_price', 0)
+        else:
+            print(f"[{get_now_str()}] [CACHE HIT] Entry strikes resolved instantly from ATM scan cache (0ms delay)", flush=True)
         
         print(f"[{get_now_str()}] Skew Balance Check | Before | PE Strike: {entry_put_strike} ({sym_entry_put}) | PE Price: {price_put} | CE Strike: {entry_call_strike} ({sym_entry_call}) | CE Price: {price_call} | Threshold: 1.25x", flush=True)
         if price_put > 1.25 * price_call:
@@ -911,7 +1082,35 @@ def run_trading_process():
             buy_strike_ce, buy_strike_pe = find_otm_buy_strikes(kite, atm_strike, nifty_options, exchange=OPT_EXCHANGE)
             token_buy_ce, sym_buy_ce = get_token_and_symbol(nifty_options, buy_strike_ce, 'CE')
             token_buy_pe, sym_buy_pe = get_token_and_symbol(nifty_options, buy_strike_pe, 'PE')
-            
+
+        # --- INDEX BASED ENTRY: Fetch index token and compute thresholds at start time ---
+        index_entry_threshold_put = None   # Index must break ABOVE this to enter PUT
+        index_entry_threshold_call = None  # Index must break BELOW this to enter CALL
+        token_spot_index = None            # Used by WebSocket (Bot 7 only)
+
+        if INDEX_BASED_ENTRY:
+            token_spot_index = config.get('spot_token')
+            if token_spot_index:
+                print(f"[{get_now_str()}] Index Based Entry | Spot index token (from config): {token_spot_index} ({spot_sym_full})", flush=True)
+            else:
+                try:
+                    spot_quote = kite.quote(spot_sym_full)
+                    token_spot_index = spot_quote.get(spot_sym_full, {}).get('instrument_token')
+                    print(f"[{get_now_str()}] Index Based Entry | Spot index token: {token_spot_index} ({spot_sym_full})", flush=True)
+                except Exception as e:
+                    print(f"[{get_now_str()}] Index Based Entry | WARNING: Could not fetch spot index token: {e}. Disabling INDEX_BASED_ENTRY.", flush=True)
+                    INDEX_BASED_ENTRY = False
+                    token_spot_index = None
+
+        # --- WebSocket subscriptions (Bot 7) ---
+        sub_tokens = [t for t in [token_entry_put, token_entry_call, token_hedge_put, token_hedge_call, token_buy_ce, token_buy_pe] if t]
+        if INDEX_BASED_ENTRY and token_spot_index:
+            if token_spot_index not in sub_tokens:
+                sub_tokens.append(token_spot_index)
+                print(f"[{get_now_str()}] Index Based Entry | Added spot index token {token_spot_index} to WebSocket subscriptions.", flush=True)
+        tick_client.subscribe(sub_tokens)
+        time.sleep(0.25) 
+        
         snap_symbols = [f"{OPT_EXCHANGE}:{s}" for s in [sym_entry_put, sym_entry_call, sym_hedge_put, sym_hedge_call, sym_buy_pe, sym_buy_ce] if s]
         snapshot = get_ltp_safe(kite, snap_symbols)
         
@@ -939,32 +1138,25 @@ def run_trading_process():
         initial_bc_price = snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_ce}", {}).get('last_price', 0) if sym_buy_ce else 0
 
         # --- INDEX BASED ENTRY: Compute index thresholds using spot_ltp fetched at start time (REST) ---
-        index_entry_threshold_put = None
-        index_entry_threshold_call = None
-
         if INDEX_BASED_ENTRY:
-            if index_entry_atr is None:
-                print(f"[{get_now_str()}] Index Based Entry | CRITICAL: ATR is None. Disabling INDEX_BASED_ENTRY.", flush=True)
+            index_ltp_at_start = spot_ltp
+            print(f"[{get_now_str()}] Index Based Entry | Using spot_ltp fetched at start time (REST): {index_ltp_at_start}", flush=True)
+
+            if index_ltp_at_start == 0 or index_entry_atr is None:
+                print(f"[{get_now_str()}] Index Based Entry | CRITICAL: Cannot compute index thresholds (index_ltp={index_ltp_at_start}, atr={index_entry_atr}). Disabling INDEX_BASED_ENTRY.", flush=True)
                 INDEX_BASED_ENTRY = False
             else:
-                # Use spot_ltp already fetched via REST at start time (get_ltp_safe call above at config['start'])
-                index_ltp_at_start = spot_ltp
-                print(f"[{get_now_str()}] Index Based Entry | Using spot_ltp fetched at start time (REST): {index_ltp_at_start}", flush=True)
-                if index_ltp_at_start == 0:
-                    print(f"[{get_now_str()}] Index Based Entry | CRITICAL: spot_ltp is 0. Disabling INDEX_BASED_ENTRY.", flush=True)
-                    INDEX_BASED_ENTRY = False
-                else:
-                    atr_band = index_entry_atr * ATR_ENTRY_MULTIPLIER
-                    index_entry_threshold_put  = index_ltp_at_start + atr_band
-                    index_entry_threshold_call = index_ltp_at_start - atr_band
-                    print(f"[{get_now_str()}] Index Based Entry THRESHOLDS SET:", flush=True)
-                    print(f"  Index LTP at Start ({config['start']}): {index_ltp_at_start}", flush=True)
-                    print(f"  ATR({INDEX_ENTRY_ATR_PERIOD}) from prev day: {index_entry_atr:.4f}", flush=True)
-                    print(f"  ATR Multiplier:                  {ATR_ENTRY_MULTIPLIER}", flush=True)
-                    print(f"  ATR Band (ATR x Multiplier):     {atr_band:.4f}", flush=True)
-                    print(f"  PUT  entry threshold (index > ): {index_entry_threshold_put:.2f}", flush=True)
-                    print(f"  CALL entry threshold (index < ): {index_entry_threshold_call:.2f}", flush=True)
-                    print(f"  NOTE: Stop prices will be computed from actual fill price at entry time.", flush=True)
+                atr_band = index_entry_atr * ATR_ENTRY_MULTIPLIER
+                index_entry_threshold_put  = index_ltp_at_start + atr_band  # PUT entry when index breaks ABOVE this
+                index_entry_threshold_call = index_ltp_at_start - atr_band  # CALL entry when index breaks BELOW this
+                print(f"[{get_now_str()}] Index Based Entry THRESHOLDS SET:", flush=True)
+                print(f"  Index LTP at Start ({config['start']}): {index_ltp_at_start}", flush=True)
+                print(f"  ATR({INDEX_ENTRY_ATR_PERIOD}) from prev day: {index_entry_atr:.4f}", flush=True)
+                print(f"  ATR Multiplier:                  {ATR_ENTRY_MULTIPLIER}", flush=True)
+                print(f"  ATR Band (ATR x Multiplier):     {atr_band:.4f}", flush=True)
+                print(f"  PUT  entry threshold (index > ): {index_entry_threshold_put:.2f}", flush=True)
+                print(f"  CALL entry threshold (index < ): {index_entry_threshold_call:.2f}", flush=True)
+                print(f"  NOTE: Stop prices will be computed from actual fill price at entry time.", flush=True)
         
         # --- TOTAL PREMIUM SKIP LOGIC ---
         total_premium = threshold_put + threshold_call
@@ -995,6 +1187,12 @@ def run_trading_process():
             print(f"BUY LEGS       | PE: {buy_strike_pe} (@ {initial_bp_price}) | CE: {buy_strike_ce} (@ {initial_bc_price})", flush=True)
         print(f"{'-'*60}\n", flush=True)
         
+        # Freeze static objects from GC scanning and trim memory
+        gc.collect()
+        if hasattr(gc, 'freeze'):
+            gc.freeze()
+        trim_memory()
+
         # ----------------------------------------------------------------------
         # 7. TRADING LOOP
         # ----------------------------------------------------------------------
@@ -1013,7 +1211,10 @@ def run_trading_process():
         final_realized_main_pnl = 0 
         realized_put_main_pnl, realized_put_hedge_pnl, realized_put_leg_pnl = 0, 0, 0
         realized_call_main_pnl, realized_call_hedge_pnl, realized_call_leg_pnl = 0, 0, 0
-        last_print_minute = datetime.now().minute
+        
+        last_monitored_marker = (-1, -1)
+        last_pnl_print_minute = -1
+        last_print_minute = datetime.now(IST).minute
         
         # --- CLOSING HELPER FUNCTIONS ---
         
@@ -1023,7 +1224,11 @@ def run_trading_process():
 
             print(f"\n[{get_now_str()}] !!! CLOSING PUT SIDE | REASON: {reason} !!!", flush=True)
             if sl_price: print(f"    STOP PRICE: {sl_price:.2f}", flush=True)
-
+            
+            with tick_lock: 
+                curr_price = live_market_data.get(token_entry_put, 0)
+                curr_hedge = live_market_data.get(token_hedge_put, 0)
+            
             place_order_with_retry(kite, sym_entry_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
             exec_price = get_quote_price(kite, sym_entry_put, 'BUY', exchange=OPT_EXCHANGE) 
             exit_price_put_sold = exec_price 
@@ -1071,6 +1276,10 @@ def run_trading_process():
 
             print(f"\n[{get_now_str()}] !!! CLOSING CALL SIDE | REASON: {reason} !!!", flush=True)
             if sl_price: print(f"    STOP PRICE: {sl_price:.2f}", flush=True)
+            
+            with tick_lock: 
+                curr_price = live_market_data.get(token_entry_call, 0)
+                curr_hedge = live_market_data.get(token_hedge_call, 0)
 
             place_order_with_retry(kite, sym_entry_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
             exec_price = get_quote_price(kite, sym_entry_call, 'BUY', exchange=OPT_EXCHANGE)
@@ -1152,43 +1361,54 @@ def run_trading_process():
             close_call_side(reason)
             close_buy_legs(reason)
 
-        print(f"[{get_now_str()}] Starting Main Loop...", flush=True)
+        print(f"[{get_now_str()}] Starting Main Loop (Monitoring Interval: {MONITORING_INTERVAL_SECONDS}s)...", flush=True)
         while True:
-            check_dt = wait_for_next_check_interval(TRADING_LOOP_CHECK_INTERVAL_MINUTES)
+            time.sleep(0.5)
+            now = datetime.now(IST)
             
-            if check_dt.strftime("%H:%M") >= config['exit']:
+            if now.strftime("%H:%M") >= config['exit']:
                 close_all_positions("Time_Exit")
                 break
-
-            current_snapshot = get_ltp_safe(kite, snap_symbols)
-            ltp_put = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_entry_put}", {}).get('last_price', 0)
-            ltp_call = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_entry_call}", {}).get('last_price', 0)
-            ltp_hedge_put = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_hedge_put}", {}).get('last_price', 0)
-            ltp_hedge_call = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_hedge_call}", {}).get('last_price', 0)
-            ltp_buy_put = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_pe}", {}).get('last_price', 0) if token_buy_pe else 0
-            ltp_buy_call = current_snapshot.get(f"{OPT_EXCHANGE}:{sym_buy_ce}", {}).get('last_price', 0) if token_buy_ce else 0
-
-            # Bot 9: Fetch index LTP via REST for index_based_entry
-            if INDEX_BASED_ENTRY:
-                ltp_index = get_ltp_safe(kite, [spot_sym_full]).get(spot_sym_full, {}).get('last_price', 0)
-                print(f"[{get_now_str()}] [INDEX_ENTRY_CHECK] Index LTP (REST): {ltp_index:.2f} | PUT thresh (>): {index_entry_threshold_put:.2f} | CALL thresh (<): {index_entry_threshold_call:.2f}", flush=True)
+                
+            current_second_marker = (now.minute, now.second)
+            if MONITORING_INTERVAL_SECONDS >= 60:
+                interval_mins = max(1, MONITORING_INTERVAL_SECONDS // 60)
+                is_monitoring_tick = (now.second == 0 and now.minute % interval_mins == 0) and (current_second_marker != last_monitored_marker)
             else:
-                ltp_index = 0
+                is_monitoring_tick = (now.second % MONITORING_INTERVAL_SECONDS == 0) and (current_second_marker != last_monitored_marker)
 
+            is_minute_tick = (now.second == 0) and (now.minute != last_pnl_print_minute)
+
+            if not is_monitoring_tick and not is_minute_tick:
+                continue
+
+            if is_monitoring_tick:
+                last_monitored_marker = current_second_marker
+            if is_minute_tick:
+                last_pnl_print_minute = now.minute
+
+            with tick_lock:
+                ltp_put = live_market_data.get(token_entry_put, 0)
+                ltp_call = live_market_data.get(token_entry_call, 0)
+                ltp_hedge_put = live_market_data.get(token_hedge_put, 0)
+                ltp_hedge_call = live_market_data.get(token_hedge_call, 0)
+                ltp_buy_put = live_market_data.get(token_buy_pe, 0) if token_buy_pe else 0
+                ltp_buy_call = live_market_data.get(token_buy_ce, 0) if token_buy_ce else 0
+                ltp_index = live_market_data.get(token_spot_index, 0) if (INDEX_BASED_ENTRY and token_spot_index) else 0
+                
             if ltp_put == 0 or ltp_call == 0: continue
-            risk_checks_enabled = check_dt.hour > config.get('skip_till_hour', 8)
+            risk_checks_enabled = now.hour > config.get('skip_till_hour', 8)
             
             # --- ENTRIES ---
-            # Determine whether to use index-based or option-price-based entry for sell legs
             if INDEX_BASED_ENTRY:
                 if ltp_index == 0:
-                    print(f"[{get_now_str()}] Index Based Entry | WARNING: index LTP is 0. Skipping entry checks.", flush=True)
+                    if datetime.now().minute != last_print_minute:
+                        print(f"[{get_now_str()}] Index Based Entry | WARNING: index LTP is 0 (WebSocket not ticked yet?). Skipping entry checks this iteration.", flush=True)
                     put_entry_condition  = False
                     call_entry_condition = False
                 else:
                     put_entry_condition  = ltp_index > index_entry_threshold_put   # Index broke above PUT threshold
                     call_entry_condition = ltp_index < index_entry_threshold_call  # Index broke below CALL threshold
-                    print(f"[{get_now_str()}] [INDEX_ENTRY_CHECK] PUT cond: {put_entry_condition} | CALL cond: {call_entry_condition}", flush=True)
             else:
                 put_entry_condition  = ltp_put  < threshold_put
                 call_entry_condition = ltp_call < threshold_call
@@ -1207,7 +1427,6 @@ def run_trading_process():
                 place_order_with_retry(kite, sym_entry_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_put_sold = get_quote_price(kite, sym_entry_put, 'SELL', exchange=OPT_EXCHANGE)
                 flag_sell_put = 1
-                # --- INDEX BASED ENTRY: Recompute stop_put from actual fill price ---
                 if INDEX_BASED_ENTRY:
                     stop_put = entry_price_put_sold * (1 + stop_percent * 0.01)
                     print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] PUT stop recomputed from fill price | Fill: {entry_price_put_sold} | Stop: {stop_put:.2f} ({stop_percent}%)", flush=True)
@@ -1228,14 +1447,13 @@ def run_trading_process():
                 place_order_with_retry(kite, sym_entry_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_call_sold = get_quote_price(kite, sym_entry_call, 'SELL', exchange=OPT_EXCHANGE)
                 flag_sell_call = 1
-                # --- INDEX BASED ENTRY: Recompute stop_call from actual fill price ---
                 if INDEX_BASED_ENTRY:
                     stop_call = entry_price_call_sold * (1 + stop_percent * 0.01)
                     print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] CALL stop recomputed from fill price | Fill: {entry_price_call_sold} | Stop: {stop_call:.2f} ({stop_percent}%)", flush=True)
                 print(f"[{get_now_str()}] OPENED CALL SIDE | Main: {entry_price_call_sold} | Hedge: {'DISABLED' if HEDGELESS_MODE else entry_price_hedge_call} | Stop: {stop_call:.2f}", flush=True)
                 append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), entry_call_strike, 'CE', initial_ec_price, entry_price_call_sold, 0, 0, final_realized_pnl, 'Open - Call_Sold'])
 
-            # --- BUYS (unchanged — always option-price based) ---
+            # --- BUYS ---
             if use_buy_legs:
                 if flag_buy_put == 0 and ltp_buy_put >= (2 * initial_bp_price):
                     print(f"\n[{get_now_str()}] >>> ENTRY BUY PUT | LTP: {ltp_buy_put} >= Trigger: {2 * initial_bp_price:.2f}", flush=True)
@@ -1287,9 +1505,9 @@ def run_trading_process():
                 close_all_positions(f"Skip_Hour_Loss_Bypass_({total_net_pnl:.2f})")
                 break
             
-            # --- MINUTE LOG ---
-            if check_dt.minute != last_print_minute:
-                print(f"\n[STATUS {check_dt.strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
+            # --- MINUTE LOG (Runs at :00s) ---
+            if is_minute_tick or (now.minute != last_print_minute and now.second == 0):
+                print(f"\n[STATUS {now.strftime('%H:%M:00')}] Net PnL: {round(current_net_pnl + final_realized_pnl, 2)} (Gross: {round(gross_pnl + final_realized_pnl, 2)} - Comm: {round(comm_curr, 2)})", flush=True)
                 print(f"STRIKES    | PUT: {entry_put_strike} PE ({sym_entry_put}) | CALL: {entry_call_strike} CE ({sym_entry_call})" + (f" | HEDGE PE: {hedge_put_strike} | HEDGE CE: {hedge_call_strike}" if not HEDGELESS_MODE else " | HEDGES: DISABLED") + (f" | BUY PE: {buy_strike_pe} | BUY CE: {buy_strike_ce}" if use_buy_legs else ""), flush=True)
                 print(f"RISK INFO  | Put Thresh: {threshold_put:.2f} | Put Stop: {stop_put:.2f} | Call Thresh: {threshold_call:.2f} | Call Stop: {stop_call:.2f} | Global Stop: {-GLOBAL_MAX_LOSS:.2f} | Stops Active: {'YES' if risk_checks_enabled else 'NO (SKIPPED)'}", flush=True)
                 if INDEX_BASED_ENTRY:
@@ -1354,7 +1572,8 @@ def run_trading_process():
                 if use_buy_legs:
                     print(f"BUY PE    | LTP: {ltp_buy_put:<6} | Trigger: {(2 * initial_bp_price):<6.2f} | Entry: {entry_price_put_bought:<6} | PnL: {round(pnl_bp, 2)}", flush=True)
                     print(f"BUY CE    | LTP: {ltp_buy_call:<6} | Trigger: {(2 * initial_bc_price):<6.2f} | Entry: {entry_price_call_bought:<6} | PnL: {round(pnl_bc, 2)}", flush=True)
-                last_print_minute = check_dt.minute
+                last_print_minute = now.minute
+                trim_memory()
 
             # --- STOP LOSS CHECKS ---
             if risk_checks_enabled and flag_sell_put == 1 and ltp_put >= stop_put:
@@ -1387,29 +1606,45 @@ def run_trading_process():
                 break
 
         # 8. End of Day Cleanup
+        if tick_client:
+            tick_client.stop()
+        
         print(f"\n{'='*30}", flush=True)
         print(f"FINAL DAY PNL: {final_realized_pnl:.2f}", flush=True)
         print(f"{'='*30}\n", flush=True)
         
         print("Tradebook Saved to CSV.", flush=True)
         
-        final_pnl_df = pd.read_csv(DAILY_PNL_CSV_PATH)
-        final_pnl_df.loc[len(final_pnl_df)] = [
+        file_exists = os.path.exists(DAILY_PNL_CSV_PATH)
+        pnl_row = [
             get_now_str(), entry_call_strike, entry_put_strike, buy_strike_ce, buy_strike_pe, 
             entry_price_call_sold, entry_price_put_sold, entry_price_call_bought, entry_price_put_bought, 
             exit_price_call_sold, exit_price_put_sold, exit_price_call_bought, exit_price_put_bought, 
             final_realized_pnl
         ]
-        final_pnl_df.to_csv(DAILY_PNL_CSV_PATH, index=False)
+        if not file_exists or os.path.getsize(DAILY_PNL_CSV_PATH) == 0:
+            append_csv_row(DAILY_PNL_CSV_PATH, [
+                'timestamp', 'entry_call_strike', 'entry_put_strike', 'buy_strike_ce', 'buy_strike_pe',
+                'entry_price_call_sold', 'entry_price_put_sold', 'entry_price_call_bought', 'entry_price_put_bought',
+                'exit_price_call_sold', 'exit_price_put_sold', 'exit_price_call_bought', 'exit_price_put_bought',
+                'final_realized_pnl'
+            ])
+        append_csv_row(DAILY_PNL_CSV_PATH, pnl_row)
         print("Daily Process Finished Successfully.", flush=True)
 
     except Exception as e:
+        if tick_client:
+            try:
+                tick_client.stop()
+            except Exception:
+                pass
         print(f"\nCRITICAL PROCESS CRASH: {e}", flush=True)
         import traceback
         traceback.print_exc()
         try:
             input("Press Enter to Exit Process...")
         except: pass
+
         
 # ==============================================================================
 # 5. PHOENIX SUPERVISOR (Pipe Proxy for IDLE Support + Safety Block)
