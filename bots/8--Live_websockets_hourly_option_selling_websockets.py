@@ -52,13 +52,28 @@ BUILD_CANDLE_FROM_MINUTES    = True
 # O = first tick of hour, H/L = running max/min, C = last tick at xx:15:01.
 BUILD_CANDLE_FROM_WS         = False
 
-# When True, fetches India VIX daily candles at startup, computes Supertrend(10,3)
-# on them, and overrides option_mode based on last completed day's supertrend:
-#   ST trending UP   -> market is calm/bullish -> BUY mode
-#   ST trending DOWN -> market is volatile     -> SELL mode
-# Overrides the static option_mode in DAY_CONFIGURATION.
-VIX_MODE                     = True
-VIX_ST_PERIOD                = 10    # Supertrend ATR period
+# ------------------------------------------------------------------------------
+# VIX DYNAMIC REGIME FILTER CONFIGURATION
+# ------------------------------------------------------------------------------
+# vix_ema_mode:
+#   1 = Dynamic mode per day based on 10:15 India VIX candle vs its 10-day EMA.
+#       Computed at 11:15 AM (matching Backtest_hourly_option_selling.py).
+#       today_vix >  VIX EMA(10) -> BUY  mode (volatility expanding)
+#       today_vix <= VIX EMA(10) -> SELL mode (volatility contracting)
+#       Overrides vix_supertrend_mode and static option_mode.
+#   0 = Disabled.
+VIX_EMA_MODE                 = 1
+VIX_EMA_PERIOD               = 10
+
+# vix_supertrend_mode (VIX_MODE):
+#   When VIX_EMA_MODE = 0 and VIX_SUPERTREND_MODE = 1:
+#   Fetches India VIX daily candles, computes Supertrend(10,3) on them,
+#   and overrides option_mode based on last completed day's supertrend:
+#     ST trending UP   -> BUY mode
+#     ST trending DOWN -> SELL mode
+VIX_SUPERTREND_MODE          = 0
+VIX_MODE                     = False   # alias kept for backwards compatibility
+VIX_ST_PERIOD                = 10      # Supertrend ATR period
 VIX_ST_MULTIPLIER            = 3.0
 
 ATR_PERIOD                   = 10    # ATR period for global stop calculation
@@ -128,6 +143,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
     1: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 25,
         'lots': 2, 'live_mode': 1,
@@ -140,6 +158,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
     2: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 25,
         'lots': 1, 'live_mode': 1,
@@ -152,6 +173,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
     3: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 19,
         'lots': 3, 'live_mode': 1,
@@ -164,6 +188,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
     4: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 25,
         'lots': 2, 'live_mode': 1,
@@ -176,6 +203,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
     5: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 15,
         'lots': 3, 'live_mode': 1,
@@ -188,6 +218,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
     6: {'target_index': 'SENSEX', 'start': '11:15', 'exit_hour': 15, 'exit_minute': 15,
         'lots': 5, 'live_mode': 0,
@@ -200,6 +233,9 @@ DAY_CONFIGURATION = {
         'INSIDE_BAR_LOGIC_ENABLED'   : True,
         'TRAILING_STOP_LOGIC_ENABLED': True,
         'option_mode'                : 'buy',
+        'vix_ema_mode'               : 1,
+        'vix_ema_period'             : 10,
+        'vix_supertrend_mode'        : 0,
         },
 }
 
@@ -325,16 +361,19 @@ def get_quote_price(kite, symbol, side, exchange='NFO'):
             time.sleep(1)
     return 0.0
 
-def place_order(kite, symbol, qty, side, live_mode, exchange='BFO'):
+def place_order(kite, symbol, qty, side, live_mode, exchange='BFO', known_ltp=None):
     if live_mode == 0:
         print(f"[PAPER] {side} {qty}x {symbol} on {exchange}", flush=True)
-        return True
+        paper_price = known_ltp if (known_ltp is not None and known_ltp > 0) else 0.0
+        return True, paper_price
 
     ltp_sym    = f"{exchange}:{symbol}"
     order_side = kite.TRANSACTION_TYPE_BUY if side == 'BUY' else kite.TRANSACTION_TYPE_SELL
 
-    # --- Helper 1: Fetch LTP via kite.ltp ---
+    # --- Helper 1: Fetch LTP via known_ltp or kite.ltp ---
     def get_ltp():
+        if known_ltp is not None and known_ltp > 0:
+            return known_ltp
         ltp_sleep = 0.5
         for attempt in range(10):
             try:
@@ -362,7 +401,7 @@ def place_order(kite, symbol, qty, side, live_mode, exchange='BFO'):
     current_ltp = get_ltp()
     if current_ltp is None:
         print(f"    [order] order_placement_failed: could not fetch LTP for {symbol}", flush=True)
-        return False
+        return False, 0.0
 
     # 2. Place initial limit order
     limit_price   = get_limit_price(current_ltp)
@@ -389,18 +428,33 @@ def place_order(kite, symbol, qty, side, live_mode, exchange='BFO'):
             print(f"    [order] place error attempt {place_retries}/10: {e}", flush=True)
             if place_retries == 10:
                 print(f"    [order] order_placement_failed for {symbol}", flush=True)
-                return False
+                return False, 0.0
             time.sleep(place_sleep)
             if place_retries >= 3:
                 place_sleep += 1.0
 
     if not order_id:
-        return False
+        return False, 0.0
 
     # 3. Monitor fill and chase price if partial/unfilled
     max_modifications = 10
     mod_count         = 0
     mod_sleep         = 1.0
+
+    # Fast probe (150ms): 95% of aggressive limit orders execute within 50-100ms
+    time.sleep(0.15)
+    try:
+        latest_state = kite.order_history(order_id)[-1]
+        status       = latest_state['status']
+        if status == 'COMPLETE':
+            avg_price = float(latest_state.get('average_price', limit_price))
+            print(f"    [order] {side} {qty}x {symbol} FILLED (fast probe) | avg_price: {avg_price:.2f} | id: {order_id} [OK]", flush=True)
+            return True, avg_price
+        elif status in ['REJECTED', 'CANCELLED']:
+            print(f"    [order] Order {status} for {symbol} | reason: {latest_state.get('status_message', 'Unknown')}", flush=True)
+            return False, 0.0
+    except Exception as e:
+        print(f"    [order] fast probe check error: {e}", flush=True)
 
     while mod_count < max_modifications:
         time.sleep(mod_sleep)
@@ -410,12 +464,13 @@ def place_order(kite, symbol, qty, side, live_mode, exchange='BFO'):
             pending_qty  = latest_state.get('pending_quantity', 0)
 
             if status == 'COMPLETE':
-                print(f"    [order] {side} {qty}x {symbol} FILLED | limit: {limit_price:.2f} | id: {order_id} [OK]", flush=True)
-                return True
+                avg_price = float(latest_state.get('average_price', limit_price))
+                print(f"    [order] {side} {qty}x {symbol} FILLED | avg_price: {avg_price:.2f} | id: {order_id} [OK]", flush=True)
+                return True, avg_price
 
             elif status in ['REJECTED', 'CANCELLED']:
                 print(f"    [order] Order {status} for {symbol} | reason: {latest_state.get('status_message', 'Unknown')}", flush=True)
-                return False
+                return False, 0.0
 
             elif pending_qty > 0:
                 print(f"    [order] Partial/no fill | pending: {pending_qty} | chasing price...", flush=True)
@@ -441,7 +496,7 @@ def place_order(kite, symbol, qty, side, live_mode, exchange='BFO'):
             mod_sleep += 1.0
 
     print(f"    [order] WARNING: max modifications ({max_modifications}) reached for {symbol} — order may still be pending.", flush=True)
-    return False
+    return False, 0.0
 
 
 def get_token_and_symbol(df, strike, instrument_type):
@@ -509,8 +564,120 @@ def on_close(ws, code, reason):
     print(f"WebSocket closed | code: {code} | reason: {reason}", flush=True)
 
 # ==============================================================================
-# 4.  VIX SUPERTREND  (option mode override)
+# 4.  VIX REGIME FILTERS  (VIX EMA & VIX Supertrend)
 # ==============================================================================
+
+def calculate_vix_ema(kite, vix_ema_period=10, max_retries=8, retry_wait=1.0):
+    """
+    Fetches historical 60minute candles for INDIA VIX (NSE token: 264969),
+    filters strictly for the 10:15:00 candle close (which completes at 11:15:00 AM),
+    deduplicates by date, and computes the N-day EMA (ewm(span=vix_ema_period, adjust=False).mean()).
+
+    Matches Backtest_hourly_option_selling.py:
+      vix_target_time = (pd.to_datetime(start_time) - timedelta(hours=1)).time()  # 10:15:00
+      df_vix_start = df_vix[df_vix.index.time == vix_target_time].copy()
+      df_vix_start['vix_close_round'] = df_vix_start['close'].round(2)
+      df_vix_start['vix_ema'] = df_vix_start['vix_close_round'].ewm(span=vix_ema_period, adjust=False).mean()
+
+    Returns:
+      'buy'  if today_vix >  vix_ema (volatility expanding -> option buying)
+      'sell' if today_vix <= vix_ema (volatility contracting -> option selling)
+      None   if fetch / calculation fails after all retries (triggers fallback)
+    """
+    VIX_TOKEN = 264969
+    try:
+        now         = datetime.now(IST)
+        today       = now.date()
+        target_time = datetime.strptime('10:15', '%H:%M').time()
+        from_dt     = now - timedelta(days=90)
+
+        print(f"[{get_now_str()}] [VIX EMA] Fetching 60minute VIX candles (from {from_dt.strftime('%Y-%m-%d')})...", flush=True)
+
+        df_1015 = pd.DataFrame()
+        today_candle_found = False
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                candles = kite.historical_data(
+                    instrument_token = VIX_TOKEN,
+                    from_date        = from_dt.strftime('%Y-%m-%d 09:15:00'),
+                    to_date          = datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'),
+                    interval         = '60minute',
+                    continuous       = False,
+                    oi               = False,
+                )
+            except Exception as e:
+                print(f"[{get_now_str()}] [VIX EMA] Historical API fetch error (attempt {attempt}/{max_retries}): {e}", flush=True)
+                candles = None
+
+            if candles:
+                df_raw = pd.DataFrame(candles)
+                df_raw['date'] = pd.to_datetime(df_raw['date'])
+                # Normalize timezone to IST
+                if df_raw['date'].dt.tz is not None:
+                    df_raw['date_local'] = df_raw['date'].dt.tz_convert(IST)
+                else:
+                    df_raw['date_local'] = df_raw['date'].dt.tz_localize(IST)
+
+                # Filter strictly for 10:15:00 candles
+                df_filtered = df_raw[df_raw['date_local'].dt.time == target_time].copy()
+
+                # Verify if today's 10:15 candle has finalized
+                today_rows = df_filtered[df_filtered['date_local'].dt.date == today]
+                if not today_rows.empty and today_rows.iloc[-1]['close'] > 0:
+                    today_candle_found = True
+                    df_1015 = df_filtered
+                    print(f"[{get_now_str()}] [VIX EMA] Today's 10:15 VIX candle verified (attempt {attempt}/{max_retries}) | close: {today_rows.iloc[-1]['close']:.2f}", flush=True)
+                    break
+
+            print(f"[{get_now_str()}] [VIX EMA] Attempt {attempt}/{max_retries}: Today's 10:15 candle not yet returned by Zerodha | retrying in {retry_wait}s...", flush=True)
+            if attempt < max_retries:
+                time.sleep(retry_wait)
+
+        if not today_candle_found or df_1015.empty:
+            print(f"[{get_now_str()}] [VIX EMA] WARNING: Could not retrieve today's 10:15 candle after {max_retries} attempts.", flush=True)
+            return None
+
+        # Deduplicate historical 10:15 candles by date keeping latest
+        df_1015['date_norm'] = df_1015['date_local'].dt.date
+        df_clean = (
+            df_1015.drop_duplicates(subset=['date_norm'], keep='last')
+                   .sort_values('date_local')
+                   .reset_index(drop=True)
+        )
+
+        if len(df_clean) < vix_ema_period + 2:
+            print(f"[{get_now_str()}] [VIX EMA] WARNING: Not enough 10:15 candles ({len(df_clean)}) for EMA({vix_ema_period}).", flush=True)
+            return None
+
+        # Compute EMA matching backtest
+        df_clean['vix_close_round'] = df_clean['close'].round(2)
+        df_clean['vix_ema'] = df_clean['vix_close_round'].ewm(span=vix_ema_period, adjust=False).mean()
+
+        today_row   = df_clean.iloc[-1]
+        today_vix   = float(today_row['vix_close_round'])
+        vix_ema_val = float(round(today_row['vix_ema'], 2))
+
+        print(f"[{get_now_str()}] [VIX EMA] Last 5 daily 10:15 VIX candles (including today):", flush=True)
+        display_cols = ['date_norm', 'open', 'high', 'low', 'close', 'vix_close_round', 'vix_ema']
+        avail = [c for c in display_cols if c in df_clean.columns]
+        print(df_clean[avail].tail(5).to_string(index=False), flush=True)
+
+        if today_vix > vix_ema_val:
+            option_mode = 'buy'
+            reason_str  = f"BUY (VIX {today_vix:.2f} > EMA{vix_ema_period} {vix_ema_val:.2f})"
+        else:
+            option_mode = 'sell'
+            reason_str  = f"SELL (VIX {today_vix:.2f} <= EMA{vix_ema_period} {vix_ema_val:.2f})"
+
+        print(f"[{get_now_str()}] [VIX EMA] Today 10:15 VIX: {today_vix:.2f} | EMA({vix_ema_period}): {vix_ema_val:.2f} -> {reason_str} | Mode: {option_mode.upper()}", flush=True)
+        return option_mode
+
+    except Exception as e:
+        print(f"[{get_now_str()}] [VIX EMA] Calculation failed: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        return None
+
 
 def calculate_vix_supertrend(kite):
     """
@@ -947,10 +1114,14 @@ def run_trading_process():
         POS1_STOP                   = config.get('pos1_stop', 20000)
         POS2_CLOSE_TARGET           = config.get('pos2_close_target', 50000)
         OPTION_MODE                 = config.get('option_mode', 'sell')     # 'sell' or 'buy'
+        vix_ema_mode                = config.get('vix_ema_mode', VIX_EMA_MODE)
+        vix_ema_period              = config.get('vix_ema_period', VIX_EMA_PERIOD)
+        vix_supertrend_mode         = config.get('vix_supertrend_mode', VIX_SUPERTREND_MODE)
 
-        print(f"Mode:      {'LIVE' if LIVE_MODE else 'PAPER'} | Option mode: {OPTION_MODE} | POS1 offset: +{POS1_STRIKE_OFFSET} | POS2 offset: +{POS2_STRIKE_OFFSET}", flush=True)
+        print(f"Mode:      {'LIVE' if LIVE_MODE else 'PAPER'} | Initial option_mode: {OPTION_MODE} | POS1 offset: +{POS1_STRIKE_OFFSET} | POS2 offset: +{POS2_STRIKE_OFFSET}", flush=True)
         print(f"Index:     {SYMBOL_NAME} | Lots: {LOTS} | Qty: {QUANTITY}", flush=True)
         print(f"Exit:      {EXIT_HOUR}:{EXIT_MINUTE:02d}", flush=True)
+        print(f"VIX:       vix_ema_mode={vix_ema_mode} (period={vix_ema_period}) | vix_supertrend_mode={vix_supertrend_mode}", flush=True)
 
         # -- Authenticate ------------------------------------------------------
         try:
@@ -1045,22 +1216,42 @@ def run_trading_process():
         # -- Wait for start time -----------------------------------------------
         print(f"[{get_now_str()}] Waiting for start: {config['start']}...", flush=True)
 
-        # -- VIX Supertrend mode override (runs before start time wait) --------
-        if VIX_MODE:
-            print(f"[{get_now_str()}] [VIX] VIX_MODE enabled — computing supertrend to determine option_mode...", flush=True)
-            vix_mode = calculate_vix_supertrend(kite)
-            if vix_mode is not None:
-                OPTION_MODE = vix_mode
-                print(f"[{get_now_str()}] [VIX] option_mode overridden to: {OPTION_MODE.upper()}", flush=True)
-            else:
-                print(f"[{get_now_str()}] [VIX] Supertrend failed — keeping static option_mode: {OPTION_MODE.upper()}", flush=True)
-        else:
-            print(f"[{get_now_str()}] VIX_MODE disabled — using static option_mode: {OPTION_MODE.upper()}", flush=True)
-
         while True:
             if get_now().strftime('%H:%M') >= config['start']:
                 break
             time.sleep(5)
+
+        # -- Live Check at 11:15 AM: wait 5 sec buffer after 11:15:00 ----------
+        print(f"[{get_now_str()}] Start time {config['start']} reached. Waiting 5s buffer for 10:15 candles to settle...", flush=True)
+        while True:
+            now = get_now()
+            if (now.hour == 11 and now.minute == 15 and now.second >= 5) or \
+               (now.hour == 11 and now.minute > 15) or now.hour > 11:
+                break
+            time.sleep(0.1)
+
+        # -- VIX mode determination (EMA overrides Supertrend) -----------------
+        if vix_ema_mode == 1:
+            print(f"[{get_now_str()}] [VIX] vix_ema_mode enabled — computing 10:15 VIX EMA({vix_ema_period})...", flush=True)
+            vix_mode = calculate_vix_ema(kite, vix_ema_period=vix_ema_period)
+            if vix_mode is not None:
+                OPTION_MODE = vix_mode
+                print(f"[{get_now_str()}] [VIX] option_mode set by VIX EMA to: {OPTION_MODE.upper()}", flush=True)
+            else:
+                OPTION_MODE = config.get('option_mode', 'buy')
+                print(f"[{get_now_str()}] [VIX] VIX EMA failed — falling back to static option_mode: {OPTION_MODE.upper()}", flush=True)
+        elif vix_supertrend_mode == 1 or VIX_MODE:
+            print(f"[{get_now_str()}] [VIX] VIX Supertrend mode enabled — computing supertrend to determine option_mode...", flush=True)
+            vix_mode = calculate_vix_supertrend(kite)
+            if vix_mode is not None:
+                OPTION_MODE = vix_mode
+                print(f"[{get_now_str()}] [VIX] option_mode set by VIX Supertrend to: {OPTION_MODE.upper()}", flush=True)
+            else:
+                OPTION_MODE = config.get('option_mode', 'buy')
+                print(f"[{get_now_str()}] [VIX] Supertrend failed — keeping static option_mode: {OPTION_MODE.upper()}", flush=True)
+        else:
+            OPTION_MODE = config.get('option_mode', 'buy')
+            print(f"[{get_now_str()}] VIX modes disabled — using static option_mode: {OPTION_MODE.upper()}", flush=True)
 
         # -- Calculate global_stop via ATR EMA200 ------------------------------
         print(f"[{get_now_str()}] Calculating ATR EMA200 for global stop...", flush=True)
@@ -1305,11 +1496,11 @@ def run_trading_process():
                 print(f"[{get_now_str()}] {action_str} {label} skipped  -  LTP is 0 (WS + REST both failed)", flush=True)
                 return False
 
-            order_ok = place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE)
+            order_ok, fill_price = place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE, known_ltp=ltp)
             if not order_ok:
                 print(f"[{get_now_str()}] {action_str} {label} skipped  -  order placement failed for {sym}", flush=True)
                 return False
-            exec_price = get_quote_price(kite, sym, order_side, exchange=OPT_EXCHANGE) if LIVE_MODE else ltp
+            exec_price = fill_price if (LIVE_MODE and fill_price > 0) else (get_quote_price(kite, sym, order_side, exchange=OPT_EXCHANGE) if LIVE_MODE else ltp)
 
             entry_call_price      = exec_price
             # Index stop: for sell -> opposite trigger (long_entry); for buy -> short_entry (if price reverses back)
@@ -1320,7 +1511,7 @@ def run_trading_process():
                 first_position_side = 'call'
 
             trigger_ref = short_entry_price if OPTION_MODE == 'sell' else long_entry_price
-            print(f"[{get_now_str()}] {action_str} {label} OPENED | Strike: {entry_call_strike} | Entry: {exec_price} | Index: {spot_now} | Trigger: {trigger_ref} | Stop: {stop_call_index_price}", flush=True)
+            print(f"[{get_now_str()}] {action_str} {label} OPENED | Strike: {entry_call_strike} | Entry: {exec_price} | Index: {current_spot} | Trigger: {trigger_ref} | Stop: {stop_call_index_price}", flush=True)
             tradebook_df.loc[len(tradebook_df)] = [
                 get_now_str(), str(current_expiry), entry_call_strike, 'CE',
                 exec_price, None, None, None,
@@ -1354,11 +1545,11 @@ def run_trading_process():
                 print(f"[{get_now_str()}] {action_str} {label} skipped  -  LTP is 0 (WS + REST both failed)", flush=True)
                 return False
 
-            order_ok = place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE)
+            order_ok, fill_price = place_order(kite, sym, QUANTITY, order_side, LIVE_MODE, exchange=OPT_EXCHANGE, known_ltp=ltp)
             if not order_ok:
                 print(f"[{get_now_str()}] {action_str} {label} skipped  -  order placement failed for {sym}", flush=True)
                 return False
-            exec_price = get_quote_price(kite, sym, order_side, exchange=OPT_EXCHANGE) if LIVE_MODE else ltp
+            exec_price = fill_price if (LIVE_MODE and fill_price > 0) else (get_quote_price(kite, sym, order_side, exchange=OPT_EXCHANGE) if LIVE_MODE else ltp)
 
             entry_put_price      = exec_price
             # Index stop: for sell -> opposite trigger (short_entry); for buy -> long_entry (if price reverses back)
@@ -1369,7 +1560,7 @@ def run_trading_process():
                 first_position_side = 'put'
 
             trigger_ref = long_entry_price if OPTION_MODE == 'sell' else short_entry_price
-            print(f"[{get_now_str()}] {action_str} {label} OPENED | Strike: {entry_put_strike} | Entry: {exec_price} | Index: {spot_now} | Trigger: {trigger_ref} | Stop: {stop_put_index_price}", flush=True)
+            print(f"[{get_now_str()}] {action_str} {label} OPENED | Strike: {entry_put_strike} | Entry: {exec_price} | Index: {current_spot} | Trigger: {trigger_ref} | Stop: {stop_put_index_price}", flush=True)
             tradebook_df.loc[len(tradebook_df)] = [
                 get_now_str(), str(current_expiry), entry_put_strike, 'PE',
                 exec_price, None, None, None,
@@ -1385,8 +1576,8 @@ def run_trading_process():
             exit_side  = 'SELL' if OPTION_MODE == 'buy' else 'BUY'
             action_str = 'BUY CALL' if OPTION_MODE == 'buy' else 'SELL CALL'
 
-            place_order(kite, sym, QUANTITY, exit_side, LIVE_MODE, exchange=OPT_EXCHANGE)
-            exec_price = get_quote_price(kite, sym, exit_side, exchange=OPT_EXCHANGE) if LIVE_MODE else current_ltp
+            order_ok, fill_price = place_order(kite, sym, QUANTITY, exit_side, LIVE_MODE, exchange=OPT_EXCHANGE, known_ltp=current_ltp)
+            exec_price = fill_price if (LIVE_MODE and fill_price > 0) else (get_quote_price(kite, sym, exit_side, exchange=OPT_EXCHANGE) if LIVE_MODE else current_ltp)
 
             # buy mode: profit when exit > entry; sell mode: profit when entry > exit
             if OPTION_MODE == 'buy':
@@ -1420,8 +1611,8 @@ def run_trading_process():
             exit_side  = 'SELL' if OPTION_MODE == 'buy' else 'BUY'
             action_str = 'BUY PUT' if OPTION_MODE == 'buy' else 'SELL PUT'
 
-            place_order(kite, sym, QUANTITY, exit_side, LIVE_MODE, exchange=OPT_EXCHANGE)
-            exec_price = get_quote_price(kite, sym, exit_side, exchange=OPT_EXCHANGE) if LIVE_MODE else current_ltp
+            order_ok, fill_price = place_order(kite, sym, QUANTITY, exit_side, LIVE_MODE, exchange=OPT_EXCHANGE, known_ltp=current_ltp)
+            exec_price = fill_price if (LIVE_MODE and fill_price > 0) else (get_quote_price(kite, sym, exit_side, exchange=OPT_EXCHANGE) if LIVE_MODE else current_ltp)
 
             # buy mode: profit when exit > entry; sell mode: profit when entry > exit
             if OPTION_MODE == 'buy':
@@ -1769,8 +1960,13 @@ def run_trading_process():
                             realized_profit = leg_pnl
                             pos_num         = 1
                             print('Look_for_second_reverse_position', flush=True)
-                            if realized_profit < 0 and first_position_side == 'call' and spot_now >= long_entry_price:
-                                try_open_put('2nd', spot_now)
+                            if realized_profit < 0:
+                                if OPTION_MODE == 'sell':
+                                    if close_reason == 'index_sl_hit' or spot_now >= long_entry_price:
+                                        try_open_put('2nd', spot_now)
+                                else:  # buy
+                                    if close_reason == 'index_sl_hit' or spot_now <= short_entry_price:
+                                        try_open_put('2nd', spot_now)
                             elif realized_profit >= 0:
                                 print(f"[{get_now_str()}] Realized profit not negative | day_over", flush=True)
                                 day_over = True
@@ -1821,8 +2017,13 @@ def run_trading_process():
                             realized_profit = leg_pnl
                             pos_num         = 1
                             print('Look_for_second_reverse_position', flush=True)
-                            if realized_profit < 0 and first_position_side == 'put' and spot_now <= short_entry_price:
-                                try_open_call('2nd', spot_now)
+                            if realized_profit < 0:
+                                if OPTION_MODE == 'sell':
+                                    if close_reason == 'index_sl_hit' or spot_now <= short_entry_price:
+                                        try_open_call('2nd', spot_now)
+                                else:  # buy
+                                    if close_reason == 'index_sl_hit' or spot_now >= long_entry_price:
+                                        try_open_call('2nd', spot_now)
                             elif realized_profit >= 0:
                                 print(f"[{get_now_str()}] Realized profit not negative | day_over", flush=True)
                                 day_over = True

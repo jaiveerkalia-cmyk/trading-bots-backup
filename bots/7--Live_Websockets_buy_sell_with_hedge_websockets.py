@@ -102,18 +102,11 @@ INDEX_DETAILS = {
 # ------------------------------------------------------------------------------
 DAY_CONFIGURATION = {
     # Monday (NIFTY)
-    # 0: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
-    #     'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
-    #     'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-    #     'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
-    #     'index_based_entry': False, 'atr_entry_multiplier': 2},
-
-    # Monday (NIFTY)
-    0: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
-        'total_premium_skip': False, 'buy_strikes_flag': True, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
+    0: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:25', 'entry_gap': 5, 'strike_gap': 2, 'lots': 4, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
+        'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
         'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
-        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 30, 'vix_stop_mode_on': True, 'hedgeless_mode': True,
-        'index_based_entry': True, 'atr_entry_multiplier': 2},
+        'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
+        'index_based_entry': False, 'atr_entry_multiplier': 2},
     
     # Tuesday (NIFTY)
     1: {'target_index': 'NIFTY', 'start': '09:20', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 2, 'lots': 3, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
@@ -137,7 +130,7 @@ DAY_CONFIGURATION = {
         'index_based_entry': True, 'atr_entry_multiplier': 1.5},
 
     # Friday (NIFTY)
-   4: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:19', 'entry_gap': 5, 'strike_gap': 0, 'lots': 5, 'live_mode': 0, 'percent_mode': 0, 'find_atm': True,
+   4: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:25', 'entry_gap': 5, 'strike_gap': 0, 'lots': 5, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
             'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
             'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
             'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,
@@ -1398,6 +1391,8 @@ def run_trading_process():
                 
             if ltp_put == 0 or ltp_call == 0: continue
             risk_checks_enabled = now.hour > config.get('skip_till_hour', 8)
+            position_opened_this_tick = False
+            position_stopped_this_tick = False
             
             # --- ENTRIES ---
             if INDEX_BASED_ENTRY:
@@ -1427,6 +1422,7 @@ def run_trading_process():
                 place_order_with_retry(kite, sym_entry_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_put_sold = get_quote_price(kite, sym_entry_put, 'SELL', exchange=OPT_EXCHANGE)
                 flag_sell_put = 1
+                position_opened_this_tick = True
                 if INDEX_BASED_ENTRY:
                     stop_put = entry_price_put_sold * (1 + stop_percent * 0.01)
                     print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] PUT stop recomputed from fill price | Fill: {entry_price_put_sold} | Stop: {stop_put:.2f} ({stop_percent}%)", flush=True)
@@ -1447,6 +1443,7 @@ def run_trading_process():
                 place_order_with_retry(kite, sym_entry_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
                 entry_price_call_sold = get_quote_price(kite, sym_entry_call, 'SELL', exchange=OPT_EXCHANGE)
                 flag_sell_call = 1
+                position_opened_this_tick = True
                 if INDEX_BASED_ENTRY:
                     stop_call = entry_price_call_sold * (1 + stop_percent * 0.01)
                     print(f"[{get_now_str()}] [INDEX_BASED_ENTRY] CALL stop recomputed from fill price | Fill: {entry_price_call_sold} | Stop: {stop_call:.2f} ({stop_percent}%)", flush=True)
@@ -1460,6 +1457,7 @@ def run_trading_process():
                     place_order_with_retry(kite, sym_buy_pe, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
                     entry_price_put_bought = get_quote_price(kite, sym_buy_pe, 'BUY', exchange=OPT_EXCHANGE)
                     flag_buy_put = 1
+                    position_opened_this_tick = True
                     print(f"[{get_now_str()}] OPENED BUY PUT | Entry: {entry_price_put_bought}", flush=True)
                     append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), buy_strike_pe, 'PE', initial_bp_price, entry_price_put_bought, 0, 0, final_realized_pnl, 'Open - Put_Bought'])
                 
@@ -1468,6 +1466,7 @@ def run_trading_process():
                     place_order_with_retry(kite, sym_buy_ce, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
                     entry_price_call_bought = get_quote_price(kite, sym_buy_ce, 'BUY', exchange=OPT_EXCHANGE)
                     flag_buy_call = 1
+                    position_opened_this_tick = True
                     print(f"[{get_now_str()}] OPENED BUY CALL | Entry: {entry_price_call_bought}", flush=True)
                     append_csv_row(TRADEBOOK_CSV_PATH, [get_now_str(), buy_strike_ce, 'CE', initial_bc_price, entry_price_call_bought, 0, 0, final_realized_pnl, 'Open - Call_Bought'])
 
@@ -1496,7 +1495,8 @@ def run_trading_process():
             total_net_pnl = current_net_pnl + final_realized_pnl
 
             if (
-                skip_checking_till_hour_loss_bypass > 0
+                not position_opened_this_tick
+                and skip_checking_till_hour_loss_bypass > 0
                 and not risk_checks_enabled
                 and total_net_pnl <= -(GLOBAL_MAX_LOSS * skip_checking_till_hour_loss_bypass)
             ):
@@ -1579,10 +1579,12 @@ def run_trading_process():
             if risk_checks_enabled and flag_sell_put == 1 and ltp_put >= stop_put:
                 print(f"!!! STOP LOSS TRIGGERED: PUT SIDE ({ltp_put} >= {stop_put:.2f}) !!!", flush=True)
                 close_put_side("SL_Put", sl_price=stop_put) 
+                position_stopped_this_tick = True
                 
             if risk_checks_enabled and flag_sell_call == 1 and ltp_call >= stop_call:
                 print(f"!!! STOP LOSS TRIGGERED: CALL SIDE ({ltp_call} >= {stop_call:.2f}) !!!", flush=True)
                 close_call_side("SL_Call", sl_price=stop_call)
+                position_stopped_this_tick = True
 
             # Re-calculate open pnl
             pnl_sp = (QUANTITY * (entry_price_put_sold - ltp_put)) if flag_sell_put == 1 else 0
@@ -1601,6 +1603,14 @@ def run_trading_process():
             
             net_main_total = (open_main_gross - open_main_comm) + final_realized_main_pnl
             
+            # Defer global stop/target check if a position was opened or stopped on this tick
+            if position_opened_this_tick or position_stopped_this_tick:
+                action_reasons = []
+                if position_opened_this_tick: action_reasons.append("opened")
+                if position_stopped_this_tick: action_reasons.append("stopped")
+                print(f"[{get_now_str()}] Position {' & '.join(action_reasons)} this tick. Deferring global stop/target check to next tick.", flush=True)
+                continue
+
             if risk_checks_enabled and (net_main_total > GLOBAL_PROFIT_TARGET or net_main_total < -GLOBAL_MAX_LOSS):
                 close_all_positions(f"Global_Target_({net_main_total:.2f})")
                 break
