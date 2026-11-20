@@ -1563,7 +1563,7 @@ def _index_exit_wrapper(side):
                 comp.index_exit_component('Put', 'Tgt', 'put_index_target_time', 'put_index_target_val', 'put_index_tgt_active')
 
 def build_left_stack():
-    comp.unified_entry_card('Call', 'call', on_fire_market=lambda: handle_fire_market('Call'), on_close=lambda: handle_close('Call'))
+    comp.unified_entry_card('Call', 'call', on_fire_market=lambda: handle_fire_market('Call'), on_close=lambda: handle_close('Call'), strike_validator=logic.validate_strike)
     comp.auto_close_card('Call', 'call_target_val', 'call_target_active', 'call_stop_val', 'call_stop_active')
     comp.premium_exit_card('Call')
     _index_exit_wrapper('Call')
@@ -1615,7 +1615,7 @@ def build_center_stack():
     ui.button('CLOSE ALL', on_click=handle_close_all, color='red').classes('w-full font-bold shadow-md rounded-xl mt-4')
 
 def build_right_stack():
-    comp.unified_entry_card('Put', 'put', on_fire_market=lambda: handle_fire_market('Put'), on_close=lambda: handle_close('Put'))
+    comp.unified_entry_card('Put', 'put', on_fire_market=lambda: handle_fire_market('Put'), on_close=lambda: handle_close('Put'), strike_validator=logic.validate_strike)
     comp.auto_close_card('Put', 'put_target_val', 'put_target_active', 'put_stop_val', 'put_stop_active')
     comp.premium_exit_card('Put')
     _index_exit_wrapper('Put')

@@ -221,69 +221,82 @@ def commission(quantity, buy_price, sell_price):
 
     return round(total_charges, 2)
 
+last_executed_prices = {}
+
 def get_quote_price(kite, symbol, side, exchange='NFO'):
-    """Fetches the Bid/Ask price from the market quote with retries."""
+    """Fetches execution price:
+    - In Live mode: returns exact exchange fill price from completed order (0.0ms cache hit).
+    - In Paper mode: fetches real-world Bid/Ask from market depth with fast fallback.
+    """
     quote_key = f"{exchange}:{symbol}"
-    for attempt in range(50):
+    if quote_key in last_executed_prices:
+        return last_executed_prices.pop(quote_key)
+
+    delays = [0.1, 0.2, 0.4]
+    for attempt in range(len(delays)):
         try:
             quote = kite.quote(quote_key)
             if quote_key in quote:
-                market_depth = quote[quote_key]['depth']
-                if side == 'BUY':
-                    return float(market_depth['sell'][0]['price']) # Ask
+                depth = quote[quote_key].get('depth', {})
+                asks = depth.get('sell', [])
+                bids = depth.get('buy', [])
+                if side == 'BUY' and asks and float(asks[0].get('price', 0)) > 0:
+                    return float(asks[0]['price']) # Real Ask price
+                elif side == 'SELL' and bids and float(bids[0].get('price', 0)) > 0:
+                    return float(bids[0]['price']) # Real Bid price
                 else:
-                    return float(market_depth['buy'][0]['price'])  # Bid
+                    last_p = float(quote[quote_key].get('last_price', 0.0))
+                    if last_p > 0:
+                        return round(last_p + 0.05, 2) if side == 'BUY' else round(max(0.05, last_p - 0.05), 2)
         except Exception as e:
-            print(f"Quote Fetch Failed ({attempt+1}/50): {e}", flush=True)
-            time.sleep(1)
+            delay = delays[attempt]
+            if attempt < len(delays) - 1:
+                time.sleep(delay)
+            else:
+                print(f"[{get_now_str()}] [QUOTE ERROR] Failed to fetch quote for {quote_key}: {e}", flush=True)
     return 0.0
 
-def place_order_with_retry(kite, symbol, qty, side, live_mode, exchange='NFO'):
-    """Places and manages an order with retries and price chasing."""
+def place_order_with_retry(kite, symbol, qty, side, live_mode, exchange='NFO', current_ltp=None):
+    """Places and manages an order with fast sub-second confirmation and price chasing."""
+    quote_key = f"{exchange}:{symbol}"
     if live_mode == 0:
         print(f"[PAPER TRADE] Placed {side} order for {symbol} on {exchange} | Qty: {qty}", flush=True)
         return True
 
     transaction_type = kite.TRANSACTION_TYPE_BUY if side == 'BUY' else kite.TRANSACTION_TYPE_SELL
-    ltp_sym = f"{exchange}:{symbol}"
 
-    def get_ltp():
-        ltp_sleep = 0.5
-        for attempt in range(10):
-            try:
-                resp = kite.ltp(ltp_sym)
-                ltp = resp.get(ltp_sym, {}).get('last_price', 0)
-                if ltp > 0:
-                    return ltp
-            except Exception as e:
-                print(f"LTP fetch error attempt {attempt + 1}: {e}", flush=True)
+    if current_ltp is None or current_ltp <= 0:
+        def get_ltp():
+            delays = [0.1, 0.2, 0.4, 0.8]
+            for attempt, delay in enumerate(delays):
+                try:
+                    resp = kite.ltp(quote_key)
+                    ltp = resp.get(quote_key, {}).get('last_price', 0)
+                    if ltp > 0: return ltp
+                except Exception as e:
+                    print(f"LTP fetch error attempt {attempt + 1}: {e}", flush=True)
+                time.sleep(delay)
+            return None
+        current_ltp = get_ltp()
 
-            time.sleep(ltp_sleep)
-            if attempt >= 2:
-                ltp_sleep += 1.0
-        return None
+    if current_ltp is None or current_ltp <= 0:
+        print(f"[{get_now_str()}] order_placement_failed: Could not fetch initial LTP for {quote_key}", flush=True)
+        return False
 
-    def get_limit_price(current_ltp):
+    def get_limit_price(ltp):
         if side == 'BUY':
-            price = current_ltp * 1.10 if current_ltp > 50 else current_ltp + 5.0
+            price = ltp * 1.10 if ltp > 50 else ltp + 5.0
         else:
-            price = current_ltp * 0.90 if current_ltp > 50 else current_ltp - 5.0
-
+            price = ltp * 0.90 if ltp > 50 else ltp - 5.0
         price = max(price, 0.05)
         return round(round(price / 0.05) * 0.05, 2)
-
-    current_ltp = get_ltp()
-    if current_ltp is None:
-        print('order_placement_failed: Could not fetch initial LTP', flush=True)
-        return False
 
     limit_price = get_limit_price(current_ltp)
 
     order_id = None
-    place_retries = 0
-    place_sleep = 1.0
+    delays_place = [0.1, 0.2, 0.4, 0.8, 1.0]
 
-    while place_retries < 10:
+    for attempt, delay in enumerate(delays_place):
         try:
             order_id = kite.place_order(tradingsymbol=symbol,
                                         exchange=exchange,
@@ -293,29 +306,22 @@ def place_order_with_retry(kite, symbol, qty, side, live_mode, exchange='NFO'):
                                         price=limit_price,
                                         variety=kite.VARIETY_REGULAR,
                                         product=kite.PRODUCT_MIS)
-            print(f"[LIVE ORDER] Submitted {side} {symbol} @ {limit_price}", flush=True)
+            print(f"[{get_now_str()}] [LIVE ORDER] Submitted {side} {symbol} @ {limit_price}", flush=True)
             break
         except Exception as e:
-            place_retries += 1
-            print(f"Entry_order_error attempt {place_retries}: {e}", flush=True)
-            if place_retries == 10:
-                print('order_placement_failed', flush=True)
+            print(f"[{get_now_str()}] Entry_order_error attempt {attempt + 1}: {e}", flush=True)
+            if attempt == len(delays_place) - 1:
+                print(f"[{get_now_str()}] order_placement_failed", flush=True)
                 return False
-
-            time.sleep(place_sleep)
-            if place_retries >= 3:
-                place_sleep += 1.0
+            time.sleep(delay)
 
     if not order_id:
         return False
 
-    max_modifications = 10
-    mod_count = 0
-    mod_sleep = 1.0
-
-    while mod_count < max_modifications:
-        time.sleep(mod_sleep)
-
+    # Fast OMS fill polling: start at 100ms, then progressive micro-intervals
+    poll_delays = [0.10, 0.15, 0.25, 0.50, 0.50, 1.0, 1.0, 1.0]
+    for mod_count, poll_sleep in enumerate(poll_delays):
+        time.sleep(poll_sleep)
         try:
             order_history = kite.order_history(order_id)
             latest_state = order_history[-1]
@@ -323,35 +329,30 @@ def place_order_with_retry(kite, symbol, qty, side, live_mode, exchange='NFO'):
             pending_qty = latest_state.get('pending_quantity', 0)
 
             if status == 'COMPLETE':
-                print(f"[LIVE ORDER] Complete: {side} {symbol}", flush=True)
+                avg_price = float(latest_state.get('average_price', 0.0))
+                last_executed_prices[quote_key] = avg_price
+                print(f"[{get_now_str()}] [LIVE ORDER] Complete: {side} {symbol} @ {avg_price} (Pending Qty: 0)", flush=True)
                 return True
 
             if status in ['REJECTED', 'CANCELLED']:
-                print(f"Order {status}. Reason: {latest_state.get('status_message', 'Unknown')}", flush=True)
+                print(f"[{get_now_str()}] Order {status}. Reason: {latest_state.get('status_message', 'Unknown')}", flush=True)
                 return False
 
-            if pending_qty > 0:
-                print(f"Partial/No Fill. Pending Qty: {pending_qty}. Fetching latest LTP to modify...", flush=True)
-
-                new_ltp = get_ltp()
-                if new_ltp is not None:
+            if pending_qty > 0 and mod_count >= 3:
+                print(f"[{get_now_str()}] Partial/No Fill. Pending Qty: {pending_qty}. Fetching latest LTP to modify...", flush=True)
+                resp = kite.ltp(quote_key)
+                new_ltp = resp.get(quote_key, {}).get('last_price', 0)
+                if new_ltp > 0:
                     new_limit_price = get_limit_price(new_ltp)
                     kite.modify_order(variety=kite.VARIETY_REGULAR,
                                       order_id=order_id,
                                       order_type=kite.ORDER_TYPE_LIMIT,
                                       price=new_limit_price)
-                    print(f"Modified order {order_id} to {new_limit_price}", flush=True)
-                else:
-                    print("Could not fetch new LTP for modification. Retrying status check...", flush=True)
-
+                    print(f"[{get_now_str()}] Modified order {order_id} to {new_limit_price}", flush=True)
         except Exception as e:
-            print(f"Order_modification_error: {e}", flush=True)
+            print(f"[{get_now_str()}] Order status/modification error: {e}", flush=True)
 
-        mod_count += 1
-        if mod_count >= 3:
-            mod_sleep += 1.0
-
-    print(f"Warning: Max modifications ({max_modifications}) reached. Order may still be pending.", flush=True)
+    print(f"[{get_now_str()}] Warning: Polling completed. Order may still be pending.", flush=True)
     return False
 
 def get_ltp_safe(kite, symbol_list):
@@ -1222,7 +1223,7 @@ def run_trading_process():
                 curr_price = live_market_data.get(token_entry_put, 0)
                 curr_hedge = live_market_data.get(token_hedge_put, 0)
             
-            place_order_with_retry(kite, sym_entry_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+            place_order_with_retry(kite, sym_entry_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=curr_price)
             exec_price = get_quote_price(kite, sym_entry_put, 'BUY', exchange=OPT_EXCHANGE) 
             exit_price_put_sold = exec_price 
             
@@ -1235,7 +1236,7 @@ def run_trading_process():
                 hedge_pnl = 0
                 comm_hedge = 0
             else:
-                place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=curr_hedge)
                 exec_hedge = get_quote_price(kite, sym_hedge_put, 'SELL', exchange=OPT_EXCHANGE) 
                 exit_price_hedge_put = exec_hedge
                 hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_put)
@@ -1274,7 +1275,7 @@ def run_trading_process():
                 curr_price = live_market_data.get(token_entry_call, 0)
                 curr_hedge = live_market_data.get(token_hedge_call, 0)
 
-            place_order_with_retry(kite, sym_entry_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+            place_order_with_retry(kite, sym_entry_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=curr_price)
             exec_price = get_quote_price(kite, sym_entry_call, 'BUY', exchange=OPT_EXCHANGE)
             exit_price_call_sold = exec_price 
             
@@ -1287,7 +1288,7 @@ def run_trading_process():
                 hedge_pnl = 0
                 comm_hedge = 0
             else:
-                place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=curr_hedge)
                 exec_hedge = get_quote_price(kite, sym_hedge_call, 'SELL', exchange=OPT_EXCHANGE)
                 exit_price_hedge_call = exec_hedge
                 hedge_pnl = QUANTITY * (exec_hedge - entry_price_hedge_call)
@@ -1319,7 +1320,8 @@ def run_trading_process():
             nonlocal final_realized_pnl, final_realized_main_pnl, flag_buy_put, flag_buy_call, exit_price_put_bought, exit_price_call_bought
             
             if flag_buy_put == 1:
-                place_order_with_retry(kite, sym_buy_pe, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                with tick_lock: curr_bp = live_market_data.get(token_buy_pe, 0) if token_buy_pe else 0
+                place_order_with_retry(kite, sym_buy_pe, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=curr_bp)
                 exec_price = get_quote_price(kite, sym_buy_pe, 'SELL', exchange=OPT_EXCHANGE)
                 exit_price_put_bought = exec_price 
                 
@@ -1334,7 +1336,8 @@ def run_trading_process():
                 flag_buy_put = 2
 
             if flag_buy_call == 1:
-                place_order_with_retry(kite, sym_buy_ce, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                with tick_lock: curr_bc = live_market_data.get(token_buy_ce, 0) if token_buy_ce else 0
+                place_order_with_retry(kite, sym_buy_ce, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=curr_bc)
                 exec_price = get_quote_price(kite, sym_buy_ce, 'SELL', exchange=OPT_EXCHANGE)
                 exit_price_call_bought = exec_price 
                 
@@ -1416,10 +1419,10 @@ def run_trading_process():
                 if HEDGELESS_MODE:
                     entry_price_hedge_put = 0
                 else:
-                    place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    place_order_with_retry(kite, sym_hedge_put, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=ltp_hedge_put)
                     entry_price_hedge_put = get_quote_price(kite, sym_hedge_put, 'BUY', exchange=OPT_EXCHANGE)
-                    time.sleep(1)
-                place_order_with_retry(kite, sym_entry_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    time.sleep(0.05)
+                place_order_with_retry(kite, sym_entry_put, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=ltp_put)
                 entry_price_put_sold = get_quote_price(kite, sym_entry_put, 'SELL', exchange=OPT_EXCHANGE)
                 flag_sell_put = 1
                 position_opened_this_tick = True
@@ -1437,10 +1440,10 @@ def run_trading_process():
                 if HEDGELESS_MODE:
                     entry_price_hedge_call = 0
                 else:
-                    place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    place_order_with_retry(kite, sym_hedge_call, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=ltp_hedge_call)
                     entry_price_hedge_call = get_quote_price(kite, sym_hedge_call, 'BUY', exchange=OPT_EXCHANGE)
-                    time.sleep(1)
-                place_order_with_retry(kite, sym_entry_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    time.sleep(0.05)
+                place_order_with_retry(kite, sym_entry_call, QUANTITY, 'SELL', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=ltp_call)
                 entry_price_call_sold = get_quote_price(kite, sym_entry_call, 'SELL', exchange=OPT_EXCHANGE)
                 flag_sell_call = 1
                 position_opened_this_tick = True
@@ -1454,7 +1457,7 @@ def run_trading_process():
             if use_buy_legs:
                 if flag_buy_put == 0 and ltp_buy_put >= (2 * initial_bp_price):
                     print(f"\n[{get_now_str()}] >>> ENTRY BUY PUT | LTP: {ltp_buy_put} >= Trigger: {2 * initial_bp_price:.2f}", flush=True)
-                    place_order_with_retry(kite, sym_buy_pe, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    place_order_with_retry(kite, sym_buy_pe, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=ltp_buy_put)
                     entry_price_put_bought = get_quote_price(kite, sym_buy_pe, 'BUY', exchange=OPT_EXCHANGE)
                     flag_buy_put = 1
                     position_opened_this_tick = True
@@ -1463,7 +1466,7 @@ def run_trading_process():
                 
                 if flag_buy_call == 0 and ltp_buy_call >= (2 * initial_bc_price):
                     print(f"\n[{get_now_str()}] >>> ENTRY BUY CALL | LTP: {ltp_buy_call} >= Trigger: {2 * initial_bc_price:.2f}", flush=True)
-                    place_order_with_retry(kite, sym_buy_ce, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE)
+                    place_order_with_retry(kite, sym_buy_ce, QUANTITY, 'BUY', LIVE_MODE, exchange=OPT_EXCHANGE, current_ltp=ltp_buy_call)
                     entry_price_call_bought = get_quote_price(kite, sym_buy_ce, 'BUY', exchange=OPT_EXCHANGE)
                     flag_buy_call = 1
                     position_opened_this_tick = True

@@ -114,6 +114,43 @@ class LogicEngine:
                 attempts += 1; self.log_action(f"⚠️ RETRY {attempts}: {symbol}", str(e)); time.sleep(1)
         self.log_action(f"❌ FAILED: {symbol}", "Manual Check Req"); self.play_sound('error'); return False
 
+    def validate_strike(self, side, strike):
+        """Validates an explicit strike (strike selector 'Exact' mode) for this side's option
+        type on the CURRENT trading index. Returns (ok, message). Checks: numeric; multiple of
+        the index strike step (get_atm_token silently ROUNDS off-step values, so this must come
+        first); listed for the current expiry (CE for Call card, PE for Put card); and, in Sell
+        Mode with a hedge, that the hedge strike (+/-10 steps, same as open_position) is listed
+        too. Read-only: places no order and touches no state."""
+        try:
+            s = float(str(strike).strip().replace(',', ''))
+        except (ValueError, TypeError):
+            return False, "enter the strike as a number"
+        if s != s or s in (float('inf'), float('-inf')):
+            return False, "enter the strike as a number"
+        try:
+            index_name = params['trading_index']
+            step = float(INDICES[index_name]['step'])
+            if s < 1000:
+                return False, f"{s:g} is too low to be an index strike"
+            if abs(s / step - round(s / step)) > 1e-6:
+                return False, f"{s:g} is not a multiple of step {step:g}"
+            opt_type = 'CE' if side == 'Call' else 'PE'
+            token, info = self.inst_manager.get_atm_token(index_name, s, opt_type)
+            if not token:
+                if isinstance(info, str) and info.startswith('Strike '):
+                    return False, f"{s:g} {opt_type} is not listed for the current {index_name} expiry"
+                return False, f"instrument lookup failed ({info})"
+            buy_mode = params.get('options_buy_mode', False)
+            hedgeless = True if buy_mode else params.get('hedgeless_mode', False)
+            if not hedgeless:
+                hedge_strike = s + (10 * step) if side == 'Call' else s - (10 * step)
+                h_token, h_info = self.inst_manager.get_atm_token(index_name, hedge_strike, opt_type)
+                if not h_token:
+                    return False, f"hedge strike {hedge_strike:g} {opt_type} is not listed"
+            return True, f"{s:g} {opt_type} listed for current expiry"
+        except Exception as e:
+            return False, f"strike check failed ({e})"
+
     def open_position(self, side, manual_strike=None, reason="Manual", qty_override=None, strike_offset=None):
         if not self.trading_active: return False, "Trading Stopped"
         index_name = params['trading_index']
@@ -140,7 +177,12 @@ class LogicEngine:
             try: offset = float(strike_offset)
             except: offset = 0
             atm = round(spot_ltp / step) * step
-            main_strike = (atm - (offset * step)) if side == 'Call' else (atm + (offset * step))
+            if abs(offset) >= 1000:
+                # Explicit strike (strike selector 'Exact' mode, ZB_STRIKE_SELECTOR): the offset
+                # field carries the strike itself. Relative offsets are always far below 1000.
+                main_strike = offset
+            else:
+                main_strike = (atm - (offset * step)) if side == 'Call' else (atm + (offset * step))
         else:
             entry_mode = params['call_entry_mode'] if side == 'Call' else params['put_entry_mode']
             manual_key = 'call_manual_strike' if side == 'Call' else 'put_manual_strike'

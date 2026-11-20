@@ -7,6 +7,9 @@ mode-aware coloring).
 from nicegui import ui
 from config import params, UI_OPTS, shared_state, get_eval_price
 from datetime import datetime
+import os as _zb_os
+# Strike selector (ATM/ITM/OTM/Exact radios). Default OFF: the original strike stepper renders.
+_STRIKE_SEL = _zb_os.environ.get('ZB_STRIKE_SELECTOR') == '1'
 
 from ._shared import _side_colors, _bind_card_colors, _bind_btn_color, _sync_draft_from_params, _side_is_red, _log_alert_action, _num_stepper
 from ._warnings import (
@@ -67,7 +70,7 @@ def _unified_card_colors(side, buy_mode):
     return cls, btn
 
 
-def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
+def unified_entry_card(side, prefix, on_fire_market=None, on_close=None, strike_validator=None):
     """Unified Open Short/Long card: index-based entry with order type (Market/Limit/
     Stop-Market), trigger price, strike offset (0=ATM, 1=ITM, -1=OTM, with -/+ steppers),
     optional stop/target, a fire-on timeframe, and its own qty (also with -/+ steppers).
@@ -109,6 +112,124 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
     draft = {'trigger': params.get(trig_key, 0)}
     _sync_draft_from_params(draft, 'trigger', trig_key)
 
+    # --- Strike selector state/handlers (used only when _STRIKE_SEL is on) ---
+    # params[strike_key] stays the single source of truth read by every firing path (Market,
+    # armed Stop-Market/Limit, Enter via Stop hand-off): |v|<1000 = relative (0 ATM, +N ITM,
+    # -N OTM), >=1000 = explicit strike. The radio/field widgets are a view over it; an Exact
+    # strike is written to params ONLY after strike_validator accepts it.
+    sk = {'mode': 'ITM', 'msg': '', 'bad': False}
+    w = {}
+    sk_last = {'v': params.get(strike_key, 1)}
+    sk_busy = {'v': False}
+
+    def _sk_decode(v):
+        try: v = float(v)
+        except (ValueError, TypeError): v = 1.0
+        if abs(v) >= 1000: return 'Exact', None, '%g' % v
+        if v == 0: return 'ATM', None, None
+        return ('ITM' if v > 0 else 'OTM'), max(1, int(round(abs(v)))), None
+
+    def _sk_steps():
+        try:
+            f = float(str(w['steps'].value).strip())
+            return int(f) if f.is_integer() else 0
+        except (ValueError, TypeError, KeyError): return 0
+
+    def _sk_msg(text, bad):
+        sk['msg'] = text; sk['bad'] = bad
+        lbl = w.get('msg')
+        if lbl is None: return
+        lbl.set_text(text)
+        lbl.set_visibility(bool(text) and (bad or sk['mode'] == 'Exact'))
+        lbl.classes(add='text-red-600' if bad else 'text-green-700', remove='text-green-700' if bad else 'text-red-600')
+        for k in ('steps', 'exact'):
+            if k in w: w[k].props(remove='error')
+        if bad: w['exact' if sk['mode'] == 'Exact' else 'steps'].props(add='error')
+
+    def _sk_apply_mode():
+        if 'steps_row' not in w or 'exact' not in w: return
+        m = sk['mode']
+        w['steps_row'].set_visibility(m in ('ITM', 'OTM'))
+        w['exact'].set_visibility(m == 'Exact')
+        if m in ('ITM', 'OTM'): w['steps'].props(f'label="{m} steps"')
+        _sk_msg('', False)
+
+    def _sk_commit(notify=False):
+        """Writes the selected strike into params[strike_key] when valid; returns True if
+        params now holds what the card shows. Invalid input shows the inline warning (and a
+        toast when notify=True) and writes nothing."""
+        m = sk['mode']
+        if m == 'ATM':
+            val, msg = 0, ''
+        elif m in ('ITM', 'OTM'):
+            n = _sk_steps()
+            if n < 1:
+                _sk_msg('Check steps: enter a whole number, 1 or more', True)
+                if notify: ui.notify(sk['msg'], type='warning')
+                return False
+            val, msg = (n if m == 'ITM' else -n), ''
+        else:
+            raw = str(w['exact'].value or '').strip().replace(',', '')
+            if not raw: ok, info = False, 'enter a strike'
+            elif strike_validator is not None: ok, info = strike_validator(side, raw)
+            else:
+                try: ok = float(raw) >= 1000
+                except ValueError: ok = False
+                info = f'{raw} accepted' if ok else 'enter the strike as a number'
+            if not ok:
+                _sk_msg(f'Check strike: {info}', True)
+                if notify: ui.notify(sk['msg'], type='warning')
+                return False
+            f = float(raw); val = int(f) if f.is_integer() else f; msg = info
+        params[strike_key] = val; sk_last['v'] = val
+        _sk_msg(msg, False)
+        return True
+
+    def _sk_mode_changed(mode):
+        if sk_busy['v']: return
+        sk['mode'] = mode
+        _sk_apply_mode()
+        if mode != 'Exact' or str(w['exact'].value or '').strip():
+            _sk_commit()
+
+    def _sk_step(d):
+        n = _sk_steps()
+        w['steps'].set_value(str(max(1, (n if n >= 1 else 1) + d)))
+        _sk_commit()
+
+    def _sk_typing():
+        if not sk_busy['v']: _sk_msg('', False)
+
+    def _sk_gate():
+        """Top of Open Now / Arm: commit + validate the shown strike; False blocks the action."""
+        if _sk_commit(): return True
+        ui.notify(sk['msg'], type='warning')
+        return False
+
+    def _sk_sync():
+        # Mirrors EXTERNAL changes to params[strike_key] (Cancel reset, Enter via Stop hand-off)
+        # back into the radio/fields. Our own commits update sk_last, so they never loop here.
+        cur = params.get(strike_key, 1)
+        if cur == sk_last['v'] or 'radio' not in w: return
+        sk_last['v'] = cur
+        mode, steps, exact = _sk_decode(cur)
+        sk_busy['v'] = True
+        try:
+            if steps is not None: w['steps'].set_value(str(steps))
+            if exact is not None: w['exact'].set_value(exact)
+            w['radio'].set_value(mode)
+        finally: sk_busy['v'] = False
+        sk['mode'] = mode
+        _sk_apply_mode()
+
+    def _sk_reset():
+        sk_last['v'] = None
+        _sk_sync()
+
+    if _STRIKE_SEL:
+        sk['mode'] = _sk_decode(params.get(strike_key, 1))[0]
+        ui.timer(1.0, _sk_sync)
+
     with ui.card().classes(f'w-full p-4 gap-2 {init_color_class} border shadow-md rounded-xl') as card:
         _bind_card_colors(card, side, lambda is_red: f"w-full p-4 gap-2 {'bg-red-100 border-red-300' if is_red else 'bg-green-100 border-green-300'} border shadow-md rounded-xl")
 
@@ -126,6 +247,9 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
 
         with ui.row().classes('w-full justify-start'):
             ui.radio(UI_OPTS['order_types'], value=params[order_key]).bind_value(params, order_key).props('inline dense')
+            if _STRIKE_SEL:
+                ui.element('div').classes('w-px h-4 bg-gray-400 mx-1 self-center')
+                w['radio'] = ui.radio(['ATM', 'ITM', 'OTM', 'Exact'], value=sk['mode'], on_change=lambda e: _sk_mode_changed(e.value)).props('inline dense')
 
         with ui.row().classes('w-full gap-2'):
             # NOTE: intentionally NOT disabled for Market (previously used bind_enabled_from,
@@ -134,7 +258,22 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             # value is simply ignored by the firing logic when order type is Market. Bound to
             # 'draft', not params directly -- see docstring above.
             ui.input('Trigger Price').bind_value(draft, 'trigger').props('outlined dense bg-color=white').classes('grow')
-            _num_stepper(params, strike_key, step=1, label='Strike (0=ATM,1=ITM,-1=OTM)')
+            if _STRIKE_SEL:
+                _d_mode, _d_steps, _d_exact = _sk_decode(params.get(strike_key, 1))
+                w['steps_row'] = ui.row().classes('grow items-center gap-1 no-wrap')
+                with w['steps_row']:
+                    ui.button(icon='remove', on_click=lambda: _sk_step(-1)).props('flat dense round size=sm').classes('text-gray-600 bg-gray-100')
+                    w['steps'] = ui.input('ITM steps', value=str(_d_steps or 1)).props('outlined dense bg-color=white hide-bottom-space').classes('grow text-center')
+                    w['steps'].on('blur', lambda e: _sk_commit())
+                    w['steps'].on('keydown.enter', lambda e: _sk_commit(notify=True))
+                    ui.button(icon='add', on_click=lambda: _sk_step(1)).props('flat dense round size=sm').classes('text-gray-600 bg-gray-100')
+                w['exact'] = ui.input('Strike (e.g. 25000)', value=_d_exact or '', on_change=lambda e: _sk_typing()).props('outlined dense bg-color=white hide-bottom-space').classes('grow')
+                w['exact'].on('blur', lambda e: _sk_commit())
+                w['exact'].on('keydown.enter', lambda e: _sk_commit(notify=True))
+                w['msg'] = ui.label().classes('w-full text-xs')
+                _sk_apply_mode()
+            else:
+                _num_stepper(params, strike_key, step=1, label='Strike (0=ATM,1=ITM,-1=OTM)')
 
         with ui.row().classes('w-full gap-2'):
             _num_stepper(params, qty_key, step=1, label='Qty (Lots)')
@@ -148,6 +287,7 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
         status.bind_visibility_from(params, armed_key)
 
         def fire_or_arm():
+            if _STRIKE_SEL and not _sk_gate(): return
             if params[order_key] == 'Market':
                 if on_fire_market: on_fire_market()
                 return
@@ -182,6 +322,7 @@ def unified_entry_card(side, prefix, on_fire_market=None, on_close=None):
             # Full reset: trigger price + every other field back to default (not just disarm).
             _reset_unified_card_defaults(prefix)
             draft['trigger'] = 0
+            if _STRIKE_SEL: _sk_reset()
             ui.notify(f"{_unified_card_title(side, params.get('options_buy_mode', False))} Cancelled & Reset", type='info')
 
         with ui.row().classes('w-full gap-2'):
