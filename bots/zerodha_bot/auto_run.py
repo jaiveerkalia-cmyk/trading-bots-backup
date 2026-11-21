@@ -15,12 +15,6 @@ if __name__ == "__main__" and "--worker" not in _zb_sys.argv and _zb_os.environ.
         try:
             _zb_p = _zb_sp.Popen([_zb_sys.executable, __file__, "--worker"])
             _zb_p.wait()
-            _zb_next_on = False
-            if _zb_os.path.exists(".automode_state"):
-                with open(".automode_state", "r") as _zb_f:
-                    if _zb_f.read().strip() == 'ON': _zb_next_on = True
-            if _zb_next_on:
-                with open(".automode_state", "w") as _zb_f: _zb_f.write("ON")
             _zb_now = _zb_dt.now()
             _zb_ts = _zb_now.strftime('%Y-%m-%d %H:%M:%S')
             if (_zb_now.weekday() == 4 and _zb_now.hour >= 22) or _zb_now.weekday() in [5, 6]:
@@ -1194,12 +1188,6 @@ def custom_render_master_banner(update_lots_callback):
                 ui.radio(UI_OPTS['on_off'], value=params['live_trading']).bind_value(params, 'live_trading').props('inline dense')
             with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
                 with ui.column().classes('gap-0'):
-                    ui.label('AUTO PILOT').classes('font-bold text-blue-900 text-[10px] leading-none')
-                    status_lbl = ui.label().bind_text_from(controller, 'log_msg')
-                    status_lbl.classes('text-[8px] font-mono text-blue-600 leading-none')
-                ui.radio(['ON', 'OFF'], value=controller.mode, on_change=on_auto_mode_change).bind_value(controller, 'mode').props('inline dense color=blue')
-            with ui.row().classes('items-center gap-2 ml-4 border-l pl-4 border-orange-300'):
-                with ui.column().classes('gap-0'):
                     ui.label('HEDGELESS').classes('font-bold text-purple-900 text-[10px] leading-none')
                     ui.label('No hedge buy').classes('text-[8px] font-mono text-purple-600 leading-none')
                 # Disabled (greyed) whenever Options Buy Mode is on, since Buy Mode is always
@@ -1472,9 +1460,6 @@ def on_buy_mode_button_click():
         if shared_state['active_trades']['Call'] is not None or shared_state['active_trades']['Put'] is not None:
             ui.notify("Close open positions before switching to Options Buy Mode.", type='negative')
             return
-        if controller.is_active:
-            ui.notify("Turn off Auto Pilot before switching to Options Buy Mode.", type='negative')
-            return
         params['options_buy_mode'] = True
         params['hedgeless_mode'] = True
         ui.notify("Options Buy Mode ON: Call=Buy CE, Put=Buy PE, always hedgeless.", type='warning')
@@ -1641,7 +1626,6 @@ async def run_bot_logic():
             if now.hour == 22 and now.minute == 45:
                 shared_state['shutdown_triggered'] = True 
                 print(f"[{ts}] 💤 NIGHT MODE: Saving State & Shutting Down...")
-                with open(".automode_state", "w") as f: f.write(controller.mode)
                 try:
                     if hasattr(ticker, 'close'): ticker.close()
                     if hasattr(ticker, 'stop'): ticker.stop() 
@@ -1760,18 +1744,7 @@ if __name__ in {"__main__", "__mp_main__"}:
     if "--worker" in sys.argv:
         shared_state['daily_scan_done'] = False
 
-        # Restore State from File or Arguments
-        if os.path.exists(".automode_state"):
-            with open(".automode_state", "r") as f:
-                saved_mode = f.read().strip()
-                if saved_mode in ['ON', 'OFF']:
-                    controller.mode = saved_mode
-                    print(f"--- WORKER STARTED: Auto Mode Restored to {saved_mode} ---")
-        elif "--auto-on" in sys.argv:
-            controller.mode = 'ON'
-            print("--- WORKER STARTED: Auto Mode Restored to ON (Arg) ---")
-        else:
-            print("--- WORKER STARTED: Auto Mode Default (OFF) ---")
+        print("--- WORKER STARTED ---")
 
         # Run the App (Blocking)
         ui.run(title='Zerodha Bot', host='0.0.0.0', port=9000, reload=False, show=False)
@@ -1792,17 +1765,6 @@ if __name__ in {"__main__", "__mp_main__"}:
                 cmd = [sys.executable, __file__, "--worker"]
                 p = subprocess.Popen(cmd)
                 p.wait() 
-                
-                # Check for Saved State File
-                auto_mode_next = False
-                if os.path.exists(".automode_state"):
-                    with open(".automode_state", "r") as f:
-                        if f.read().strip() == 'ON': auto_mode_next = True
-                
-                # Update Command for Next Run
-                if auto_mode_next: 
-                    # We write to the file again to ensure persistence if next run crashes
-                    with open(".automode_state", "w") as f: f.write("ON")
                 
                 now = datetime.now()
                 ts = now.strftime('%Y-%m-%d %H:%M:%S')
