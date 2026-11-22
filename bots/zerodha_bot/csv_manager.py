@@ -17,11 +17,12 @@ class CsvManager:
     def log_open(self, trade_id, trade_data):
         try: df = pd.read_csv(TRADEBOOK_FILE)
         except: self.init_files(); df = pd.read_csv(TRADEBOOK_FILE)
-        expiry = shared_state['current_expiry'].get(params['trading_index'], 'N/A')
+        _ix = trade_data.get('index') or params['trading_index']  # Positions V2 rows carry their own index
+        expiry = shared_state['current_expiry'].get(_ix, 'N/A')
         hedge_strike = trade_data['hedge']['strike'] if trade_data['hedge'] else 0
         hedge_entry  = trade_data['hedge']['entry_price'] if trade_data['hedge'] else 0
         new_row = pd.DataFrame([{
-            'Trade_ID': str(trade_id), 'Date': datetime.now().strftime('%Y-%m-%d'), 'Index_Type': params['trading_index'], 'Expiry': str(expiry),
+            'Trade_ID': str(trade_id), 'Date': datetime.now().strftime('%Y-%m-%d'), 'Index_Type': _ix, 'Expiry': str(expiry),
             'Type': trade_data['type'], 'Direction': trade_data.get('direction', 'SELL'), 'Qty': int(trade_data['qty']), 'Main_Strike': float(trade_data['main']['strike']), 'Hedge_Strike': float(hedge_strike),
             'Open_Main_Price': float(trade_data['main']['entry_price']), 'Open_Hedge_Price': float(hedge_entry), 'Open_Index_Price': float(trade_data['index_entry_price']),
             'Open_Time': datetime.now().strftime('%H:%M:%S'), 'Close_Main_Price': 0.0, 'Close_Hedge_Price': 0.0, 'Close_Index_Price': 0.0, 'Close_Time': 'Active', 'Profit': 0.0, 'Status': 'OPEN'
@@ -34,6 +35,17 @@ class CsvManager:
             idx = df[df['Trade_ID'].astype(str) == str(trade_id)].index
             if not idx.empty:
                 i = idx[0]
+                df.at[i, 'Open_Main_Price'] = float(main_p); df.at[i, 'Open_Hedge_Price'] = float(hedge_p); df.at[i, 'Open_Index_Price'] = float(idx_p)
+                df.to_csv(TRADEBOOK_FILE, index=False)
+        except: pass
+    def log_modify(self, trade_id, qty, main_p, hedge_p, idx_p):
+        """Positions V2: an add changes Qty and the averaged open prices of an OPEN row."""
+        try:
+            df = pd.read_csv(TRADEBOOK_FILE)
+            idx = df[df['Trade_ID'].astype(str) == str(trade_id)].index
+            if not idx.empty:
+                i = idx[0]
+                df.at[i, 'Qty'] = int(qty)
                 df.at[i, 'Open_Main_Price'] = float(main_p); df.at[i, 'Open_Hedge_Price'] = float(hedge_p); df.at[i, 'Open_Index_Price'] = float(idx_p)
                 df.to_csv(TRADEBOOK_FILE, index=False)
         except: pass
@@ -63,5 +75,6 @@ if _zb_os.environ.get('ZB_NO_PANDAS') == '1':
     CsvManager.init_files = _lean_io.csv_init_files
     CsvManager.log_open = _lean_io.csv_log_open
     CsvManager.update_entry_log = _lean_io.csv_update_entry_log
+    CsvManager.log_modify = _lean_io.csv_log_modify
     CsvManager.log_close = _lean_io.csv_log_close
     CsvManager.save_daily_report = _lean_io.csv_save_daily_report

@@ -130,7 +130,7 @@ DAY_CONFIGURATION = {
         'index_based_entry': True, 'atr_entry_multiplier': 1.5},
 
     # Friday (NIFTY)
-   4: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:25', 'entry_gap': 5, 'strike_gap': 0, 'lots': 5, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
+   4: {'target_index': 'NIFTY', 'start': '09:16', 'exit': '15:25', 'entry_gap': 5, 'strike_gap': 0, 'lots': 4, 'live_mode': 0, 'percent_mode': 1, 'find_atm': True,
             'total_premium_skip': False, 'buy_strikes_flag': False, 'total_profit_change': False, 'atr_mode_on': False, 'atr_ema_window': 20,
             'atr_stop_per_lot': 30, 'atr_entry_gap': 10, 'skip_till_hour': 8, 'target_profit_per_lot': TARGET_PROFIT_PER_LOT,
             'max_loss_per_lot': MAX_LOSS_PER_LOT, 'stop_percent': 50, 'vix_stop_mode_on': False, 'hedgeless_mode': False,

@@ -360,6 +360,28 @@ params = {
 }
 
 
+# --- POSITIONS V2 / SYMBOL REGISTRY: derived defaults (purely additive) ---
+# Every symbol in INDICES gets the per-index runtime entries the rest of the bot expects, so a
+# new symbol only needs its INDICES entry. Existing keys are never overwritten (setdefault).
+for _n in INDICES:
+    shared_state.setdefault(_n, {'ltp': 0.0, 'open': 0.0, 'high': 0.0, 'low': 0.0, 'fut_ltp': 0.0, 'fut_symbol': '', 'fut_token': None})
+    shared_state['current_expiry'].setdefault(_n, None)
+    params.setdefault(f'enter_via_stop_tick_{_n.lower()}', 1)
+UI_OPTS['indices'] = list(INDICES.keys())
+UI_OPTS['exit_periods'] = ['Current', '1m', '5m', '15m']
+UI_OPTS['strike_modes'] = ['ATM', 'ITM', 'OTM', 'Exact']
+shared_state.setdefault('positions', [])
+# Positions V2 cards: 'call'/'put' = Sell cards (existing keys), 'bcall'/'bput' = Buy cards.
+# Each card also carries its own index (default = the global trading_index) and a net_ok flag
+# (set when the user confirms an order that offsets an opposite open position).
+for _c in ('bcall', 'bput'):
+    for _k, _v in (('order_type', 'Market'), ('trigger_price', 0), ('strike_offset', 1), ('fire_on', 'Live'),
+                   ('qty', 4), ('armed', False), ('armed_at', None), ('new_stop', ''), ('new_target', '')):
+        params.setdefault(f'{_c}_{_k}', _v)
+for _c in ('call', 'put', 'bcall', 'bput'):
+    params.setdefault(f'{_c}_index', params['trading_index'])
+    params.setdefault(f'{_c}_net_ok', False)
+
 # --- FUTURES MODE: SINGLE-SOURCE-OF-TRUTH PRICE/TOKEN RESOLVERS ---
 # Every consumer of Futures Mode (logic_engine, auto_run.AutoController, pattern_engine,
 # stop_via_candle_engine) calls these two helpers instead of each re-implementing its own

@@ -181,12 +181,13 @@ def csv_log_open(self, trade_id, trade_data):
     except Exception:
         self.init_files()
         header, rows = read_table(TRADEBOOK_FILE)
-    expiry = shared_state['current_expiry'].get(params['trading_index'], 'N/A')
+    _ix = trade_data.get('index') or params['trading_index']  # Positions V2 rows carry their own index
+    expiry = shared_state['current_expiry'].get(_ix, 'N/A')
     hedge_strike = trade_data['hedge']['strike'] if trade_data['hedge'] else 0
     hedge_entry = trade_data['hedge']['entry_price'] if trade_data['hedge'] else 0
     new_row = {
         'Trade_ID': str(trade_id), 'Date': datetime.now().strftime('%Y-%m-%d'),
-        'Index_Type': params['trading_index'], 'Expiry': str(expiry),
+        'Index_Type': _ix, 'Expiry': str(expiry),
         'Type': trade_data['type'], 'Direction': trade_data.get('direction', 'SELL'),
         'Qty': int(trade_data['qty']), 'Main_Strike': float(trade_data['main']['strike']),
         'Hedge_Strike': float(hedge_strike),
@@ -212,6 +213,21 @@ def csv_update_entry_log(self, trade_id, main_p, hedge_p, idx_p):
         i = _find_trade(header, rows, trade_id)
         if i is not None:
             c = {h: j for j, h in enumerate(header)}
+            rows[i][c['Open_Main_Price']] = float(main_p)
+            rows[i][c['Open_Hedge_Price']] = float(hedge_p)
+            rows[i][c['Open_Index_Price']] = float(idx_p)
+            write_table(TRADEBOOK_FILE, header, render_rows(rows, len(header)))
+    except Exception:
+        pass
+
+
+def csv_log_modify(self, trade_id, qty, main_p, hedge_p, idx_p):
+    try:
+        header, rows = read_table(TRADEBOOK_FILE)
+        i = _find_trade(header, rows, trade_id)
+        if i is not None:
+            c = {h: j for j, h in enumerate(header)}
+            rows[i][c['Qty']] = int(qty)
             rows[i][c['Open_Main_Price']] = float(main_p)
             rows[i][c['Open_Hedge_Price']] = float(hedge_p)
             rows[i][c['Open_Index_Price']] = float(idx_p)
