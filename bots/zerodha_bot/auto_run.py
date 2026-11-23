@@ -162,6 +162,13 @@ class DayController:
 
     def clear_leg_fields(self, side):
         """Wipes the physical text fields and disables toggles for a specific leg."""
+        # Positions V2: the Buy card of the same option type is disarmed together with the Sell
+        # card (EOD, Close All, Global limits all call this for Call and Put). No-op flag off.
+        if getattr(self.logic, 'v2', None) is not None and side in ('Call', 'Put'):
+            _bc = 'bcall' if side == 'Call' else 'bput'
+            params[f'{_bc}_armed'] = False; params[f'{_bc}_armed_at'] = None; params[f'{_bc}_trigger_price'] = 0
+            params[f'{_bc}_new_stop'] = ''; params[f'{_bc}_new_target'] = ''; params[f'{_bc}_net_ok'] = False
+            params[f'{side.lower()}_net_ok'] = False
         if side == 'Call':
             params['call_target_val'] = 0; params['call_target_active'] = False
             params['call_stop_val'] = 0; params['call_stop_active'] = False
@@ -264,6 +271,13 @@ controller = DayController(logic, inst_manager)
 # -- wired in here (after controller exists) rather than importing AutoController into
 # logic_engine.py, to avoid a circular import.
 logic.clear_leg_fields_callback = controller.clear_leg_fields
+# Positions V2 (default OFF; enable with env ZB_POSITIONS_V2=1 -- needs the Stage 3 UI first).
+# With the flag off positions_engine is never imported and logic.v2 stays None, so every
+# LogicEngine hook falls straight through to its legacy body.
+if os.environ.get("ZB_POSITIONS_V2") == "1":
+    from positions_engine import PositionsEngine
+    logic.v2 = PositionsEngine(logic, stop_via_candle_engine)
+    print("--- POSITIONS V2 ENABLED ---")
 daily_logger = DailyLogger() 
 #ticker.start()
 
@@ -806,6 +820,9 @@ def on_buy_mode_button_click():
     """Handles the big standalone Options Buy Mode button (toggles the opposite of current
     state). Reuses the exact same guard logic as the old small toggle: blocked while any
     position is open, and mutually exclusive with Auto Pilot."""
+    if getattr(logic, 'v2', None) is not None:
+        ui.notify("Positions V2 has separate Buy cards; the Buy Mode switch is not used.", type='warning')
+        return
     turning_on = not params.get('options_buy_mode', False)
 
     if turning_on:
@@ -1049,8 +1066,50 @@ async def run_bot_logic():
 #      MAIN UI PAGE (SAFE MODE)
 # ==========================================
 
+def _build_v2_page():
+    """Positions V2 page (only when logic.v2 is set): red cards left, green right, Open Positions
+    directly under the chart / Trade Event Log row, Open Orders per position. Banner (incl. the
+    CALL/PUT POSITION cards, fed by the active_trades mirror), alerts, patterns, indicators and
+    order history are the same components as the legacy page."""
+    from ui_components import v2_ui
+    eng = logic.v2
+    comp.render_master_banner(update_lots)
+    buy_btn = ui_refs.get('buy_mode_button')
+    if buy_btn is not None:      # Buy cards replace the global Buy Mode switch (display:none survives classes(replace=))
+        buy_btn.style('display: none !important')
+
+    with ui.row().classes('w-full px-0 gap-0'):
+        comp.render_chart_row()
+        comp.render_log_row()
+
+    v2_ui.render_positions(eng)
+
+    with ui.row().classes('w-full no-wrap items-start gap-4 p-2'):
+        with ui.column().classes('grow gap-4'):
+            v2_ui.entry_card(eng, 'call')
+            v2_ui.entry_card(eng, 'bput')
+        with ui.column().classes('grow gap-4'): build_center_stack()
+        with ui.column().classes('grow gap-4'):
+            v2_ui.entry_card(eng, 'put')
+            v2_ui.entry_card(eng, 'bcall')
+
+    comp.render_active_alerts()
+    v2_ui.render_open_orders(eng)
+    comp.render_pattern_indicators()
+    render_indicator_alerts_section()
+    comp.render_order_history()
+    ui.timer(1.0, update_ui)
+
+
 @ui.page('/', title='Zerodha Bot')
 def index():
+    if getattr(logic, 'v2', None) is not None:
+        _build_v2_page()
+        return
+    _build_legacy_page()
+
+
+def _build_legacy_page():
     # 1. Build UI Elements
     comp.render_master_banner(update_lots)
     

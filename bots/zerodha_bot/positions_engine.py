@@ -664,5 +664,87 @@ class PositionsEngine:
         self._mirror()
         lg.update_chart_data()
 
+    # ------------------------------------------------------------------ legacy entry-point shims
+    # LogicEngine.open_position / close_position are hooked to these (only when logic.v2 is set) so
+    # the legacy cards and rows that are still on screen keep ONE source of truth (this engine)
+    # instead of creating legacy trades behind its back.
+    def open_for_side(self, side, manual_strike=None, reason='Manual', qty_override=None, strike_offset=None):
+        if params.get('options_buy_mode', False):
+            return False, 'Buy Mode toggle is not used with Positions V2 (use the Buy cards)'
+        card = 'call' if side == 'Call' else 'put'
+        if manual_strike:
+            offset = _f(manual_strike, 0.0)          # >= 1000 is read as an explicit strike
+        elif strike_offset is not None:
+            offset = strike_offset
+        else:
+            offset = 0
+        lots = qty_override if qty_override is not None else params.get('lots', 1)
+        return self.open_from_card(card, lots, offset, reason=reason, net_ok=False)
+
+    def close_side(self, side, reason='Manual'):
+        pos = shared_state['active_trades'].get(side)
+        if not pos:
+            return False, 'No Position'
+        return self.close_position(pos['id'], reason)
+
+    # ------------------------------------------------------------------ helpers used by the V2 UI
+    def validate_strike(self, card, strike):
+        """Per-card version of LogicEngine.validate_strike: uses the card's OWN index, option
+        type and direction (Buy cards are always hedgeless; Sell cards need the hedge strike
+        listed unless the global hedgeless toggle is on). Returns (ok, message). Read-only."""
+        opt, direction = CARDS[card]
+        try:
+            s = float(str(strike).strip().replace(',', ''))
+        except (ValueError, TypeError):
+            return False, "enter the strike as a number"
+        if s != s or s in (float('inf'), float('-inf')):
+            return False, "enter the strike as a number"
+        try:
+            index = params.get(f'{card}_index', params['trading_index'])
+            step = float(INDICES[index]['step'])
+            if s < 1000:
+                return False, f"{s:g} is too low to be an index strike"
+            if abs(s / step - round(s / step)) > 1e-6:
+                return False, f"{s:g} is not a multiple of step {step:g}"
+            inst = self.logic.inst_manager
+            token, info = inst.get_atm_token(index, s, opt)
+            if not token:
+                if isinstance(info, str) and info.startswith('Strike '):
+                    return False, f"{s:g} {opt} is not listed for the current {index} expiry"
+                return False, f"instrument lookup failed ({info})"
+            if direction == 'SELL' and not params.get('hedgeless_mode', False):
+                hs = s + HEDGE_STEPS * step if opt == 'CE' else s - HEDGE_STEPS * step
+                h_token, _ = inst.get_atm_token(index, hs, opt)
+                if not h_token:
+                    return False, f"hedge strike {hs:g} {opt} is not listed"
+            return True, f"{s:g} {opt} listed for current expiry"
+        except Exception as e:
+            return False, f"strike check failed ({e})"
+
+    def breached_now(self, pos_id, kind, val):
+        """True when an exit of this kind at this value would already fire on the next tick
+        (the UI warns before setting it). Mirrors the _check_exits comparisons exactly."""
+        pos = self.find(pos_id)
+        v = _f(val, 0.0)
+        if not pos or v <= 0:
+            return False
+        bearish = self._bearish(pos['type'], pos['direction'])
+        is_buy = pos['direction'] == 'BUY'
+        idx = get_eval_price(pos['index'])
+        ltp = shared_state['option_chain'].get(pos['main']['token'], {}).get('ltp', 0)
+        if kind == 'pnl_tgt':
+            return pos['pnl'] >= v
+        if kind == 'pnl_stop':
+            return pos['pnl'] <= -v
+        if kind == 'idx_stop':
+            return idx > 0 and (idx >= v if bearish else idx <= v)
+        if kind == 'idx_tgt':
+            return idx > 0 and (idx <= v if bearish else idx >= v)
+        if kind == 'prem_stop':
+            return ltp > 0 and (ltp <= v if is_buy else ltp >= v)
+        if kind == 'prem_tgt':
+            return ltp > 0 and (ltp >= v if is_buy else ltp <= v)
+        return False
+
     def live_total(self):
         return shared_state['pnl']['realized'] + sum(p['pnl'] for p in self.positions)

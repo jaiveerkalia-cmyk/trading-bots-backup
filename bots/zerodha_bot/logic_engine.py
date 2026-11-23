@@ -25,6 +25,11 @@ class LogicEngine:
         # (rather than importing AutoController here) to avoid a circular import, matching the
         # same loosely-coupled pattern already used for stop_via_candle_engine.
         self.clear_leg_fields_callback = None
+        # Positions V2 (stage 2c; default OFF): set from auto_run.py ONLY when env ZB_POSITIONS_V2=1.
+        # While None, every method below behaves exactly as before. When set, the hooked methods
+        # (open_position, close_position, close_all_positions, update_pnl, _live_total_pnl,
+        # check_triggers) hand over to positions_engine.PositionsEngine.
+        self.v2 = None
         # Tick-scoped log of every position closed during the CURRENT check_triggers() call,
         # regardless of which code path closed it (PnL/Index/Premium stop or target, manual
         # close, close_all_positions, etc). Reset to [] at the start of every check_triggers()
@@ -152,6 +157,10 @@ class LogicEngine:
             return False, f"strike check failed ({e})"
 
     def open_position(self, side, manual_strike=None, reason="Manual", qty_override=None, strike_offset=None):
+        if self.v2 is not None: return self.v2.open_for_side(side, manual_strike, reason, qty_override, strike_offset)
+        return self._open_position_legacy(side, manual_strike, reason, qty_override, strike_offset)
+
+    def _open_position_legacy(self, side, manual_strike=None, reason="Manual", qty_override=None, strike_offset=None):
         if not self.trading_active: return False, "Trading Stopped"
         index_name = params['trading_index']
         # Strike selection is ALWAYS spot-based, regardless of Futures Mode (option strikes
@@ -282,6 +291,10 @@ class LogicEngine:
             return True, f"Opened {side}"
 
     def close_position(self, side, reason="Manual"):
+        if self.v2 is not None: return self.v2.close_side(side, reason)
+        return self._close_position_legacy(side, reason)
+
+    def _close_position_legacy(self, side, reason="Manual"):
         trade = shared_state['active_trades'][side]
         if not trade: return False, "No Position"
         m = trade['main']
@@ -361,6 +374,10 @@ class LogicEngine:
         return True, "Closed"
 
     def close_all_positions(self, reason="Global Exit", save_pnl=True):
+        if self.v2 is not None: return self.v2.close_all(reason, save_pnl)
+        return self._close_all_positions_legacy(reason, save_pnl)
+
+    def _close_all_positions_legacy(self, reason="Global Exit", save_pnl=True):
         """Closes every open position (Call/Put). Returns a list of {'side','symbol','pnl'}
         dicts, one per position actually closed by THIS call -- NOT the full-session
         shared_state['pnl']['trades_history'] (which keeps growing all day), and NOT
@@ -411,6 +428,10 @@ class LogicEngine:
             self.log_action(f"🚫 Target hit on {side}{(' (' + reason + ')') if reason else ''}: cancelled {opp_side} orders", ', '.join(cancelled))
 
     def update_pnl(self):
+        if self.v2 is not None: return self.v2.update_pnl()
+        return self._update_pnl_legacy()
+
+    def _update_pnl_legacy(self):
         """Updates each open trade's live 'pnl' field (shown throughout the UI as running/
         unrealized PnL) and the aggregate shared_state['pnl']['unrealized'].
 
@@ -507,6 +528,10 @@ class LogicEngine:
         self.update_chart_data()
 
     def _live_total_pnl(self):
+        if self.v2 is not None: return self.v2.live_total()
+        return self._live_total_pnl_legacy()
+
+    def _live_total_pnl_legacy(self):
         """Computes total PnL fresh from currently-open trades, never from the cached
         shared_state['pnl']['unrealized'] snapshot -- that snapshot is only refreshed once
         per tick by update_pnl(), so if a trade opened AND/OR closed earlier in this same
@@ -541,6 +566,10 @@ class LogicEngine:
         return shared_state['pnl']['realized'] + unrealized
 
     def check_triggers(self):
+        if self.v2 is not None: return self.v2.tick()
+        return self._check_triggers_legacy()
+
+    def _check_triggers_legacy(self):
         if not self.trading_active: return
         now = datetime.now()
         # Reset the tick-scoped closed-trades log at the very start of this tick's
