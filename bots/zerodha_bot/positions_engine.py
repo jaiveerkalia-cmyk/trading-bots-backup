@@ -367,6 +367,8 @@ class PositionsEngine:
         close_info = {'main_price': m_curr, 'hedge_price': h_exit, 'index_price': idx_curr}
         if full:
             lg.csv_manager.log_close(pos['id'], close_info, net)
+            for _k in ('idx_stop', 'prem_stop'):
+                self._cancel_job(pos, _k)          # a closed position must not be hit by a pending stop job
             if pos in self.positions:
                 self.positions.remove(pos)
         else:
@@ -575,7 +577,8 @@ class PositionsEngine:
                 and self.stop_engine is not None and self.defer_entries):
             self.stop_engine.defer_card_entry(card=card, interval=fire_on, now=now, index_name=index, is_downside=downside,
                                               lots=lots, strike_offset=off, new_stop=params.get(f'{card}_new_stop', ''),
-                                              new_target=params.get(f'{card}_new_target', ''), reason=reason)
+                                              new_target=params.get(f'{card}_new_target', ''), reason=reason,
+                                              net_ok=bool(params.get(f'{card}_net_ok', False)))
             params[f'{card}_armed'] = False
             params[f'{card}_armed_at'] = None
             return

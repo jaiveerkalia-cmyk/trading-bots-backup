@@ -228,6 +228,9 @@ def entry_card(engine, card):
 
     def cancel():
         was = params.get(armed_key, False)
+        _se = getattr(engine, 'stop_engine', None)
+        if _se is not None and hasattr(_se, 'cancel_card_job'):
+            _se.cancel_card_job(card)          # also drops an entry that is waiting for its candle
         params[armed_key] = False
         params[f'{card}_armed_at'] = None
         params[f'{card}_net_ok'] = False
@@ -576,6 +579,9 @@ def render_open_orders(engine):
             ui.label('armed').classes(CHIP_WORKING + ' w-36 text-center')
 
             def cancel(c=card):
+                _se = getattr(engine, 'stop_engine', None)
+                if _se is not None and hasattr(_se, 'cancel_card_job'):
+                    _se.cancel_card_job(c)
                 params[f'{c}_armed'] = False
                 params[f'{c}_armed_at'] = None
                 params[f'{c}_net_ok'] = False

@@ -277,6 +277,8 @@ logic.clear_leg_fields_callback = controller.clear_leg_fields
 if os.environ.get("ZB_POSITIONS_V2") == "1":
     from positions_engine import PositionsEngine
     logic.v2 = PositionsEngine(logic, stop_via_candle_engine)
+    logic.v2.defer_entries = True      # Stop-Market entries and candle-based stops use Enter via Stop (same
+    logic.v2.defer_exits = True        # params['enter_via_stop'] switch as the legacy page)
     print("--- POSITIONS V2 ENABLED ---")
 daily_logger = DailyLogger() 
 #ticker.start()

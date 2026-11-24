@@ -176,6 +176,140 @@ class StopViaCandleEngine:
     # ------------------------------------------------------------------
     # Called every tick from auto_run.py's background loop
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # POSITIONS V2 (logic_engine.v2): jobs created by positions_engine for per-position stops and
+    # card entries. 'kind' is one of the legacy kinds ('entry' / 'index_stop' / 'premium_stop'), so
+    # token and tick selection in _try_fetch are identical; job['v2'] routes the hand-off.
+    # ------------------------------------------------------------------
+    _V2_TITLE = {'call': 'Sell Call', 'put': 'Sell Put', 'bcall': 'Buy Call', 'bput': 'Buy Put'}
+
+    def defer_position_stop(self, pos_id, kind, interval, now, index_name, is_downside, reason, qty=''):
+        eng = getattr(self.logic_engine, 'v2', None)
+        pos = eng.find(pos_id) if eng is not None else None
+        if pos is None:
+            return
+        premium = kind == 'prem_stop'
+        label = f"{pos['index']} {int(pos['main']['strike'])} {pos['type']}"
+        job = {
+            'id': self._next_id, 'v2': True, 'kind': 'premium_stop' if premium else 'index_stop', 'slot': kind,
+            'pos_id': pos_id, 'side': label, 'interval': interval, 'boundary_time': now.replace(second=0, microsecond=0),
+            'index_name': index_name, 'is_downside': is_downside, 'reason': reason, 'qty': qty,
+            'status': 'awaiting_fetch', 'first_attempt_at': None, 'trigger_price': None,
+        }
+        if premium:
+            job['token'] = pos['main']['token']
+            job['symbol'] = pos['main']['symbol']
+        self._next_id += 1
+        self.jobs.append(job)
+        candle_start = job['boundary_time'] - INTERVAL_DELTA[interval]
+        self.logic_engine.log_action(
+            f"🕯️ ENTER VIA STOP: {label} {'Prem' if premium else 'Idx'} Stop deferred ({interval}) - will check {candle_start.strftime('%H:%M')}-{job['boundary_time'].strftime('%H:%M')} candle after {_fetch_delay_sec():.0f}s",
+            reason
+        )
+
+    def defer_card_entry(self, card, interval, now, index_name, is_downside, lots, strike_offset,
+                         new_stop, new_target, reason, net_ok=False):
+        title = self._V2_TITLE.get(card, card)
+        job = {
+            'id': self._next_id, 'v2': True, 'kind': 'entry', 'card': card, 'side': title,
+            'interval': interval, 'boundary_time': now.replace(second=0, microsecond=0),
+            'index_name': index_name, 'is_downside': is_downside, 'lots': lots, 'strike_offset': strike_offset,
+            'new_stop': new_stop, 'new_target': new_target, 'reason': reason, 'net_ok': bool(net_ok),
+            'status': 'awaiting_fetch', 'first_attempt_at': None, 'trigger_price': None,
+        }
+        self._next_id += 1
+        self.jobs.append(job)
+        candle_start = job['boundary_time'] - INTERVAL_DELTA[interval]
+        self.logic_engine.log_action(
+            f"🕯️ ENTER VIA STOP: {title} entry deferred ({interval}) - will check {candle_start.strftime('%H:%M')}-{job['boundary_time'].strftime('%H:%M')} candle after {_fetch_delay_sec():.0f}s",
+            reason
+        )
+
+    def cancel_position_job(self, pos_id, slot=None):
+        """Drops pending V2 stop jobs of a position (one slot, or all when slot is None)."""
+        before = len(self.jobs)
+        self.jobs = [j for j in self.jobs if not (j.get('v2') and j.get('pos_id') == pos_id and (slot is None or j.get('slot') == slot))]
+        if len(self.jobs) < before:
+            self.logic_engine.log_action("🚫 ENTER VIA STOP: pending position stop cancelled")
+
+    def cancel_card_job(self, card):
+        """Drops a pending V2 entry job of an entry card (card CANCEL / Open Orders Cancel)."""
+        before = len(self.jobs)
+        self.jobs = [j for j in self.jobs if not (j.get('v2') and j['kind'] == 'entry' and j.get('card') == card)]
+        if len(self.jobs) < before:
+            self.logic_engine.log_action(f"🚫 ENTER VIA STOP: pending {self._V2_TITLE.get(card, card)} entry cancelled (order changed)")
+
+    @staticmethod
+    def _past_eod():
+        import config as _cfg
+        return datetime.now().time() >= _cfg.EOD_TIME
+
+    def _handoff_v2(self, job, trigger_price):
+        """Same decision as _handoff (already past the trigger -> MARKET now, otherwise re-arm LIVE),
+        but targets Positions V2: a card entry re-arms the card, a position stop re-arms that
+        position's own slot. A manual change made while the candle was being fetched always wins,
+        and nothing is executed after EOD_TIME."""
+        eng = getattr(self.logic_engine, 'v2', None)
+        if eng is None:
+            return
+        log = self.logic_engine.log_action
+        side, kind = job['side'], job['kind']
+        direction_txt = 'below candle low' if job['is_downside'] else 'above candle high'
+        current_price = self._current_price_for_job(job)
+        breached = self._already_breached(job, trigger_price, current_price)
+
+        if kind == 'entry':
+            card = job['card']
+            if params.get(f'{card}_armed', False):
+                log(f"ℹ️ ENTER VIA STOP: {side} entry hand-off skipped - order was re-armed manually")
+                return
+            if self._past_eod():
+                params[f'{card}_net_ok'] = False
+                log(f"ℹ️ ENTER VIA STOP: {side} entry dropped - past end of day")
+                return
+            if breached:
+                log(f"⚡ ENTER VIA STOP: {side} price already past trigger ({current_price:.2f} vs {trigger_price:.2f}) - firing MARKET now", job['reason'])
+                ok, msg = eng.open_from_card(card, job['lots'], job['strike_offset'],
+                                             reason="Enter via Stop (Market - price moved past trigger)",
+                                             net_ok=job['net_ok'], new_stop=job['new_stop'], new_target=job['new_target'])
+                params[f'{card}_net_ok'] = False
+                if not ok:
+                    log(f"⚠️ ENTER VIA STOP: {side} market fire failed: {msg}")
+                    self.logic_engine.play_sound('error')
+                return
+            params[f'{card}_order_type'] = 'Stop-Market'
+            params[f'{card}_trigger_price'] = trigger_price
+            params[f'{card}_fire_on'] = 'Live'
+            params[f'{card}_strike_offset'] = job['strike_offset']
+            params[f'{card}_qty'] = job['lots']
+            params[f'{card}_new_stop'] = job['new_stop']
+            params[f'{card}_new_target'] = job['new_target']
+            params[f'{card}_net_ok'] = job['net_ok']
+            params[f'{card}_armed_at'] = datetime.now()
+            params[f'{card}_armed'] = True
+            log(f"🕯️ STOP ARMED (live): {side} entry Stop-Market @ {trigger_price:.2f} ({direction_txt})", job['reason'])
+            return
+
+        pos = eng.find(job['pos_id'])
+        if pos is None:
+            log(f"ℹ️ ENTER VIA STOP: {side} stop hand-off skipped - position no longer open")
+            return
+        slot = pos['exits'][job['slot']]
+        if slot['state'] != 'deferred':
+            log(f"ℹ️ ENTER VIA STOP: {side} stop hand-off skipped - stop was changed manually")
+            return
+        if self._past_eod():
+            slot.update(val='', period='Current', lots='', active=False, state='off')
+            log(f"ℹ️ ENTER VIA STOP: {side} stop dropped - past end of day")
+            return
+        label = 'Prem' if kind == 'premium_stop' else 'Idx'
+        if breached:
+            log(f"⚡ ENTER VIA STOP: {side} {label.lower()} already past trigger ({current_price:.2f} vs {trigger_price:.2f}) - firing MARKET exit now", job['reason'])
+            eng._exit_for(pos, job['slot'], "Enter via Stop (Market - price moved past trigger)")
+            return
+        slot.update(val=trigger_price, period='Current', active=True, state='working')
+        log(f"🕯️ STOP ARMED (live): {side} {label} Stop @ {trigger_price:.2f} ({direction_txt})", job['reason'])
+
     def check(self):
         if not self.jobs:
             return
@@ -372,6 +506,8 @@ class StopViaCandleEngine:
         time (e.g. re-armed the card by hand while the candle was being fetched), that manual
         action wins -- the hand-off (whether market-fire or arm) is skipped rather than
         silently overwriting it."""
+        if job.get('v2'):
+            return self._handoff_v2(job, trigger_price)
         side = job['side']
         kind = job['kind']
         direction_txt = 'below candle low' if job['is_downside'] else 'above candle high'
