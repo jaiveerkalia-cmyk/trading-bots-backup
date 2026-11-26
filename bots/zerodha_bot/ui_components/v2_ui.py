@@ -14,7 +14,7 @@ from datetime import datetime
 
 from nicegui import ui
 
-from config import params, INDICES
+from config import params, INDICES, ui_refs
 from positions_engine import CARDS, EXIT_KINDS
 
 ORDER_TYPES = ['Market', 'Limit', 'Stop-Market']
@@ -91,6 +91,54 @@ def _stale(e):
     return 'client' in str(e).lower() and 'deleted' in str(e).lower()
 
 
+# ------------------------------------------------------------------ banner index selector
+def index_selector(engine):
+    """Banner NIFTY/SENSEX control for Positions V2: pick, then press Set to apply the index to the
+    global default and to all four entry cards at once (each card can still be changed alone)."""
+    draft = {'index': params['trading_index']}
+    ui.radio(list(INDICES.keys()), value=draft['index']).bind_value(draft, 'index').props('inline dense')
+
+    def apply():
+        idx = draft['index']
+        if idx not in INDICES:
+            return
+        params['trading_index'] = idx
+        for c in CARDS:
+            params[f'{c}_index'] = idx
+        ui.notify(f"Index {idx} set on all four entry cards", type='positive')
+    ui.button('Set', on_click=apply).props('dense size=sm color=orange-8 no-caps')
+    return {'draft': draft, 'apply': apply}
+
+
+def adapt_banner(engine):
+    """Called right after the banner is built (V2 page only), without touching the banner code:
+    (1) hides the CALL/PUT POSITION cards (they stay in the page and keep being updated by
+    update_ui, so nothing else changes); (2) hides the banner's global NIFTY/SENSEX radio and
+    puts index_selector (radio + Set) in its place."""
+    el = ui_refs.get('call_status')
+    card = el
+    while card is not None and not isinstance(card, ui.card):
+        card = card.parent_slot.parent if getattr(card, 'parent_slot', None) else None
+    if card is not None and getattr(card, 'parent_slot', None) is not None:
+        card.parent_slot.parent.style('display: none !important')       # the row holding both position cards
+    wanted = list(INDICES.keys())
+    radio = None
+    for e in list(ui.context.client.elements.values()):
+        if isinstance(e, ui.radio) and list(getattr(e, 'options', [])) == wanted:
+            radio = e
+            break
+    if radio is None or getattr(radio, 'parent_slot', None) is None:
+        return
+    parent = radio.parent_slot.parent
+    pos = list(parent.default_slot.children).index(radio)
+    radio.style('display: none !important')
+    with parent:
+        wrapper = ui.row().classes('items-center gap-1 no-wrap')
+        with wrapper:
+            index_selector(engine)
+    wrapper.move(parent, target_index=pos + 1)
+
+
 # ------------------------------------------------------------------ entry cards
 def entry_card(engine, card):
     st = CARD_STYLE[card]
@@ -110,6 +158,13 @@ def entry_card(engine, card):
     index_key = f'{card}_index'
     armed_key = f'{card}_armed'
     refs = {}
+    initial = dict(draft)            # what the form looked like when the page was built (CLEAR restores this)
+
+    def reset_form():
+        """Puts every typed value (order type, trigger, strike mode/steps/exact, qty, fire on, stop,
+        target) back to the page-load defaults. Never touches an armed order or a position."""
+        draft.update(initial)
+        _show_exact_msg(True, '')
 
     def parse_lots():
         try:
@@ -225,6 +280,7 @@ def entry_card(engine, card):
         params[f'{card}_armed_at'] = datetime.now()
         params[armed_key] = True
         ui.notify(f"{st['title']} ARMED: {order_type} @ {trig:g} ({draft['fire_on']})", type='positive')
+        reset_form()                 # the order now lives in Open Orders: leave the form empty
 
     def cancel():
         was = params.get(armed_key, False)
@@ -236,11 +292,14 @@ def entry_card(engine, card):
         params[f'{card}_net_ok'] = False
         params[f'{card}_new_stop'] = ''
         params[f'{card}_new_target'] = ''
-        draft['stop'] = ''
-        draft['target'] = ''
+        reset_form()
         if was:
             engine.logic.log_action(f"{st['title']} order cancelled")
-        ui.notify(f"{st['title']} order cancelled" if was else 'Nothing armed', type='info')
+        ui.notify(f"{st['title']} order cancelled" if was else f"{st['title']} form cleared", type='info')
+
+    def clear():
+        reset_form()
+        ui.notify(f"{st['title']} form cleared", type='info')
 
     with ui.card().classes(f'w-full p-3 gap-1 {bg} border shadow-sm rounded-xl'):
         with ui.row().classes('w-full items-center justify-between'):
@@ -293,7 +352,8 @@ def entry_card(engine, card):
             primary.bind_text_from(draft, 'order_type', backward=lambda t: 'OPEN NOW' if t == 'Market' else 'ARM')
             primary.bind_enabled_from(params, armed_key, backward=lambda a: not a)
             ui.button('CANCEL', on_click=cancel).props('color=blue-grey-5 no-caps').classes('grow font-bold')
-    return {'draft': draft, 'submit': submit, 'cancel': cancel, 'refs': refs}
+            ui.button('CLEAR', on_click=clear).props('color=blue-grey-3 no-caps').classes('grow font-bold')
+    return {'draft': draft, 'submit': submit, 'cancel': cancel, 'clear': clear, 'refs': refs}
 
 
 # ------------------------------------------------------------------ exit editors (shared by rows and orders)
@@ -374,48 +434,58 @@ class _ExitDraft:
             ui.notify(msg, type='negative')
 
 
-def _exit_controls(engine, pid, kind, with_label=True):
-    """Value / Period / Lots inputs + Set + Reset for one slot. Returns the _ExitDraft."""
+def _exit_line(engine, pid, kind):
+    """One compact Stop / Target line: value [period] [lots] Set x. Returns the _ExitDraft."""
     d = _ExitDraft(engine, pid, kind)
     is_pnl = kind.startswith('pnl')
-    if with_label:
-        ui.label(EXIT_LABEL[kind]).classes('text-xs font-bold text-gray-600 w-24')
-    d.widgets['val'] = ui.input(on_change=d.touch).props('outlined dense bg-color=white hide-bottom-space').classes('w-24')
-    if is_pnl:
-        ui.label('n/a').classes('text-xs text-gray-400 w-20 text-center')
-        ui.label('all').classes('text-xs text-gray-400 w-14 text-center')
-    else:
+    ui.label('Stop' if kind.endswith('stop') else 'Target').classes('text-xs font-bold text-gray-600 w-10')
+    d.widgets['val'] = ui.input(on_change=d.touch).props('outlined dense bg-color=white hide-bottom-space').classes('grow min-w-[70px]')
+    if not is_pnl:
         d.widgets['period'] = ui.select(PERIODS, value='Current', on_change=d.touch) \
             .props('outlined dense bg-color=white hide-bottom-space').classes('w-24')
         d.widgets['lots'] = ui.input(on_change=d.touch).props('outlined dense bg-color=white hide-bottom-space placeholder=all') \
-            .classes('w-16')
+            .classes('w-14')
     ui.button('Set', on_click=d.apply).props('dense no-caps color=primary size=sm')
-    ui.button('Reset', on_click=d.reset).props('dense no-caps flat size=sm')
+    ui.button('×', on_click=d.reset).props('dense no-caps flat size=sm')
     d.sync()
     return d
 
 
 # ------------------------------------------------------------------ open positions
+def _kv(title, cls='font-mono text-sm'):
+    """A small right-aligned title/value pair; returns the value label."""
+    with ui.column().classes('gap-0 items-end'):
+        ui.label(title).classes('text-[9px] uppercase text-gray-500')
+        return ui.label('-').classes(cls)
+
+
+def _group(first=False):
+    return ui.row().classes('items-center no-wrap gap-3 px-3 ' + ('' if first else 'border-l border-gray-400'))
+
+
 def _position_row(engine, pid):
     pos = engine.find(pid)
-    is_buy = pos['direction'] == 'BUY'
-    border = 'border-blue-500' if is_buy else ('border-red-500' if pos['type'] == 'CE' else 'border-green-500')
+    bearish = (pos['type'] == 'CE') == (pos['direction'] == 'SELL')     # same red/green as the entry cards
+    tint = 'bg-red-50 border-red-200' if bearish else 'bg-green-50 border-green-200'
     refs, drafts = {}, {}
-    with ui.card().classes(f'w-full p-2 gap-1 border-l-4 {border} shadow-sm'):
-        with ui.row().classes('w-full items-center gap-3'):
+    with ui.card().classes(f'w-full p-2 gap-1 {tint} border shadow-sm'):
+        with ui.row().classes('w-full items-center gap-y-1'):
             refs['sym'] = ui.label(_label(pos)).classes('font-mono font-bold text-sm')
-            tag_cls = ('bg-blue-100 text-blue-700' if is_buy else
-                       ('bg-red-100 text-red-700' if pos['type'] == 'CE' else 'bg-green-100 text-green-700'))
-            ui.label('BUY' if is_buy else 'SELL').classes(f'text-[10px] font-bold px-2 py-0.5 rounded {tag_cls}')
+            ui.label('BUY' if pos['direction'] == 'BUY' else 'SELL').classes('text-[10px] font-bold px-2 py-0.5 rounded bg-white mx-2')
             ui.label(f"pos {pos['pos_no']}").classes('text-[10px] text-gray-500')
             ui.element('div').classes('grow')
-            for key, title in (('mark', 'Mark'), ('size', 'Size'), ('pnl', 'uPnL')):
-                with ui.column().classes('gap-0 items-end'):
-                    ui.label(title).classes('text-[9px] uppercase text-gray-400')
-                    refs[key] = ui.label('-').classes('font-mono text-sm')
-        with ui.row().classes('w-full gap-6 text-[11px] text-gray-600'):
-            refs['entry'] = ui.label('Entry -')
-            refs['qty'] = ui.label('Qty -')
+            with _group(first=True):
+                refs['idx_entry'] = _kv('Index entry')
+                refs['idx_now'] = _kv('Index now')
+            with _group():
+                refs['entry'] = _kv('Entry')
+                refs['ltp'] = _kv('LTP')
+            with _group():
+                refs['qty'] = _kv('Qty')
+            with _group():
+                refs['realized'] = _kv('Realized')
+                refs['unrealized'] = _kv('Unrealized')
+                refs['total'] = _kv('Total')
         with ui.row().classes('w-full gap-1'):
             for kind in EXIT_KINDS:
                 refs[f'chip_{kind}'] = ui.label('').classes(CHIP_OFF)
@@ -453,28 +523,30 @@ def _position_row(engine, pid):
             ui.element('div').classes('grow')
             ui.button('CLOSE', on_click=do_close).props('dense no-caps color=red-6 size=sm')
         with ui.expansion('Stops / Targets').classes('w-full').props('dense'):
-            with ui.column().classes('w-full gap-1'):
-                with ui.row().classes('items-center gap-2 text-[10px] text-gray-500'):
-                    ui.label('').classes('w-24')
-                    ui.label('Value').classes('w-24')
-                    ui.label('Period').classes('w-24')
-                    ui.label('Lots (blank = all)').classes('w-16')
-                for kind in ('prem_stop', 'prem_tgt', 'idx_stop', 'idx_tgt', 'pnl_stop', 'pnl_tgt'):
-                    with ui.row().classes('items-center gap-2'):
-                        drafts[kind] = _exit_controls(engine, pid, kind)
+            with ui.row().classes('w-full gap-2 items-start'):
+                for title, pair in (('PnL (₹)', ('pnl_stop', 'pnl_tgt')), ('Index', ('idx_stop', 'idx_tgt')),
+                                    ('Premium', ('prem_stop', 'prem_tgt'))):
+                    with ui.card().classes('grow basis-0 min-w-[300px] p-2 gap-1 bg-white border shadow-none'):
+                        ui.label(title).classes('text-xs font-bold text-gray-700')
+                        for kind in pair:
+                            with ui.row().classes('w-full items-center gap-1'):
+                                drafts[kind] = _exit_line(engine, pid, kind)
 
     def update():
         p = engine.find(pid)
         if not p:
             return
         lot = _lot_size(p['index'])
+        real = p.get('realized', 0.0)
         refs['sym'].set_text(_label(p))
-        refs['mark'].set_text(f"{p['main']['current_price']:.2f}")
-        refs['size'].set_text(f"{p['qty'] // lot}")
-        refs['pnl'].set_text(f"₹ {p['pnl']:.0f}")
-        refs['pnl'].classes(replace=f"font-mono text-sm font-bold {_pnl_cls(p['pnl'])}")
-        refs['entry'].set_text(f"Entry {p['main']['entry_price']:.2f}")
-        refs['qty'].set_text(f"Qty {p['qty']}")
+        refs['idx_entry'].set_text(f"{p['index_entry_price']:.1f}")
+        refs['idx_now'].set_text(f"{p['index_current_price']:.1f}")
+        refs['entry'].set_text(f"{p['main']['entry_price']:.2f}")
+        refs['ltp'].set_text(f"{p['main']['current_price']:.2f}")
+        refs['qty'].set_text(f"{p['qty']} ({p['qty'] // lot} lot{'s' if p['qty'] // lot != 1 else ''})")
+        for key, val in (('realized', real), ('unrealized', p['pnl']), ('total', real + p['pnl'])):
+            refs[key].set_text(f"{val:+,.0f}" if round(val) != 0 else '0')
+            refs[key].classes(replace=f"font-mono text-sm font-bold {_pnl_cls(val)}")
         for kind in EXIT_KINDS:
             text, cls = _slot_text(kind, p['exits'][kind], p)
             refs[f'chip_{kind}'].set_text(text)
@@ -487,13 +559,16 @@ def _position_row(engine, pid):
 
 def render_positions(engine):
     state = {'ids': None, 'rows': {}}
+    tot = {}
     with ui.card().classes('w-full p-3 gap-2 shadow-sm'):
         with ui.row().classes('w-full items-center gap-3'):
             ui.label('OPEN POSITIONS').classes('font-bold text-sm text-gray-700')
             count = ui.label('0 positions').classes('text-[11px] text-gray-500')
             ui.element('div').classes('grow')
-            ui.label('Total uPnL').classes('text-[10px] uppercase text-gray-400')
-            total = ui.label('₹ 0').classes('font-mono text-sm font-bold text-gray-500')
+            for i, (key, title) in enumerate((('realized', 'Realized'), ('unrealized', 'Unrealized'), ('total', 'Total'))):
+                with ui.column().classes('gap-0 items-end px-3 ' + ('' if i == 0 else 'border-l border-gray-400')):
+                    ui.label(title).classes('text-[9px] uppercase text-gray-500')
+                    tot[key] = ui.label('0').classes('font-mono text-sm font-bold text-gray-500')
         container = ui.column().classes('w-full gap-2')
 
     def tick():
@@ -512,16 +587,18 @@ def render_positions(engine):
                 r['update']()
             n = len(ids)
             count.set_text(f"{n} position{'s' if n != 1 else ''}")
-            tot = sum(p['pnl'] for p in engine.positions)
-            total.set_text(f"₹ {tot:.0f}")
-            total.classes(replace=f"font-mono text-sm font-bold {_pnl_cls(tot)}")
+            real = sum(p.get('realized', 0.0) for p in engine.positions)
+            unreal = sum(p['pnl'] for p in engine.positions)
+            for key, val in (('realized', real), ('unrealized', unreal), ('total', real + unreal)):
+                tot[key].set_text(f"{val:+,.0f}" if round(val) != 0 else '0')
+                tot[key].classes(replace=f"font-mono text-sm font-bold {_pnl_cls(val)}")
         except RuntimeError as e:
             if _stale(e):
                 return
             raise
     tick()
     ui.timer(1.0, tick)
-    return {'tick': tick, 'state': state}
+    return {'tick': tick, 'state': state, 'totals': tot}
 
 
 # ------------------------------------------------------------------ open orders

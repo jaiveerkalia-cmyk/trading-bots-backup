@@ -259,7 +259,7 @@ class PositionsEngine:
             'qty': qty, 'status': 'OPEN', 'pnl': 0.0, 'index_entry_price': eval_ltp, 'index_current_price': eval_ltp,
             'csv_synced': False, 'entry_time': datetime.now().strftime('%H:%M:%S'), 'trigger': reason,
             'main': {'symbol': r['main_symbol'], 'token': r['main_token'], 'strike': r['main_strike'], 'entry_price': m_pr, 'current_price': m_pr},
-            'hedge': hedge, 'brk_pending': 1, 'partials': 0, 'adds': 0, 'exits': self._new_slots(),
+            'hedge': hedge, 'brk_pending': 1, 'partials': 0, 'adds': 0, 'realized': 0.0, 'exits': self._new_slots(),
         }
         self.positions.append(pos)
         lg.csv_manager.log_open(pos['id'], pos)
@@ -373,6 +373,7 @@ class PositionsEngine:
                 self.positions.remove(pos)
         else:
             pos['partials'] += 1
+            pos['realized'] = pos.get('realized', 0.0) + net      # this position's own realized PnL (partial exits)
             pos['qty'] -= qty
             pos['brk_pending'] = 0
             pid = f"{pos['id']}-P{pos['partials']}"
@@ -451,6 +452,25 @@ class PositionsEngine:
     def _clear_slot(self, pos, kind):
         pos['exits'][kind].update(val='', period='Current', lots='', active=False, state='off')
 
+    def _cancel_pending_entries(self, why):
+        """Profit-target rule: when a target fully closes a position, every pending ENTRY order (armed
+        cards on both sides, plus entries still waiting for their candle) is cancelled. Exits of other
+        positions are never touched. Switch off with params['v2_cancel_entries_on_target'] = False."""
+        if not params.get('v2_cancel_entries_on_target', True):
+            return
+        cancelled = []
+        for card in CARDS:
+            if params.get(f'{card}_armed'):
+                params[f'{card}_armed'] = False
+                params[f'{card}_armed_at'] = None
+                params[f'{card}_net_ok'] = False
+                cancelled.append(card)
+            se = self.stop_engine
+            if se is not None and hasattr(se, 'cancel_card_job'):
+                se.cancel_card_job(card)
+        if cancelled:
+            self.logic.log_action(f"🧹 Profit target hit ({why}): cancelled pending entries on {', '.join(cancelled)}")
+
     def _exit_for(self, pos, kind, reason):
         """Full or partial exit driven by an exit slot. A partial hit consumes only that slot."""
         slot = pos['exits'][kind]
@@ -461,7 +481,10 @@ class PositionsEngine:
             q = int(lots) * lot_size
             qty = min(q, pos['qty'])
         if qty >= pos['qty']:
-            return self._exit(pos, pos['qty'], reason)
+            res = self._exit(pos, pos['qty'], reason)
+            if res[0] and kind in ('idx_tgt', 'prem_tgt'):
+                self._cancel_pending_entries(reason)
+            return res
         self._clear_slot(pos, kind)
         return self._exit(pos, qty, reason)
 
@@ -492,7 +515,8 @@ class PositionsEngine:
             t, s = ex['pnl_tgt'], ex['pnl_stop']
             tv, sv = _f(t['val']), _f(s['val'])
             if t['active'] and tv > 0 and pos['pnl'] >= tv:
-                self._exit(pos, pos['qty'], f"Auto Profit {tv:g}")
+                if self._exit(pos, pos['qty'], f"Auto Profit {tv:g}")[0]:
+                    self._cancel_pending_entries(f"Auto Profit {tv:g}")
                 continue
             if s['active'] and sv > 0 and pos['pnl'] <= -sv:
                 self._exit(pos, pos['qty'], f"Auto Loss {sv:g}")

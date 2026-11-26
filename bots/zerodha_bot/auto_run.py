@@ -719,6 +719,7 @@ def run_daily_scan():
     # TIMESTAMP HELPER
     now_str = datetime.now().strftime('%Y-%m-%d (%a) %H:%M:%S')
     logic.log_action(f"[{now_str}] 🔄 Starting Daily Scan & Login...")
+    shared_state['scan_ok'] = False
 
     try:
         new_kite, new_key, new_token = get_kite_session()
@@ -750,6 +751,7 @@ def run_daily_scan():
             # Start Redis ticker (no token refresh needed, handled centrally)
             ticker.start()
             logic.log_action('✅ Ticker Connected & Ready.')
+            shared_state['scan_ok'] = True
 
         except Exception as e:
             logic.log_action(f"⚠️ Ticker Start Failed: {e}")
@@ -963,9 +965,10 @@ def build_center_stack():
     comp.global_control_card('Global Stop Loss', 'global_stop_value', 'global_stop_active')
     comp.global_control_card('Global Target', 'global_target_value', 'global_tgt_active')
     _render_global_pnl_floor_card()
-    comp.render_alert_sound_panel()
-    comp.alerts_card_upper()
-    comp.alerts_card_lower()
+    if getattr(logic, 'v2', None) is None:     # Positions V2 shows these three in their own section below the entry cards
+        comp.render_alert_sound_panel()
+        comp.alerts_card_upper()
+        comp.alerts_card_lower()
     
     # FIX: Point to our new wrapper that includes the UI wipe
     ui.button('CLOSE ALL', on_click=handle_close_all, color='red').classes('w-full font-bold shadow-md rounded-xl mt-4')
@@ -994,7 +997,10 @@ async def run_bot_logic():
             ts = now.strftime('%H:%M:%S')
 
             # 1. NIGHT MODE
-            if now.hour == 22 and now.minute == 45:
+            # Night window = 22:45 until the manager's 08:55 wake-up. (Was: only the exact minute 22:45,
+            # so a worker started later at night never shut down, scanned at once with a session that
+            # expires before the next morning, and then skipped tomorrow's 9 AM routine.)
+            if (now.hour == 22 and now.minute >= 45) or now.hour == 23:
                 shared_state['shutdown_triggered'] = True 
                 print(f"[{ts}] 💤 NIGHT MODE: Saving State & Shutting Down...")
                 try:
@@ -1005,12 +1011,29 @@ async def run_bot_logic():
                 return
 
             # 2. DAILY INIT
-            if now.time() >= dtime(9, 0) and not shared_state.get('daily_scan_done', False):
+            # The scan is retried every 60s (up to 30 attempts) until it succeeds; the day is only marked
+            # done after a successful scan (or after giving up), so one failed login can no longer
+            # silently cancel the whole 9 AM routine.
+            if (now.time() >= dtime(9, 0) and not shared_state.get('daily_scan_done', False)
+                    and now >= shared_state.get('scan_retry_at', now)):
                 print(f"[{ts}] 🚀 INITIALIZING BOT: Running Daily Scan...")
                 run_daily_scan()
-                controller.reset()
-                shared_state['daily_scan_done'] = True
-                shared_state['daily_pnl_written'] = False
+                if shared_state.get('scan_ok'):
+                    controller.reset()
+                    shared_state['daily_scan_done'] = True
+                    shared_state['daily_pnl_written'] = False
+                    shared_state['scan_attempts'] = 0
+                else:
+                    _tries = shared_state.get('scan_attempts', 0) + 1
+                    shared_state['scan_attempts'] = _tries
+                    if _tries >= 30:
+                        controller.reset()
+                        shared_state['daily_scan_done'] = True
+                        shared_state['daily_pnl_written'] = False
+                        logic.log_action("❌ Daily scan failed 30 times - giving up. Use 'Run 9 AM Daily Scan' once the problem is fixed.")
+                    else:
+                        shared_state['scan_retry_at'] = now + timedelta(seconds=60)
+                        logic.log_action(f"⏳ Daily scan attempt {_tries}/30 failed - retrying in 60s")
 
             # --- CORE LOGIC (SAFE CONTEXT WRAPPER) ---
             # This PREVENTS 'Critical Logic Error' by redirecting ui.notify
@@ -1076,6 +1099,7 @@ def _build_v2_page():
     from ui_components import v2_ui
     eng = logic.v2
     comp.render_master_banner(update_lots)
+    v2_ui.adapt_banner(eng)      # hides the CALL/PUT POSITION cards, puts a Set button next to the index selector
     buy_btn = ui_refs.get('buy_mode_button')
     if buy_btn is not None:      # Buy cards replace the global Buy Mode switch (display:none survives classes(replace=))
         buy_btn.style('display: none !important')
@@ -1085,6 +1109,7 @@ def _build_v2_page():
         comp.render_log_row()
 
     v2_ui.render_positions(eng)
+    v2_ui.render_open_orders(eng)
 
     with ui.row().classes('w-full no-wrap items-start gap-4 p-2'):
         with ui.column().classes('grow gap-4'):
@@ -1095,8 +1120,12 @@ def _build_v2_page():
             v2_ui.entry_card(eng, 'put')
             v2_ui.entry_card(eng, 'bcall')
 
+    # Alerts: the three cards side by side (sound profile, upper, lower), existing alerts just below
+    with ui.row().classes('w-full no-wrap items-start gap-4 p-2'):
+        with ui.column().classes('grow basis-0 gap-4'): comp.render_alert_sound_panel()
+        with ui.column().classes('grow basis-0 gap-4'): comp.alerts_card_upper()
+        with ui.column().classes('grow basis-0 gap-4'): comp.alerts_card_lower()
     comp.render_active_alerts()
-    v2_ui.render_open_orders(eng)
     comp.render_pattern_indicators()
     render_indicator_alerts_section()
     comp.render_order_history()
